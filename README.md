@@ -1,5 +1,7 @@
 # FactorEngine
 
+> **⚠️ This project is still in active development. APIs and architecture may change.**
+
 Real-time factor computation engine for OKX perpetual contracts.
 
 ## Architecture
