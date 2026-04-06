@@ -17,7 +17,6 @@ import re
 
 import numpy as np
 
-from dataflow.events import BookEvent, TradeEvent
 from dataflow.manager import DataflowManager
 
 logger = logging.getLogger(__name__)
@@ -108,12 +107,20 @@ class Engine:
         """
         return self._dataflow.get_bar_snapshot(symbols)
 
-    def get_trade_data(self, symbols: list[str] | None = None) -> dict[str, list[TradeEvent]]:
-        """Get a snapshot (copy) of the trade cache."""
+    def get_trade_data(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
+        """Get a snapshot (copy) of the trade cache.
+
+        Returns:
+            {symbol: ndarray of shape (N, 3)} with columns [px, sz, side].
+        """
         return self._dataflow.get_trade_snapshot(symbols)
 
-    def get_book_data(self, symbols: list[str] | None = None) -> dict[str, BookEvent]:
-        """Get the latest shallow order-book snapshot per symbol."""
+    def get_book_data(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
+        """Get a snapshot (copy) of the book cache.
+
+        Returns:
+            {symbol: ndarray of shape (N, 20)} representing books5 rows.
+        """
         return self._dataflow.get_book_snapshot(symbols)
 
     @property

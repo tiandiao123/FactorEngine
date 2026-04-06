@@ -9,7 +9,6 @@ import numpy as np
 from .bars.worker import BarDataflowWorker
 from .books.worker import BookDataflowWorker
 from .cache import BarCache, BookCache, TradeCache
-from .events import BookEvent, TradeEvent
 from .trades.worker import TradeDataflowWorker
 
 
@@ -82,11 +81,11 @@ class DataflowManager:
     def get_bar_snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
         return self.bar_cache.snapshot(symbols)
 
-    def get_trade_snapshot(self, symbols: list[str] | None = None) -> dict[str, list[TradeEvent]]:
+    def get_trade_snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
         return self.trade_cache.snapshot(symbols)
 
-    def get_book_snapshot(self, symbols: list[str] | None = None) -> dict[str, BookEvent]:
-        return self.book_cache.latest_snapshot(symbols)
+    def get_book_snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
+        return self.book_cache.snapshot(symbols)
 
     @property
     def bar_count(self) -> int:

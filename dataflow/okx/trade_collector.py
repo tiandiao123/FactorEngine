@@ -8,15 +8,15 @@ import logging
 from typing import Callable
 
 import aiohttp
+import numpy as np
 
-from ..events import TradeEvent
+from ..events import TRADE_NUM_FIELDS, encode_trade_side
 from .common import (
     MAX_SUBS_PER_CONN,
     OKX_WS_BUSINESS,
     OKX_WS_PUBLIC,
     SUBS_BATCH_SIZE,
     chunk,
-    now_ms,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ class OKXTradeCollector:
     def __init__(
         self,
         symbols: list[str],
-        on_trades: Callable[[list[TradeEvent]], None],
+        on_trades: Callable[[str, np.ndarray], None],
         channels: tuple[str, ...] = ("trades-all",),
     ):
         invalid = set(channels) - (_PUBLIC_TRADE_CHANNELS | _BUSINESS_TRADE_CHANNELS)
@@ -112,30 +112,13 @@ class OKXTradeCollector:
         arg = payload.get("arg", {})
         channel = arg.get("channel", "")
         inst_id = arg.get("instId", "")
-        ts_recv = now_ms()
-        events: list[TradeEvent] = []
-        for row in rows:
-            count = row.get("count")
-            try:
-                count_int = int(count) if count is not None else 1
-            except (TypeError, ValueError):
-                count_int = 1
-            events.append(
-                TradeEvent(
-                    symbol=row.get("instId", inst_id),
-                    channel=channel,
-                    ts_event=int(row["ts"]),
-                    ts_recv=ts_recv,
-                    trade_id=row.get("tradeId"),
-                    px=float(row["px"]),
-                    sz=float(row["sz"]),
-                    side=row.get("side", ""),
-                    count=count_int,
-                    is_aggregated=channel == "trades",
-                )
-            )
+        rows_arr = np.empty((len(rows), TRADE_NUM_FIELDS), dtype=np.float64)
+        for idx, row in enumerate(rows):
+            rows_arr[idx, 0] = float(row["px"])
+            rows_arr[idx, 1] = float(row["sz"])
+            rows_arr[idx, 2] = encode_trade_side(row.get("side", ""))
 
-        self.on_trades(events)
+        self.on_trades(inst_id, rows_arr)
 
     def stop(self):
         self._running = False

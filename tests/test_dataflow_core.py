@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import numpy as np
 import unittest
 from unittest.mock import MagicMock
 
 from dataflow.bars.aggregator import BarAggregator
 from dataflow.cache import BarCache, BookCache, TradeCache
-from dataflow.events import BarEvent, BookEvent, BookLevel, TradeEvent
+from dataflow.events import ASK_PX_SLICE, ASK_SZ_SLICE, BID_PX_SLICE, BID_SZ_SLICE, TRADE_SIDE_BUY, TRADE_SIDE_SELL
 from dataflow.manager import DataflowManager
 
 
@@ -48,29 +49,20 @@ class BarAggregatorTest(unittest.TestCase):
             out = agg.on_candle1s(row)
 
         self.assertIsNotNone(out)
-        self.assertEqual(out.symbol, "BTC-USDT-SWAP")
-        self.assertEqual(out.channel, "bar_3s")
-        self.assertEqual(out.ts_event, 1000)
-        self.assertEqual(out.ts_recv, 3001)
-        self.assertEqual(out.open, 1.0)
-        self.assertEqual(out.high, 5.0)
-        self.assertEqual(out.low, 0.5)
-        self.assertEqual(out.close, 4.0)
-        self.assertEqual(out.vol, 33.0)
+        self.assertEqual(out[0], 1000.0)
+        self.assertEqual(out[1], 1.0)
+        self.assertEqual(out[2], 5.0)
+        self.assertEqual(out[3], 0.5)
+        self.assertEqual(out[4], 4.0)
+        self.assertEqual(out[5], 33.0)
 
 
 class CacheTest(unittest.TestCase):
     def test_bar_cache_trims_and_returns_copies(self):
         cache = BarCache(window_length=2)
-        cache.append(
-            BarEvent("BTC-USDT-SWAP", "bar_5s", 1000, 1001, 1.0, 2.0, 0.5, 1.5, 10.0)
-        )
-        cache.append(
-            BarEvent("BTC-USDT-SWAP", "bar_5s", 2000, 2001, 1.5, 2.5, 1.0, 2.0, 11.0)
-        )
-        cache.append(
-            BarEvent("BTC-USDT-SWAP", "bar_5s", 3000, 3001, 2.0, 3.0, 1.5, 2.5, 12.0)
-        )
+        cache.append("BTC-USDT-SWAP", np.array([1000, 1.0, 2.0, 0.5, 1.5, 10.0]))
+        cache.append("BTC-USDT-SWAP", np.array([2000, 1.5, 2.5, 1.0, 2.0, 11.0]))
+        cache.append("BTC-USDT-SWAP", np.array([3000, 2.0, 3.0, 1.5, 2.5, 12.0]))
 
         snapshot = cache.snapshot()
         self.assertEqual(snapshot["BTC-USDT-SWAP"].shape, (2, 6))
@@ -82,98 +74,48 @@ class CacheTest(unittest.TestCase):
 
     def test_trade_cache_returns_deep_copies(self):
         cache = TradeCache(window_length=2)
-        first = TradeEvent(
-            symbol="BTC-USDT-SWAP",
-            channel="trades-all",
-            ts_event=1000,
-            ts_recv=1001,
-            trade_id="t1",
-            px=100.0,
-            sz=1.0,
-            side="buy",
-        )
-        second = TradeEvent(
-            symbol="BTC-USDT-SWAP",
-            channel="trades-all",
-            ts_event=2000,
-            ts_recv=2001,
-            trade_id="t2",
-            px=101.0,
-            sz=2.0,
-            side="sell",
-        )
-        third = TradeEvent(
-            symbol="BTC-USDT-SWAP",
-            channel="trades-all",
-            ts_event=3000,
-            ts_recv=3001,
-            trade_id="t3",
-            px=102.0,
-            sz=3.0,
-            side="buy",
-        )
-        cache.append(first)
-        cache.append(second)
-        cache.append(third)
+        cache.extend("BTC-USDT-SWAP", np.array([[100.0, 1.0, TRADE_SIDE_BUY]]))
+        cache.extend("BTC-USDT-SWAP", np.array([[101.0, 2.0, TRADE_SIDE_SELL]]))
+        cache.extend("BTC-USDT-SWAP", np.array([[102.0, 3.0, TRADE_SIDE_BUY]]))
 
         rows = cache.get_window("BTC-USDT-SWAP")
-        self.assertEqual([row.trade_id for row in rows], ["t2", "t3"])
-        rows[0].trade_id = "mutated"
+        self.assertTrue(np.array_equal(rows[:, 0], np.array([101.0, 102.0])))
+        rows[0, 0] = -1.0
         latest = cache.latest("BTC-USDT-SWAP")
-        self.assertEqual(latest.trade_id, "t3")
+        self.assertEqual(latest[0], 102.0)
 
     def test_book_cache_tracks_latest_and_history(self):
         cache = BookCache(history_length=2)
-        b1 = BookEvent(
-            symbol="BTC-USDT-SWAP",
-            channel="books5",
-            ts_event=1000,
-            ts_recv=1001,
-            best_bid_px=100.0,
-            best_bid_sz=1.0,
-            best_ask_px=100.1,
-            best_ask_sz=2.0,
-            bids=[BookLevel(100.0, 1.0)],
-            asks=[BookLevel(100.1, 2.0)],
-        )
-        b2 = BookEvent(
-            symbol="BTC-USDT-SWAP",
-            channel="books5",
-            ts_event=2000,
-            ts_recv=2001,
-            best_bid_px=101.0,
-            best_bid_sz=3.0,
-            best_ask_px=101.1,
-            best_ask_sz=4.0,
-            bids=[BookLevel(101.0, 3.0)],
-            asks=[BookLevel(101.1, 4.0)],
-        )
-        b3 = BookEvent(
-            symbol="BTC-USDT-SWAP",
-            channel="books5",
-            ts_event=3000,
-            ts_recv=3001,
-            best_bid_px=102.0,
-            best_bid_sz=5.0,
-            best_ask_px=102.1,
-            best_ask_sz=6.0,
-            bids=[BookLevel(102.0, 5.0)],
-            asks=[BookLevel(102.1, 6.0)],
-        )
-        cache.update(b1)
-        cache.update(b2)
-        cache.update(b3)
+        row1 = np.full(20, np.nan)
+        row1[BID_PX_SLICE.start] = 100.0
+        row1[BID_SZ_SLICE.start] = 1.0
+        row1[ASK_PX_SLICE.start] = 100.1
+        row1[ASK_SZ_SLICE.start] = 2.0
+        row2 = np.full(20, np.nan)
+        row2[BID_PX_SLICE.start] = 101.0
+        row2[BID_SZ_SLICE.start] = 3.0
+        row2[ASK_PX_SLICE.start] = 101.1
+        row2[ASK_SZ_SLICE.start] = 4.0
+        row3 = np.full(20, np.nan)
+        row3[BID_PX_SLICE.start] = 102.0
+        row3[BID_SZ_SLICE.start] = 5.0
+        row3[ASK_PX_SLICE.start] = 102.1
+        row3[ASK_SZ_SLICE.start] = 6.0
+        cache.extend("BTC-USDT-SWAP", np.vstack([row1, row2]))
+        cache.extend("BTC-USDT-SWAP", row3.reshape(1, -1))
 
         latest = cache.latest("BTC-USDT-SWAP")
-        self.assertEqual(latest.best_bid_px, 102.0)
+        self.assertEqual(latest[BID_PX_SLICE.start], 102.0)
 
         window = cache.get_window("BTC-USDT-SWAP")
-        self.assertEqual([row.ts_event for row in window], [2000, 3000])
+        self.assertEqual(window.shape, (2, 20))
+        self.assertEqual(window[0, BID_PX_SLICE.start], 101.0)
+        self.assertEqual(window[1, BID_PX_SLICE.start], 102.0)
 
-        snapshot = cache.latest_snapshot()
-        snapshot["BTC-USDT-SWAP"].best_bid_px = -1.0
+        snapshot = cache.snapshot()
+        snapshot["BTC-USDT-SWAP"][0, BID_PX_SLICE.start] = -1.0
         latest_again = cache.latest("BTC-USDT-SWAP")
-        self.assertEqual(latest_again.best_bid_px, 102.0)
+        self.assertEqual(latest_again[BID_PX_SLICE.start], 102.0)
 
 
 class DataflowManagerTest(unittest.TestCase):

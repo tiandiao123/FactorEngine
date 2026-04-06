@@ -125,6 +125,5 @@ class BarDataflowWorker:
             if bar is None:
                 continue
 
-            self._bar_cache.append(bar)
+            self._bar_cache.append(symbol, bar)
             self._bar_count += 1
-

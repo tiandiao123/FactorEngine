@@ -8,9 +8,10 @@ import logging
 from typing import Callable
 
 import aiohttp
+import numpy as np
 
-from ..events import BookEvent, BookLevel
-from .common import MAX_SUBS_PER_CONN, OKX_WS_PUBLIC, SUBS_BATCH_SIZE, chunk, now_ms
+from ..events import ASK_PX_SLICE, ASK_SZ_SLICE, BID_PX_SLICE, BID_SZ_SLICE, BOOK_LEVELS, BOOK_NUM_FIELDS
+from .common import MAX_SUBS_PER_CONN, OKX_WS_PUBLIC, SUBS_BATCH_SIZE, chunk
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ class OKXBookCollector:
     def __init__(
         self,
         symbols: list[str],
-        on_books: Callable[[list[BookEvent]], None],
+        on_books: Callable[[str, np.ndarray], None],
         channels: tuple[str, ...] = ("books5",),
     ):
         invalid = set(channels) - _PUBLIC_BOOK_CHANNELS
@@ -91,48 +92,26 @@ class OKXBookCollector:
             return
 
         arg = payload.get("arg", {})
-        channel = arg.get("channel", "")
         inst_id = arg.get("instId", "")
-        ts_recv = now_ms()
-        events: list[BookEvent] = []
+        rows_arr = np.full((len(rows), BOOK_NUM_FIELDS), np.nan, dtype=np.float64)
+        valid = 0
         for row in rows:
-            bids = [
-                BookLevel(
-                    px=float(level[0]),
-                    sz=float(level[1]),
-                    orders=int(level[3]) if len(level) > 3 and level[3] else None,
-                )
-                for level in row.get("bids", [])
-            ]
-            asks = [
-                BookLevel(
-                    px=float(level[0]),
-                    sz=float(level[1]),
-                    orders=int(level[3]) if len(level) > 3 and level[3] else None,
-                )
-                for level in row.get("asks", [])
-            ]
+            bids = row.get("bids", [])
+            asks = row.get("asks", [])
             if not bids or not asks:
                 continue
 
-            events.append(
-                BookEvent(
-                    symbol=inst_id,
-                    channel=channel,
-                    ts_event=int(row["ts"]),
-                    ts_recv=ts_recv,
-                    best_bid_px=bids[0].px,
-                    best_bid_sz=bids[0].sz,
-                    best_ask_px=asks[0].px,
-                    best_ask_sz=asks[0].sz,
-                    bids=bids,
-                    asks=asks,
-                )
-            )
+            out = rows_arr[valid]
+            for level_idx, level in enumerate(bids[:BOOK_LEVELS]):
+                out[BID_PX_SLICE.start + level_idx] = float(level[0])
+                out[BID_SZ_SLICE.start + level_idx] = float(level[1])
+            for level_idx, level in enumerate(asks[:BOOK_LEVELS]):
+                out[ASK_PX_SLICE.start + level_idx] = float(level[0])
+                out[ASK_SZ_SLICE.start + level_idx] = float(level[1])
+            valid += 1
 
-        if events:
-            self.on_books(events)
+        if valid:
+            self.on_books(inst_id, rows_arr[:valid])
 
     def stop(self):
         self._running = False
-

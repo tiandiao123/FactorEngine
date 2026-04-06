@@ -2,20 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import numpy as np
 
-from ..events import BarEvent
-
-
-@dataclass(slots=True)
-class _PartialBar:
-    ts_event: int
-    ts_recv: int
-    open: float
-    high: float
-    low: float
-    close: float
-    vol: float
 
 
 class BarAggregator:
@@ -23,42 +11,43 @@ class BarAggregator:
 
     def __init__(self, agg_seconds: int = 5):
         self.agg_seconds = agg_seconds
-        self._buf: list[_PartialBar] = []
+        self._buf: list[np.ndarray] = []
 
-    def on_candle1s(self, record: dict) -> BarEvent | None:
+    def on_candle1s(self, record: dict) -> np.ndarray | None:
         """Feed one OKX candle1s record and return an aggregated bar if complete."""
         raw = record["raw"]
         if raw[-1] != "1":
             return None
 
-        partial = _PartialBar(
-            ts_event=int(raw[0]),
-            ts_recv=int(record.get("ts_recv", raw[0])),
-            open=float(raw[1]),
-            high=float(raw[2]),
-            low=float(raw[3]),
-            close=float(raw[4]),
-            vol=float(raw[5]),
+        partial = np.array(
+            [
+                int(raw[0]),
+                float(raw[1]),
+                float(raw[2]),
+                float(raw[3]),
+                float(raw[4]),
+                float(raw[5]),
+            ],
+            dtype=np.float64,
         )
         self._buf.append(partial)
         if len(self._buf) < self.agg_seconds:
             return None
 
-        bar = self._merge(symbol=record.get("instId", ""))
+        bar = self._merge()
         self._buf.clear()
         return bar
 
-    def _merge(self, symbol: str) -> BarEvent:
+    def _merge(self) -> np.ndarray:
         buf = self._buf
-        return BarEvent(
-            symbol=symbol,
-            channel=f"bar_{self.agg_seconds}s",
-            ts_event=buf[0].ts_event,
-            ts_recv=buf[-1].ts_recv,
-            open=buf[0].open,
-            high=max(bar.high for bar in buf),
-            low=min(bar.low for bar in buf),
-            close=buf[-1].close,
-            vol=sum(bar.vol for bar in buf),
+        return np.array(
+            [
+                buf[0][0],
+                buf[0][1],
+                max(bar[2] for bar in buf),
+                min(bar[3] for bar in buf),
+                buf[-1][4],
+                sum(bar[5] for bar in buf),
+            ],
+            dtype=np.float64,
         )
-

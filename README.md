@@ -68,10 +68,10 @@ engine.start()
 cd FactorEngine
 
 # Specific symbols
-python -m tests.test_live BTC-USDT-SWAP ETH-USDT-SWAP
+python -m tests.test_dataflow_live BTC-USDT-SWAP ETH-USDT-SWAP
 
-# All SWAP contracts
-python -m tests.test_live
+# Default symbol: BTC-USDT-SWAP
+python -m tests.test_dataflow_live
 ```
 
 ## API
@@ -109,7 +109,8 @@ FactorEngine/
   factorengine/
     engine.py         # Engine entry point + get_data()
   tests/
-    test_live.py      # Live test script
+    test_dataflow_live.py  # Live dataflow smoke test
+    test_micro_ws.py       # Raw OKX stream debug test
   docs/               # Design docs, test report, tutorial
 ```
 

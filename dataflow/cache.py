@@ -1,16 +1,12 @@
-"""Thread-safe cache containers for dataflow streams."""
+"""Thread-safe array caches for bars, trades and books."""
 
 from __future__ import annotations
 
-import copy
-from collections import deque
 import threading
 
 import numpy as np
 
-from .events import BarEvent, BookEvent, TradeEvent
-
-BAR_NUM_FIELDS = 6
+from .events import BAR_NUM_FIELDS, BOOK_NUM_FIELDS, TRADE_NUM_FIELDS
 
 
 class BarCache:
@@ -26,20 +22,17 @@ class BarCache:
         self._data = storage if storage is not None else {}
         self._lock = lock or threading.Lock()
 
-    def append(self, event: BarEvent):
-        row = np.array(
-            [event.ts_event, event.open, event.high, event.low, event.close, event.vol],
-            dtype=np.float64,
-        )
+    def append(self, symbol: str, row: np.ndarray):
+        row = np.asarray(row, dtype=np.float64).reshape(1, BAR_NUM_FIELDS)
         with self._lock:
-            if event.symbol not in self._data:
-                self._data[event.symbol] = row.reshape(1, BAR_NUM_FIELDS)
+            if symbol not in self._data:
+                self._data[symbol] = row
                 return
 
-            arr = np.vstack([self._data[event.symbol], row])
+            arr = np.vstack([self._data[symbol], row])
             if len(arr) > self.window_length:
                 arr = arr[-self.window_length :]
-            self._data[event.symbol] = arr
+            self._data[symbol] = arr
 
     def snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
         with self._lock:
@@ -68,51 +61,59 @@ class BarCache:
 
 
 class TradeCache:
-    """Thread-safe rolling trade cache."""
+    """Thread-safe rolling trade cache backed by dense numeric arrays."""
 
     def __init__(
         self,
         window_length: int = 10_000,
-        storage: dict[str, deque[TradeEvent]] | None = None,
+        storage: dict[str, np.ndarray] | None = None,
         lock: threading.Lock | None = None,
     ):
         self.window_length = window_length
         self._data = storage if storage is not None else {}
         self._lock = lock or threading.Lock()
 
-    def append(self, event: TradeEvent):
+    def extend(self, symbol: str, rows: np.ndarray):
+        rows = np.asarray(rows, dtype=np.float64)
+        if rows.size == 0:
+            return
+        rows = rows.reshape(-1, TRADE_NUM_FIELDS)
         with self._lock:
-            buf = self._data.setdefault(event.symbol, deque(maxlen=self.window_length))
-            buf.append(event)
+            if symbol not in self._data:
+                self._data[symbol] = rows[-self.window_length :]
+                return
 
-    def snapshot(self, symbols: list[str] | None = None) -> dict[str, list[TradeEvent]]:
+            arr = np.vstack([self._data[symbol], rows])
+            if len(arr) > self.window_length:
+                arr = arr[-self.window_length :]
+            self._data[symbol] = arr
+
+    def snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
         with self._lock:
             if symbols is None:
-                target = self._data.items()
-            else:
-                target = (
-                    (sym, self._data[sym])
-                    for sym in symbols
-                    if sym in self._data
-                )
-            return {sym: list(copy.deepcopy(buf)) for sym, buf in target}
+                return {sym: arr.copy() for sym, arr in self._data.items()}
+            return {
+                sym: self._data[sym].copy()
+                for sym in symbols
+                if sym in self._data
+            }
 
-    def get_window(self, symbol: str, limit: int | None = None) -> list[TradeEvent]:
+    def get_window(self, symbol: str, limit: int | None = None) -> np.ndarray:
         with self._lock:
-            buf = self._data.get(symbol)
-            if not buf:
-                return []
-            rows = list(buf)
+            arr = self._data.get(symbol)
+            if arr is None or len(arr) == 0:
+                return np.empty((0, TRADE_NUM_FIELDS), dtype=np.float64)
+            rows = arr
             if limit is not None:
                 rows = rows[-limit:]
-            return copy.deepcopy(rows)
+            return rows.copy()
 
-    def latest(self, symbol: str) -> TradeEvent | None:
+    def latest(self, symbol: str) -> np.ndarray | None:
         with self._lock:
-            buf = self._data.get(symbol)
-            if not buf:
+            arr = self._data.get(symbol)
+            if arr is None or len(arr) == 0:
                 return None
-            return copy.deepcopy(buf[-1])
+            return arr[-1].copy()
 
     @property
     def lock(self) -> threading.Lock:
@@ -120,56 +121,63 @@ class TradeCache:
 
 
 class BookCache:
-    """Thread-safe shallow order-book cache with latest snapshot and short history."""
+    """Thread-safe shallow order-book cache backed by dense numeric arrays."""
 
     def __init__(
         self,
         history_length: int = 1_000,
-        latest: dict[str, BookEvent] | None = None,
-        history: dict[str, deque[BookEvent]] | None = None,
+        storage: dict[str, np.ndarray] | None = None,
         lock: threading.Lock | None = None,
     ):
         self.history_length = history_length
-        self._latest = latest if latest is not None else {}
-        self._history = history if history is not None else {}
+        self._data = storage if storage is not None else {}
         self._lock = lock or threading.Lock()
 
-    def update(self, event: BookEvent):
+    def extend(self, symbol: str, rows: np.ndarray):
+        rows = np.asarray(rows, dtype=np.float64)
+        if rows.size == 0:
+            return
+        rows = rows.reshape(-1, BOOK_NUM_FIELDS)
         with self._lock:
-            self._latest[event.symbol] = event
-            buf = self._history.setdefault(event.symbol, deque(maxlen=self.history_length))
-            buf.append(event)
+            if symbol not in self._data:
+                self._data[symbol] = rows[-self.history_length :]
+                return
 
-    def latest(self, symbol: str) -> BookEvent | None:
+            arr = np.vstack([self._data[symbol], rows])
+            if len(arr) > self.history_length:
+                arr = arr[-self.history_length :]
+            self._data[symbol] = arr
+
+    def latest(self, symbol: str) -> np.ndarray | None:
         with self._lock:
-            event = self._latest.get(symbol)
-            if event is None:
+            arr = self._data.get(symbol)
+            if arr is None or len(arr) == 0:
                 return None
-            return copy.deepcopy(event)
+            return arr[-1].copy()
 
-    def latest_snapshot(self, symbols: list[str] | None = None) -> dict[str, BookEvent]:
+    def snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
         with self._lock:
             if symbols is None:
-                target = self._latest.items()
-            else:
-                target = (
-                    (sym, self._latest[sym])
-                    for sym in symbols
-                    if sym in self._latest
-                )
-            return {sym: copy.deepcopy(event) for sym, event in target}
+                return {sym: arr.copy() for sym, arr in self._data.items()}
+            return {
+                sym: self._data[sym].copy()
+                for sym in symbols
+                if sym in self._data
+            }
 
-    def get_window(self, symbol: str, limit: int | None = None) -> list[BookEvent]:
+    def latest_snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
+        return self.snapshot(symbols)
+
+    def get_window(self, symbol: str, limit: int | None = None) -> np.ndarray:
         with self._lock:
-            buf = self._history.get(symbol)
-            if not buf:
-                return []
-            rows = list(buf)
+            arr = self._data.get(symbol)
+            if arr is None or len(arr) == 0:
+                return np.empty((0, BOOK_NUM_FIELDS), dtype=np.float64)
+            rows = arr
             if limit is not None:
                 rows = rows[-limit:]
-            return copy.deepcopy(rows)
+            return rows.copy()
 
     @property
     def lock(self) -> threading.Lock:
         return self._lock
-

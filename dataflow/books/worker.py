@@ -6,8 +6,9 @@ import asyncio
 import logging
 import threading
 
+import numpy as np
+
 from ..cache import BookCache
-from ..events import BookEvent
 from ..okx.book_collector import OKXBookCollector
 
 logger = logging.getLogger(__name__)
@@ -55,8 +56,8 @@ class BookDataflowWorker:
             self._thread.join(timeout=5)
         logger.info("Book worker stopped")
 
-    def snapshot(self, symbols: list[str] | None = None) -> dict[str, BookEvent]:
-        return self._book_cache.latest_snapshot(symbols)
+    def snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
+        return self._book_cache.snapshot(symbols)
 
     @property
     def cache(self) -> BookCache:
@@ -97,8 +98,6 @@ class BookDataflowWorker:
         except asyncio.CancelledError:
             pass
 
-    def _on_books(self, events: list[BookEvent]):
-        for event in events:
-            self._book_cache.update(event)
-            self._book_count += 1
-
+    def _on_books(self, symbol: str, rows: np.ndarray):
+        self._book_cache.extend(symbol, rows)
+        self._book_count += len(rows)

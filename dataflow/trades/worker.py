@@ -6,8 +6,9 @@ import asyncio
 import logging
 import threading
 
+import numpy as np
+
 from ..cache import TradeCache
-from ..events import TradeEvent
 from ..okx.trade_collector import OKXTradeCollector
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,7 @@ class TradeDataflowWorker:
             self._thread.join(timeout=5)
         logger.info("Trade worker stopped")
 
-    def snapshot(self, symbols: list[str] | None = None) -> dict[str, list[TradeEvent]]:
+    def snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
         return self._trade_cache.snapshot(symbols)
 
     @property
@@ -97,8 +98,6 @@ class TradeDataflowWorker:
         except asyncio.CancelledError:
             pass
 
-    def _on_trades(self, events: list[TradeEvent]):
-        for event in events:
-            self._trade_cache.append(event)
-            self._trade_count += 1
-
+    def _on_trades(self, symbol: str, rows: np.ndarray):
+        self._trade_cache.extend(symbol, rows)
+        self._trade_count += len(rows)

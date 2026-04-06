@@ -18,6 +18,7 @@ import time
 
 sys.path.insert(0, ".")
 
+from dataflow.events import ASK_PX_SLICE, ASK_SZ_SLICE, BID_PX_SLICE, BID_SZ_SLICE
 from factorengine.engine import Engine
 
 logging.basicConfig(
@@ -37,24 +38,30 @@ def _fmt_bar(snapshot: dict, symbol: str) -> str:
 
 
 def _fmt_trade(snapshot: dict, symbol: str) -> str:
-    rows = snapshot.get(symbol)
-    if not rows:
+    arr = snapshot.get(symbol)
+    if arr is None or len(arr) == 0:
         return "trade=missing"
-    latest = rows[-1]
+    latest = arr[-1]
+    side = "buy" if latest[2] > 0 else "sell"
     return (
-        f"trade_px={latest.px:.4f} trade_sz={latest.sz:.4f} "
-        f"trade_side={latest.side} trade_channel={latest.channel}"
+        f"trade_px={latest[0]:.4f} trade_sz={latest[1]:.4f} "
+        f"trade_side={side}"
     )
 
 
 def _fmt_book(snapshot: dict, symbol: str) -> str:
-    book = snapshot.get(symbol)
-    if book is None:
+    arr = snapshot.get(symbol)
+    if arr is None or len(arr) == 0:
         return "book=missing"
-    spread = book.best_ask_px - book.best_bid_px
+    latest = arr[-1]
+    bid_px = latest[BID_PX_SLICE.start]
+    bid_sz = latest[BID_SZ_SLICE.start]
+    ask_px = latest[ASK_PX_SLICE.start]
+    ask_sz = latest[ASK_SZ_SLICE.start]
+    spread = ask_px - bid_px
     return (
-        f"bid={book.best_bid_px:.4f}@{book.best_bid_sz:.4f} "
-        f"ask={book.best_ask_px:.4f}@{book.best_ask_sz:.4f} "
+        f"bid={bid_px:.4f}@{bid_sz:.4f} "
+        f"ask={ask_px:.4f}@{ask_sz:.4f} "
         f"spread={spread:.10f}"
     )
 
