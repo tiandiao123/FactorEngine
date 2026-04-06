@@ -86,19 +86,19 @@ OKX candle1s
 - `OKXCollector` 名称偏泛化，但实现实际上是 bar collector
 - 若继续叠加 `trades` / `books` 逻辑，这个文件会很快失控
 
-#### `tests/test_live.py`
+#### `tests/test_dataflow_live.py`
 
 当前职责：
 
 - 手动启动 `Engine`
-- 每 `pull_interval` 秒拉一次 bar snapshot
-- 打印和保存当前快照
+- 同时拉取 `bars` / `trades` / `books`
+- 打印当前三路 dataflow 状态
 
 当前特点：
 
-- 本质上是 bar-only 的集成手动测试
+- 本质上是新的 dataflow 集成手动测试
 - 工作模式是“定时拉快照”
-- 这个脚本未来应该保留，但定位要改成 `bars live test`
+- 是当前正式 dataflow 路径的主要 smoke test
 
 #### `tests/test_micro_ws.py`
 
@@ -182,7 +182,7 @@ Books Dataflow
 
 目前测试主要是：
 
-- `test_live.py`
+- `test_dataflow_live.py`
 - `test_micro_ws.py`
 
 这对探索阶段是够的，但对正式重构不够。后续需要：
@@ -262,7 +262,7 @@ FactorEngine/
     runtime/
       ...
   tests/
-    test_live.py
+    test_dataflow_live.py
     test_micro_ws.py
     test_events.py
     test_cache.py
@@ -357,24 +357,19 @@ FactorEngine/
 
 第一阶段不追求完全抽象到极致，先把功能边界切干净。
 
-### 6.4 `tests/test_live.py`
+### 6.4 `tests/test_dataflow_live.py`
 
-建议保留，但重新定位。
+建议保留，作为当前正式 dataflow 的 live smoke test。
 
-新定位：
+当前定位：
 
-- `bars live integration test`
+- `bars + trades + books live integration test`
 
-未来可以继续保留当前行为：
+主要用途：
 
-- 每 10 秒拉一次 bar snapshot
-- 保存 CSV
-- 验证 bar cache 是否稳定
-
-但文案和注释要改成：
-
-- 这是 bars 路径测试
-- 不是整个新架构的完整测试
+- 验证 `Engine` 能否同时拉起三路 dataflow
+- 定时查看三路 cache 是否都在更新
+- 用最少人工成本检查主路径是否通
 
 ### 6.5 `tests/test_micro_ws.py`
 
@@ -511,7 +506,7 @@ trade/book cache 可以先用 deque 或 list + trim。
 
 验收标准：
 
-- `tests/test_live.py` 行为不变
+- `tests/test_dataflow_live.py` 行为正常
 - 当前 bar snapshot 输出仍然稳定
 
 ### Phase 1：抽出事件模型和 cache 抽象

@@ -32,7 +32,9 @@ engine = Engine(
     symbols=["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
     data_freq="5s",        # aggregate 1s candles into 5s bars
     pull_interval="10s",   # how often you pull data
-    window_length=1000,    # max bars to keep per symbol
+    bar_window_length=1000,    # max bars to keep per symbol
+    trade_window_length=10000, # max trade events to keep per symbol
+    book_history_length=1000,  # max book updates to keep per symbol
 )
 engine.start()
 
@@ -66,17 +68,17 @@ engine.start()
 cd FactorEngine
 
 # Specific symbols
-python -m tests.test_live BTC-USDT-SWAP ETH-USDT-SWAP
+python -m tests.test_dataflow_live BTC-USDT-SWAP ETH-USDT-SWAP
 
-# All SWAP contracts
-python -m tests.test_live
+# Default symbol: BTC-USDT-SWAP
+python -m tests.test_dataflow_live
 ```
 
 ## API
 
 | Method | Description |
 |--------|-------------|
-| `Engine(symbols, data_freq, pull_interval, window_length)` | Create engine |
+| `Engine(symbols, data_freq, pull_interval, bar_window_length, trade_window_length, book_history_length, ...)` | Create engine |
 | `engine.start()` | Start dataflow thread |
 | `engine.stop()` | Graceful shutdown |
 | `engine.get_data()` | Snapshot of all symbols |
@@ -107,7 +109,8 @@ FactorEngine/
   factorengine/
     engine.py         # Engine entry point + get_data()
   tests/
-    test_live.py      # Live test script
+    test_dataflow_live.py  # Live dataflow smoke test
+    test_micro_ws.py       # Raw OKX stream debug test
   docs/               # Design docs, test report, tutorial
 ```
 
