@@ -102,7 +102,7 @@ def main():
         symbols=symbols,
         data_freq="5s",
         pull_interval="10s",
-        window_length=1000,
+        bar_window_length=1000,
     )
     engine.start()
 
