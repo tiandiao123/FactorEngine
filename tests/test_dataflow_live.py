@@ -80,12 +80,14 @@ def _fmt_bar(snapshot: dict, symbol: str) -> str:
     recent = arr[-min(3, len(arr)) :]
     lines = [
         f"bars rows={arr.shape[0]} latest_close={latest[4]:.4f} latest_vol={latest[5]:.4f}"
+        f" vol_ccy={latest[6]:.4f} vol_ccy_quote={latest[7]:.2f}"
     ]
     start_idx = arr.shape[0] - recent.shape[0] + 1
     for idx, row in enumerate(recent, start=start_idx):
         lines.append(
             f"  bar[{idx}] ts={int(row[0])} O={row[1]:.4f} H={row[2]:.4f} "
-            f"L={row[3]:.4f} C={row[4]:.4f} V={row[5]:.4f}"
+            f"L={row[3]:.4f} C={row[4]:.4f} V={row[5]:.4f} "
+            f"Vccy={row[6]:.4f} Vquote={row[7]:.2f}"
         )
     return "\n".join(lines)
 
@@ -177,7 +179,7 @@ def main():
             #   ...
             # }
             # 每行一根 bar，列顺序:
-            # [ts, open, high, low, close, vol]
+            # [ts, open, high, low, close, vol, vol_ccy, vol_ccy_quote]
             bar_snapshot = engine.get_data(symbols)
 
             # trade_snapshot:

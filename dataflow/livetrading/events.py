@@ -6,7 +6,7 @@ column layout used by factorengine-facing numpy arrays.
 
 from __future__ import annotations
 
-BAR_COLUMNS = ("ts", "open", "high", "low", "close", "vol")
+BAR_COLUMNS = ("ts", "open", "high", "low", "close", "vol", "vol_ccy", "vol_ccy_quote")
 BAR_NUM_FIELDS = len(BAR_COLUMNS)
 
 TRADE_COLUMNS = ("px", "sz", "side")

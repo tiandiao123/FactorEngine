@@ -27,6 +27,8 @@ class BarAggregator:
                 float(raw[3]),
                 float(raw[4]),
                 float(raw[5]),
+                float(raw[6]),
+                float(raw[7]),
             ],
             dtype=np.float64,
         )
@@ -48,6 +50,8 @@ class BarAggregator:
                 min(bar[3] for bar in buf),
                 buf[-1][4],
                 sum(bar[5] for bar in buf),
+                sum(bar[6] for bar in buf),
+                sum(bar[7] for bar in buf),
             ],
             dtype=np.float64,
         )
