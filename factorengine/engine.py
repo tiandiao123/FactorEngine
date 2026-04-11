@@ -44,6 +44,7 @@ class Engine:
         bar_window_length: int = 1000,
         trade_window_length: int = 10_000,
         book_history_length: int = 1_000,
+        enable_bars: bool = True,
         enable_trades: bool = False,
         trade_channels: tuple[str, ...] = ("trades-all",),
         enable_books: bool = False,
@@ -55,6 +56,7 @@ class Engine:
         self.bar_window_length = bar_window_length
         self.trade_window_length = trade_window_length
         self.book_history_length = book_history_length
+        self.enable_bars = enable_bars
         self.enable_trades = enable_trades
         self.trade_channels = trade_channels
         self.enable_books = enable_books
@@ -69,6 +71,7 @@ class Engine:
             bar_window_length=bar_window_length,
             trade_window_length=trade_window_length,
             book_history_length=book_history_length,
+            enable_bars=enable_bars,
             enable_trades=enable_trades,
             trade_channels=trade_channels,
             enable_books=enable_books,

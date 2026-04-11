@@ -1,45 +1,31 @@
-"""Dataflow package exports."""
+"""Dataflow top-level package.
 
-from .books import BookDataflowWorker
-from .cache import BarCache, BookCache, TradeCache
-from .events import (
-    ASK_PX_SLICE,
-    ASK_SZ_SLICE,
-    BAR_COLUMNS,
-    BAR_NUM_FIELDS,
-    BID_PX_SLICE,
-    BID_SZ_SLICE,
-    BOOK_COLUMNS,
-    BOOK_LEVELS,
-    BOOK_NUM_FIELDS,
-    TRADE_COLUMNS,
-    TRADE_NUM_FIELDS,
-    TRADE_SIDE_BUY,
-    TRADE_SIDE_SELL,
-    encode_trade_side,
-)
-from .manager import DataflowManager
-from .trades import TradeDataflowWorker
+Re-exports public API from the livetrading sub-package so that existing
+``from dataflow.events import ...`` / ``from dataflow.manager import ...``
+imports keep working after the move to dataflow/livetrading/.
+"""
 
-__all__ = [
-    "ASK_PX_SLICE",
-    "ASK_SZ_SLICE",
-    "BarCache",
-    "BAR_COLUMNS",
-    "BAR_NUM_FIELDS",
-    "BID_PX_SLICE",
-    "BID_SZ_SLICE",
-    "BookCache",
-    "BookDataflowWorker",
-    "BOOK_COLUMNS",
-    "BOOK_LEVELS",
-    "BOOK_NUM_FIELDS",
-    "DataflowManager",
-    "TradeCache",
-    "TradeDataflowWorker",
-    "TRADE_COLUMNS",
-    "TRADE_NUM_FIELDS",
-    "TRADE_SIDE_BUY",
-    "TRADE_SIDE_SELL",
-    "encode_trade_side",
-]
+import sys
+
+from .livetrading import *  # noqa: F401,F403
+from .livetrading import __all__  # noqa: F401
+
+# Expose sub-packages as ``dataflow.<mod>`` so that old-style
+# ``from dataflow.events import X`` / ``from dataflow.okx.symbols import Y``
+# imports keep resolving after the move to dataflow/livetrading/.
+from .livetrading import bars, books, cache, collector, events, manager, okx, trades  # noqa: F401
+from .livetrading.okx import symbols as _okx_symbols  # noqa: F401
+
+_submodule_aliases = {
+    "dataflow.bars": bars,
+    "dataflow.books": books,
+    "dataflow.cache": cache,
+    "dataflow.collector": collector,
+    "dataflow.events": events,
+    "dataflow.manager": manager,
+    "dataflow.okx": okx,
+    "dataflow.okx.symbols": _okx_symbols,
+    "dataflow.trades": trades,
+}
+for _alias, _mod in _submodule_aliases.items():
+    sys.modules.setdefault(_alias, _mod)
