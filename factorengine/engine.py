@@ -18,6 +18,7 @@ import re
 import numpy as np
 
 from dataflow.manager import DataflowManager
+from dataflow.okx.common import resolve_bar_channel
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,15 @@ class Engine:
 
         self.data_freq_seconds = parse_freq(data_freq)
         self.pull_interval_seconds = parse_freq(pull_interval)
+
+        # Validate that data_freq maps to a valid bar collection strategy.
+        # This will raise ValueError for unsupported frequencies (e.g. "2min").
+        bar_channel, needs_agg = resolve_bar_channel(self.data_freq_seconds)
+        logger.info(
+            "Bar config: data_freq=%s (%ds) → channel=%s, aggregation=%s",
+            data_freq, self.data_freq_seconds, bar_channel,
+            f"{self.data_freq_seconds}s" if needs_agg else "none (direct)",
+        )
 
         self._dataflow = DataflowManager(
             symbols=symbols,

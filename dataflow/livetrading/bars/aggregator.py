@@ -13,6 +13,30 @@ class BarAggregator:
         self.agg_seconds = agg_seconds
         self._buf: list[np.ndarray] = []
 
+    @staticmethod
+    def parse_bar(record: dict) -> np.ndarray | None:
+        """Parse one confirmed OKX candle record into a bar array.
+
+        Used by direct-channel mode (>= 1min) where no aggregation is needed.
+        Returns None if the candle is not yet confirmed.
+        """
+        raw = record["raw"]
+        if raw[-1] != "1":
+            return None
+        return np.array(
+            [
+                int(raw[0]),
+                float(raw[1]),
+                float(raw[2]),
+                float(raw[3]),
+                float(raw[4]),
+                float(raw[5]),
+                float(raw[6]),
+                float(raw[7]),
+            ],
+            dtype=np.float64,
+        )
+
     def on_candle1s(self, record: dict) -> np.ndarray | None:
         """Feed one OKX candle1s record and return an aggregated bar if complete."""
         raw = record["raw"]

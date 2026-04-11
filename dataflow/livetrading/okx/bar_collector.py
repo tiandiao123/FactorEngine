@@ -1,4 +1,4 @@
-"""OKX WebSocket collector for candle1s data."""
+"""OKX WebSocket collector for candle data."""
 
 from __future__ import annotations
 
@@ -15,11 +15,17 @@ logger = logging.getLogger(__name__)
 
 
 class OKXBarCollector:
-    """Connect to OKX and stream candle1s data for a symbol set."""
+    """Connect to OKX and stream candle data for a symbol set."""
 
-    def __init__(self, symbols: list[str], on_candle1s: Callable[[list[dict]], None]):
+    def __init__(
+        self,
+        symbols: list[str],
+        on_candle: Callable[[list[dict]], None],
+        channel: str = "candle1s",
+    ):
         self.symbols = symbols
-        self.on_candle1s = on_candle1s
+        self.on_candle = on_candle
+        self.channel = channel
         self._running = True
 
     async def run(self):
@@ -44,8 +50,8 @@ class OKXBarCollector:
 
     async def _connect_and_listen(self, session: aiohttp.ClientSession, symbols: list[str]):
         async with session.ws_connect(OKX_WS_BUSINESS, heartbeat=20) as ws:
-            logger.info("WS connected for candle1s (%d symbols)", len(symbols))
-            args = [{"channel": "candle1s", "instId": symbol} for symbol in symbols]
+            logger.info("WS connected for %s (%d symbols)", self.channel, len(symbols))
+            args = [{"channel": self.channel, "instId": symbol} for symbol in symbols]
             for batch in chunk(args, SUBS_BATCH_SIZE):
                 await ws.send_json({"op": "subscribe", "args": batch})
 
@@ -78,7 +84,7 @@ class OKXBarCollector:
             }
             for record in records
         ]
-        self.on_candle1s(wrapped)
+        self.on_candle(wrapped)
 
     def stop(self):
         self._running = False
