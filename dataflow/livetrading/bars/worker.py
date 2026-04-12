@@ -10,6 +10,7 @@ import numpy as np
 
 from ..cache import BarCache
 from ..okx.bar_collector import OKXBarCollector
+from ..okx.common import resolve_bar_channel
 from .aggregator import BarAggregator
 
 logger = logging.getLogger(__name__)
@@ -38,9 +39,15 @@ class BarDataflowWorker:
         self._cache = self._bar_cache.storage
         self._lock = self._bar_cache.lock
 
-        self._aggregators: dict[str, BarAggregator] = {
-            symbol: BarAggregator(agg_seconds) for symbol in symbols
-        }
+        # Resolve whether to subscribe a direct channel or aggregate from 1s.
+        self._bar_channel, self._needs_aggregation = resolve_bar_channel(agg_seconds)
+
+        self._aggregators: dict[str, BarAggregator] = {}
+        if self._needs_aggregation:
+            self._aggregators = {
+                symbol: BarAggregator(agg_seconds) for symbol in symbols
+            }
+
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._collector: OKXBarCollector | None = None
@@ -55,9 +62,10 @@ class BarDataflowWorker:
         )
         self._thread.start()
         logger.info(
-            "Bar worker started (%d symbols, %ds bars, window=%d)",
+            "Bar worker started (%d symbols, channel=%s, agg=%s, window=%d)",
             len(self.symbols),
-            self.agg_seconds,
+            self._bar_channel,
+            f"{self.agg_seconds}s" if self._needs_aggregation else "direct",
             self.window_length,
         )
 
@@ -103,9 +111,11 @@ class BarDataflowWorker:
             self._loop.close()
 
     async def _run(self):
+        callback = self._on_candle_aggregate if self._needs_aggregation else self._on_candle_direct
         collector = OKXBarCollector(
             symbols=self.symbols,
-            on_candle1s=self._on_candle1s,
+            on_candle=callback,
+            channel=self._bar_channel,
         )
         self._collector = collector
         try:
@@ -113,8 +123,18 @@ class BarDataflowWorker:
         except asyncio.CancelledError:
             pass
 
-    def _on_candle1s(self, records: list[dict]):
-        """Callback from OKX bar collector — aggregate and write to cache."""
+    def _on_candle_direct(self, records: list[dict]):
+        """Callback for direct channel mode — parse confirmed candle and write to cache."""
+        for record in records:
+            symbol = record.get("instId", "")
+            bar = BarAggregator.parse_bar(record)
+            if bar is None:
+                continue
+            self._bar_cache.append(symbol, bar)
+            self._bar_count += 1
+
+    def _on_candle_aggregate(self, records: list[dict]):
+        """Callback for candle1s mode — aggregate N candles then write to cache."""
         for record in records:
             symbol = record.get("instId", "")
             agg = self._aggregators.get(symbol)

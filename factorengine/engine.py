@@ -18,6 +18,7 @@ import re
 import numpy as np
 
 from dataflow.manager import DataflowManager
+from dataflow.okx.common import resolve_bar_channel
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,9 @@ class Engine:
         trade_channels: tuple[str, ...] = ("trades-all",),
         enable_books: bool = False,
         book_channels: tuple[str, ...] = ("books5",),
+        mode: str = "live",
+        sim_bar_interval: float | None = None,
+        sim_seed: int | None = None,
     ):
         self.symbols = symbols
         self.data_freq = data_freq
@@ -61,22 +65,50 @@ class Engine:
         self.trade_channels = trade_channels
         self.enable_books = enable_books
         self.book_channels = book_channels
+        self.mode = mode
 
         self.data_freq_seconds = parse_freq(data_freq)
         self.pull_interval_seconds = parse_freq(pull_interval)
 
-        self._dataflow = DataflowManager(
-            symbols=symbols,
-            bar_agg_seconds=self.data_freq_seconds,
-            bar_window_length=bar_window_length,
-            trade_window_length=trade_window_length,
-            book_history_length=book_history_length,
-            enable_bars=enable_bars,
-            enable_trades=enable_trades,
-            trade_channels=trade_channels,
-            enable_books=enable_books,
-            book_channels=book_channels,
-        )
+        if mode == "live":
+            # Validate that data_freq maps to a valid bar collection strategy.
+            # This will raise ValueError for unsupported frequencies (e.g. "2min").
+            bar_channel, needs_agg = resolve_bar_channel(self.data_freq_seconds)
+            logger.info(
+                "Bar config: data_freq=%s (%ds) → channel=%s, aggregation=%s",
+                data_freq, self.data_freq_seconds, bar_channel,
+                f"{self.data_freq_seconds}s" if needs_agg else "none (direct)",
+            )
+
+            self._dataflow = DataflowManager(
+                symbols=symbols,
+                bar_agg_seconds=self.data_freq_seconds,
+                bar_window_length=bar_window_length,
+                trade_window_length=trade_window_length,
+                book_history_length=book_history_length,
+                enable_bars=enable_bars,
+                enable_trades=enable_trades,
+                trade_channels=trade_channels,
+                enable_books=enable_books,
+                book_channels=book_channels,
+            )
+        elif mode == "simulation":
+            from dataflow.simulation.manager import SimDataflowManager
+            self._dataflow = SimDataflowManager(
+                symbols=symbols,
+                bar_interval_seconds=sim_bar_interval if sim_bar_interval is not None else 1.0,
+                bar_window_length=bar_window_length,
+                seed=sim_seed,
+            )
+            logger.info(
+                "Simulation mode: %d symbols, bar_interval=%.2fs, seed=%s",
+                len(symbols),
+                sim_bar_interval if sim_bar_interval is not None else 1.0,
+                sim_seed,
+            )
+        else:
+            raise ValueError(f"Unknown mode: {mode!r}. Use 'live' or 'simulation'.")
+
         # Backward-compatible accessors for the current bar cache.
         self._data_cache = self._dataflow.data_cache
         self._lock = self._dataflow.lock
