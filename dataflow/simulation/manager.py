@@ -6,6 +6,7 @@ live and simulation mode transparently.
 
 from __future__ import annotations
 
+import queue
 import threading
 
 import numpy as np
@@ -32,6 +33,7 @@ class SimDataflowManager:
         volatility: float = 0.001,
         base_volume: float = 100.0,
         seed: int | None = None,
+        bar_queue: queue.Queue | None = None,
     ):
         self.symbols = symbols
 
@@ -56,6 +58,7 @@ class SimDataflowManager:
             bar_cache=self.bar_cache,
             generators=generators,
             interval_seconds=bar_interval_seconds,
+            bar_queue=bar_queue,
         )
 
     # ---- lifecycle ----

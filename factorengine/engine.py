@@ -1,19 +1,42 @@
 """FactorEngine — the top-level Engine class.
 
-Engine is the single entry point: it owns the Dataflow thread and exposes
-get_data() for pulling snapshots from the shared data_cache.
+Engine is the single entry point: it owns the Dataflow thread, optionally
+runs a separate factor inference thread, and exposes get_data() /
+get_factor_outputs() for pulling snapshots.
 
-Usage:
-    engine = Engine(symbols=["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
-                    data_freq="5s", pull_interval="10s")
+Architecture (v2 — signal-decoupled, 3 threads):
+
+    [dataflow thread]  sim-bars
+        generate bar → BarCache.append() → bar_queue.put()
+
+    [runtime thread]  factor-infer
+        bar_queue.get() → push_bars (C++ parallel) → signal_deque.append()
+
+    [main thread]  strategy / consumer
+        get_factor_outputs() → signal_deque[-1]   (O(1), no compute)
+        get_data()           → BarCache.snapshot() (copy)
+
+Usage (without factors):
+    engine = Engine(symbols=["BTC-USDT-SWAP"], mode="simulation", sim_seed=42)
     engine.start()
-    snapshot = engine.get_data()        # {symbol: ndarray(N, 6)}
-    snapshot = engine.get_data(["BTC-USDT-SWAP"])  # filtered
+    snapshot = engine.get_data()
+    engine.stop()
+
+Usage (with C++ factor inference):
+    engine = Engine(symbols=["BTC-USDT-SWAP"], mode="simulation", sim_seed=42,
+                    factor_group="okx_perp", num_threads=4)
+    engine.start()
+    time.sleep(10)                                # wait for warmup
+    factors  = engine.get_factor_outputs()        # {symbol: {factor_id: float}}
+    snapshot = engine.get_data()                  # bar cache snapshot
     engine.stop()
 """
 
 import logging
+import queue
 import re
+import threading
+from collections import deque
 
 import numpy as np
 
@@ -53,6 +76,11 @@ class Engine:
         mode: str = "live",
         sim_bar_interval: float | None = None,
         sim_seed: int | None = None,
+        factor_group: str | None = None,
+        num_threads: int = 4,
+        signal_buffer_size: int = 3,
+        bar_queue_size: int = 16,
+        bar_queue_timeout: float = 0.5,
     ):
         self.symbols = symbols
         self.data_freq = data_freq
@@ -70,9 +98,26 @@ class Engine:
         self.data_freq_seconds = parse_freq(data_freq)
         self.pull_interval_seconds = parse_freq(pull_interval)
 
+        # C++ factor inference engine (optional).
+        self._inference = None
+        self._factor_group = factor_group
+        self._num_threads = num_threads
+        self._factor_ids: list[str] = []
+        self._signal_deque: deque[dict] = deque(maxlen=signal_buffer_size)
+        self._prev_closes: dict[str, float] = {}
+        self._bars_pushed = 0
+
+        # Inter-thread communication: dataflow → runtime.
+        self._bar_queue: queue.Queue | None = None
+        self._bar_queue_timeout = bar_queue_timeout
+        self._runtime_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+        if factor_group:
+            self._init_inference(factor_group, num_threads)
+            self._bar_queue = queue.Queue(maxsize=bar_queue_size)
+
         if mode == "live":
-            # Validate that data_freq maps to a valid bar collection strategy.
-            # This will raise ValueError for unsupported frequencies (e.g. "2min").
             bar_channel, needs_agg = resolve_bar_channel(self.data_freq_seconds)
             logger.info(
                 "Bar config: data_freq=%s (%ds) → channel=%s, aggregation=%s",
@@ -99,6 +144,7 @@ class Engine:
                 bar_interval_seconds=sim_bar_interval if sim_bar_interval is not None else 1.0,
                 bar_window_length=bar_window_length,
                 seed=sim_seed,
+                bar_queue=self._bar_queue,
             )
             logger.info(
                 "Simulation mode: %d symbols, bar_interval=%.2fs, seed=%s",
@@ -113,54 +159,144 @@ class Engine:
         self._data_cache = self._dataflow.data_cache
         self._lock = self._dataflow.lock
 
+    # ── Factor inference ──────────────────────────────────────
+
+    def _init_inference(self, group: str, num_threads: int):
+        import fe_runtime as rt
+        from factorengine.factors import FactorRegistry
+
+        reg = FactorRegistry()
+        reg.load_group(group)
+        self._factor_ids = reg.factor_ids_by_group(group)
+
+        self._inference = rt.InferenceEngine(num_threads=num_threads)
+        for sym in self.symbols:
+            self._inference.add_symbol(sym)
+            for fid, graph in reg.build_group(group).items():
+                self._inference.add_factor(sym, fid, graph)
+
+        logger.info(
+            "InferenceEngine initialized: %d symbols × %d factors, %d threads",
+            len(self.symbols), len(self._factor_ids), num_threads,
+        )
+
+    def _runtime_loop(self):
+        """Runtime thread main loop: pull bars from queue, infer, write deque."""
+        import fe_runtime as rt
+
+        logger.info("factor-infer thread started")
+        while not self._stop_event.is_set():
+            try:
+                round_bars = self._bar_queue.get(timeout=self._bar_queue_timeout)
+            except queue.Empty:
+                continue
+
+            ts_ms = 0
+            batch: dict[str, rt.BarData] = {}
+            for sym, bar in round_bars.items():
+                ts_ms = int(bar[0])
+                close = float(bar[4])
+                volume = float(bar[5])
+                open_ = float(bar[1])
+                high = float(bar[2])
+                low = float(bar[3])
+                prev_close = self._prev_closes.get(sym, close)
+                ret = (close / prev_close - 1.0) if prev_close != 0 else 0.0
+                batch[sym] = rt.BarData(close, volume, open_, high, low, ret)
+                self._prev_closes[sym] = close
+
+            self._inference.push_bars(batch)
+            self._bars_pushed += 1
+
+            result = self._inference.get_all_outputs()
+            self._signal_deque.append({
+                "ts": ts_ms,
+                "bar_index": self._bars_pushed,
+                "factors": result,
+            })
+
+        logger.info("factor-infer thread stopped (bars_pushed=%d)", self._bars_pushed)
+
+    def get_factor_outputs(
+        self, symbols: list[str] | None = None
+    ) -> dict[str, dict[str, float]]:
+        """Get the latest factor values for each symbol.
+
+        Reads from the signal_deque (O(1), no computation triggered).
+
+        Returns:
+            {symbol: {factor_id: float_value}}
+        """
+        if not self._signal_deque:
+            return {}
+        latest = self._signal_deque[-1]["factors"]
+        if symbols is None:
+            return latest
+        return {sym: latest[sym] for sym in symbols if sym in latest}
+
+    @property
+    def factor_ids(self) -> list[str]:
+        """List of registered factor IDs (empty if no factor_group configured)."""
+        return self._factor_ids if self._inference else []
+
+    @property
+    def bars_pushed(self) -> int:
+        """Number of bar rounds pushed to InferenceEngine so far."""
+        return self._bars_pushed
+
+    @property
+    def signal_deque(self) -> deque:
+        """Access the signal buffer (for advanced use / debugging)."""
+        return self._signal_deque
+
+    # ── Dataflow API ──────────────────────────────────────────
+
     def start(self):
-        """Start the dataflow collection threads."""
+        """Start the dataflow collection and (optionally) the inference thread."""
+        if self._bar_queue is not None:
+            self._stop_event.clear()
+            self._runtime_thread = threading.Thread(
+                target=self._runtime_loop, daemon=True, name="factor-infer"
+            )
+            self._runtime_thread.start()
         self._dataflow.start()
         logger.info(
             "Engine started: %d symbols, data_freq=%s (%ds), pull_interval=%s (%ds), "
-            "bar_window=%d, trade_window=%d, book_history=%d",
-                     len(self.symbols), self.data_freq, self.data_freq_seconds,
-                     self.pull_interval, self.pull_interval_seconds, self.bar_window_length,
-                     self.trade_window_length, self.book_history_length)
+            "bar_window=%d, factors=%s",
+            len(self.symbols), self.data_freq, self.data_freq_seconds,
+            self.pull_interval, self.pull_interval_seconds, self.bar_window_length,
+            self._factor_group or "none",
+        )
 
     def stop(self):
-        """Stop the dataflow collection thread."""
+        """Stop the dataflow collection and inference thread."""
         self._dataflow.stop()
+        if self._runtime_thread is not None:
+            self._stop_event.set()
+            self._runtime_thread.join(timeout=5)
+            self._runtime_thread = None
         logger.info("Engine stopped")
 
     def get_data(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
         """Get a snapshot (copy) of the bar cache.
 
-        Args:
-            symbols: If provided, only return data for these symbols.
-                     If None, return all symbols in the cache.
-
         Returns:
-            {symbol: ndarray of shape (N, 6)} where columns are
-            [ts, open, high, low, close, vol].
-            Each array is an independent copy — safe to use freely.
+            {symbol: ndarray of shape (N, 8)} where columns are
+            [ts, open, high, low, close, vol, vol_ccy, vol_ccy_quote].
         """
         return self._dataflow.get_bar_snapshot(symbols)
 
     def get_trade_data(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
-        """Get a snapshot (copy) of the trade cache.
-
-        Returns:
-            {symbol: ndarray of shape (N, 3)} with columns [px, sz, side].
-        """
+        """Get a snapshot (copy) of the trade cache."""
         return self._dataflow.get_trade_snapshot(symbols)
 
     def get_book_data(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
-        """Get a snapshot (copy) of the book cache.
-
-        Returns:
-            {symbol: ndarray of shape (N, 20)} representing books5 rows.
-        """
+        """Get a snapshot (copy) of the book cache."""
         return self._dataflow.get_book_snapshot(symbols)
 
     @property
     def bar_count(self) -> int:
-        """Total number of 5s bars aggregated so far."""
+        """Total number of bars aggregated so far."""
         return self._dataflow.bar_count
 
     @property
