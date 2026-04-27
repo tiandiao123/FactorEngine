@@ -4,6 +4,8 @@
 
 Real-time factor computation stack for **quantitative trading**: a Python **dataflow + cache** layer for OKX perpetual swaps, 33 high-performance **C++ operator kernels** (`fe_ops`) exposed via pybind11, and a **DAG-based factor inference runtime** (`fe_runtime`) that pushes market data through compiled factor graphs in streaming mode.
 
+For a repository walkthrough focused on module boundaries and reading order, see [`docs/TUTORIAL.md`](docs/TUTORIAL.md).
+
 ## Architecture
 
 ```
@@ -211,7 +213,7 @@ Full benchmark data: `docs/20260418/cpp_kernel_progress_report.md`.
 ## Tests
 
 ```bash
-# Run all tests (132 tests)
+# Run all tests
 pytest tests/ -v
 
 # Kernel alignment only
@@ -301,6 +303,11 @@ FactorEngine/
 - CMake >= 3.16, C++17 compiler
 - `aiohttp`, `numpy`, `pybind11` (auto-installed by `pip install -e .`)
 - Dev: `pytest`, `pandas`, `graphviz` (install with `pip install -e ".[dev]"`)
+
+## Documentation
+
+- [`docs/TUTORIAL.md`](docs/TUTORIAL.md) — quick repository walkthrough and module guide
+- [`docs/20260419/engine_architecture_refactor.md`](docs/20260419/engine_architecture_refactor.md) — current engine architecture baseline
 
 ## License
 
