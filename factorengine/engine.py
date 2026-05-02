@@ -4,31 +4,33 @@ Engine is the single entry point: it owns the Dataflow thread, optionally
 runs a separate factor inference thread, and exposes get_data() /
 get_factor_outputs() for pulling snapshots.
 
-Architecture (v2 — signal-decoupled, 3 threads):
+Architecture (v3 — streaming, 3 threads):
 
-    [dataflow thread]  sim-bars
-        generate bar → BarCache.append() → bar_queue.put()
+    [dataflow thread]  okx-kline / sim-bars
+        WS candle / synthetic bar → bar_queue.put()
 
     [runtime thread]  factor-infer
         bar_queue.get() → push_bars (C++ parallel) → signal_deque.append()
 
     [main thread]  strategy / consumer
         get_factor_outputs() → signal_deque[-1]   (O(1), no compute)
-        get_data()           → BarCache.snapshot() (copy)
+        get_data()           → debug BarCache.snapshot() (copy, optional)
 
-Usage (without factors):
-    engine = Engine(symbols=["BTC-USDT-SWAP"], mode="simulation", sim_seed=42)
+Usage (live with factors):
+    engine = Engine(symbols=["BTC-USDT-SWAP"], mode="live", data_freq="5s",
+                    factor_group="okx_perp", num_threads=4)
     engine.start()
-    snapshot = engine.get_data()
+    time.sleep(30)
+    factors = engine.get_factor_outputs()
     engine.stop()
 
-Usage (with C++ factor inference):
+Usage (simulation with factors):
     engine = Engine(symbols=["BTC-USDT-SWAP"], mode="simulation", sim_seed=42,
                     factor_group="okx_perp", num_threads=4)
     engine.start()
-    time.sleep(10)                                # wait for warmup
-    factors  = engine.get_factor_outputs()        # {symbol: {factor_id: float}}
-    snapshot = engine.get_data()                  # bar cache snapshot
+    time.sleep(10)
+    factors  = engine.get_factor_outputs()
+    snapshot = engine.get_data()
     engine.stop()
 """
 
@@ -40,7 +42,6 @@ from collections import deque
 
 import numpy as np
 
-from dataflow.manager import DataflowManager
 from dataflow.okx.common import resolve_bar_channel
 
 logger = logging.getLogger(__name__)
@@ -66,13 +67,6 @@ class Engine:
         data_freq: str = "5s",
         pull_interval: str = "10s",
         bar_window_length: int = 1000,
-        trade_window_length: int = 10_000,
-        book_history_length: int = 1_000,
-        enable_bars: bool = True,
-        enable_trades: bool = False,
-        trade_channels: tuple[str, ...] = ("trades-all",),
-        enable_books: bool = False,
-        book_channels: tuple[str, ...] = ("books5",),
         mode: str = "live",
         sim_bar_interval: float | None = None,
         sim_seed: int | None = None,
@@ -81,18 +75,12 @@ class Engine:
         signal_buffer_size: int = 3,
         bar_queue_size: int = 16,
         bar_queue_timeout: float = 0.5,
+        enable_debug_cache: bool = True,
     ):
         self.symbols = symbols
         self.data_freq = data_freq
         self.pull_interval = pull_interval
         self.bar_window_length = bar_window_length
-        self.trade_window_length = trade_window_length
-        self.book_history_length = book_history_length
-        self.enable_bars = enable_bars
-        self.enable_trades = enable_trades
-        self.trade_channels = trade_channels
-        self.enable_books = enable_books
-        self.book_channels = book_channels
         self.mode = mode
 
         self.data_freq_seconds = parse_freq(data_freq)
@@ -117,26 +105,35 @@ class Engine:
             self._init_inference(factor_group, num_threads)
             self._bar_queue = queue.Queue(maxsize=bar_queue_size)
 
+        # Debug bar cache (optional, not on the main compute path).
+        self._debug_cache = None
+        self._kline_worker = None
+        self._dataflow = None
+
         if mode == "live":
+            from dataflow.cache import BarCache
+            from dataflow.okx.kline.worker import KlineWorker
+
             bar_channel, needs_agg = resolve_bar_channel(self.data_freq_seconds)
             logger.info(
-                "Bar config: data_freq=%s (%ds) → channel=%s, aggregation=%s",
+                "Live mode: data_freq=%s (%ds) → channel=%s, aggregation=%s",
                 data_freq, self.data_freq_seconds, bar_channel,
                 f"{self.data_freq_seconds}s" if needs_agg else "none (direct)",
             )
 
-            self._dataflow = DataflowManager(
+            if enable_debug_cache:
+                self._debug_cache = BarCache(window_length=bar_window_length)
+
+            if self._bar_queue is None:
+                self._bar_queue = queue.Queue(maxsize=bar_queue_size)
+
+            self._kline_worker = KlineWorker(
                 symbols=symbols,
-                bar_agg_seconds=self.data_freq_seconds,
-                bar_window_length=bar_window_length,
-                trade_window_length=trade_window_length,
-                book_history_length=book_history_length,
-                enable_bars=enable_bars,
-                enable_trades=enable_trades,
-                trade_channels=trade_channels,
-                enable_books=enable_books,
-                book_channels=book_channels,
+                bar_queue=self._bar_queue,
+                freq_seconds=self.data_freq_seconds,
+                debug_cache=self._debug_cache,
             )
+
         elif mode == "simulation":
             from dataflow.simulation.manager import SimDataflowManager
             self._dataflow = SimDataflowManager(
@@ -154,10 +151,6 @@ class Engine:
             )
         else:
             raise ValueError(f"Unknown mode: {mode!r}. Use 'live' or 'simulation'.")
-
-        # Backward-compatible accessors for the current bar cache.
-        self._data_cache = self._dataflow.data_cache
-        self._lock = self._dataflow.lock
 
     # ── Factor inference ──────────────────────────────────────
 
@@ -253,24 +246,33 @@ class Engine:
 
     def start(self):
         """Start the dataflow collection and (optionally) the inference thread."""
-        if self._bar_queue is not None:
+        if self._bar_queue is not None and self._inference is not None:
             self._stop_event.clear()
             self._runtime_thread = threading.Thread(
                 target=self._runtime_loop, daemon=True, name="factor-infer"
             )
             self._runtime_thread.start()
-        self._dataflow.start()
+
+        if self.mode == "live":
+            self._kline_worker.start()
+        elif self._dataflow is not None:
+            self._dataflow.start()
+
         logger.info(
-            "Engine started: %d symbols, data_freq=%s (%ds), pull_interval=%s (%ds), "
+            "Engine started: mode=%s, %d symbols, data_freq=%s (%ds), "
             "bar_window=%d, factors=%s",
-            len(self.symbols), self.data_freq, self.data_freq_seconds,
-            self.pull_interval, self.pull_interval_seconds, self.bar_window_length,
+            self.mode, len(self.symbols), self.data_freq,
+            self.data_freq_seconds, self.bar_window_length,
             self._factor_group or "none",
         )
 
     def stop(self):
         """Stop the dataflow collection and inference thread."""
-        self._dataflow.stop()
+        if self.mode == "live" and self._kline_worker is not None:
+            self._kline_worker.stop()
+        elif self._dataflow is not None:
+            self._dataflow.stop()
+
         if self._runtime_thread is not None:
             self._stop_event.set()
             self._runtime_thread.join(timeout=5)
@@ -278,33 +280,35 @@ class Engine:
         logger.info("Engine stopped")
 
     def get_data(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
-        """Get a snapshot (copy) of the bar cache.
+        """Get a snapshot of the bar cache (debug / monitoring only).
+
+        In live mode this reads from the optional debug cache.
+        In simulation mode this reads from the SimDataflowManager bar cache.
 
         Returns:
             {symbol: ndarray of shape (N, 8)} where columns are
             [ts, open, high, low, close, vol, vol_ccy, vol_ccy_quote].
         """
-        return self._dataflow.get_bar_snapshot(symbols)
-
-    def get_trade_data(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
-        """Get a snapshot (copy) of the trade cache."""
-        return self._dataflow.get_trade_snapshot(symbols)
-
-    def get_book_data(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
-        """Get a snapshot (copy) of the book cache."""
-        return self._dataflow.get_book_snapshot(symbols)
+        if self.mode == "live":
+            if self._debug_cache is None:
+                return {}
+            return self._debug_cache.snapshot(symbols)
+        if self._dataflow is not None:
+            return self._dataflow.get_bar_snapshot(symbols)
+        return {}
 
     @property
     def bar_count(self) -> int:
-        """Total number of bars aggregated so far."""
-        return self._dataflow.bar_count
+        """Total number of bars produced by the dataflow layer."""
+        if self._kline_worker is not None:
+            return self._kline_worker.bar_count
+        if self._dataflow is not None:
+            return self._dataflow.bar_count
+        return 0
 
     @property
-    def trade_count(self) -> int:
-        """Total number of trade events captured so far."""
-        return self._dataflow.trade_count
-
-    @property
-    def book_count(self) -> int:
-        """Total number of book events captured so far."""
-        return self._dataflow.book_count
+    def kline_stats(self) -> dict[str, int]:
+        """Live kline worker statistics (empty dict in simulation mode)."""
+        if self._kline_worker is not None:
+            return self._kline_worker.stats()
+        return {}

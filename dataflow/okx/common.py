@@ -11,8 +11,6 @@ OKX_REST_INSTRUMENTS = "https://www.okx.com/api/v5/public/instruments?instType=S
 MAX_SUBS_PER_CONN = 200
 SUBS_BATCH_SIZE = 50
 
-# Mapping from seconds to OKX direct candle channel names.
-# Frequencies >= 60s that appear here can be subscribed directly.
 SECONDS_TO_OKX_CHANNEL: dict[int, str] = {
     1: "candle1s",
     60: "candle1m",
@@ -59,4 +57,3 @@ def chunk(lst: list, size: int):
 
 def now_ms() -> int:
     return int(time.time() * 1000)
-
