@@ -1,6 +1,6 @@
 """TradesWorker — manages the trades streaming thread.
 
-Assembles OXKTradesCollector → TradesAccumulator into a daemon thread
+Assembles OKXTradesCollector → TradesAccumulator into a daemon thread
 that can be started / stopped by Engine.
 
 The thread runs an asyncio event loop for the WebSocket collector; each

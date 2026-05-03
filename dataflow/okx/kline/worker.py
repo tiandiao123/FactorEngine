@@ -13,6 +13,7 @@ import asyncio
 import logging
 import queue
 import threading
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -20,6 +21,9 @@ from ..common import resolve_bar_channel
 from .adapter import KlineAdapter
 from .collector import OKXKlineCollector
 from .publisher import KlinePublisher
+
+if TYPE_CHECKING:
+    from dataflow.okx.trades.accumulator import TradesAccumulator
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +54,7 @@ class KlineWorker:
         bar_queue: queue.Queue,
         freq_seconds: int = 5,
         debug_cache=None,
-        accumulators: dict | None = None,
+        accumulators: dict[str, "TradesAccumulator"] | None = None,
     ):
         self.symbols = list(symbols)
 

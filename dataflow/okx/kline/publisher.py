@@ -25,8 +25,12 @@ import logging
 import queue
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from dataflow.okx.trades.accumulator import TradesAccumulator
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +63,7 @@ class KlinePublisher:
         debug_cache=None,
         expected_interval_ms: int = 5000,
         batch_timeout_s: float | None = None,
-        accumulators: dict | None = None,
+        accumulators: dict[str, "TradesAccumulator"] | None = None,
     ):
         self._bar_queue = bar_queue
         self._debug_cache = debug_cache

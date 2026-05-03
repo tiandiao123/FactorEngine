@@ -168,10 +168,20 @@ class Engine:
                 )
 
             if data_source == "trades":
-                logger.info(
-                    "trades-only mode: KlineWorker not started. "
-                    "ClockDriver required for flush (Phase 2)."
-                )
+                if self._bar_queue is not None:
+                    logger.warning(
+                        "data_source='trades' with factor_group='%s' in live mode: "
+                        "the runtime inference thread is started but no component "
+                        "pushes bars to the queue (ClockDriver not yet implemented). "
+                        "Factor outputs will not be produced. "
+                        "Use data_source='kline_trades' to get inference results now.",
+                        factor_group,
+                    )
+                else:
+                    logger.info(
+                        "trades-only mode: KlineWorker not started. "
+                        "ClockDriver required for flush (Phase 2)."
+                    )
 
         elif mode == "simulation":
             from dataflow.simulation.manager import SimDataflowManager
@@ -199,13 +209,15 @@ class Engine:
 
         reg = FactorRegistry()
         reg.load_group(group)
-        self._factor_ids = reg.factor_ids_by_group(group)
 
         self._inference = rt.InferenceEngine(num_threads=num_threads)
         for sym in self.symbols:
             self._inference.add_symbol(sym)
             for fid, graph in reg.build_group(group).items():
                 self._inference.add_factor(sym, fid, graph)
+
+        # Set factor ID list once after all symbols are wired up.
+        self._factor_ids = reg.factor_ids_by_group(group)
 
         logger.info(
             "InferenceEngine initialized: %d symbols × %d factors, %d threads",
