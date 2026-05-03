@@ -243,6 +243,11 @@ FactorEngine/
 | [`docs/20260419/engine_architecture_refactor.md`](docs/20260419/engine_architecture_refactor.md) | Engine / threading baseline. |
 | [`docs/20260503/kline_v2/`](docs/20260503/kline_v2/) | Current kline → factor pipeline write-ups. |
 
+## Documentation
+
+- [`docs/TUTORIAL.md`](docs/TUTORIAL.md) — quick repository walkthrough and module guide
+- [`docs/20260419/engine_architecture_refactor.md`](docs/20260419/engine_architecture_refactor.md) — current engine architecture baseline
+
 ## License
 
 MIT
