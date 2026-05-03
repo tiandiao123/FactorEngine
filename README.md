@@ -4,60 +4,68 @@
 
 Real-time factor stack for **quantitative trading**: Python **market data (OKX kline + trades)**, **33 C++ operator kernels** (`fe_ops`, pybind11), and a **DAG streaming runtime** (`fe_runtime`) that evaluates compiled factor graphs bar-by-bar with minimal Python overhead in the hot path.
 
-For a reading-order tour, see [`docs/TUTORIAL.md`](docs/TUTORIAL.md) (some paths are historical; live code lives under `dataflow/okx/kline/` and `dataflow/okx/trades/`).
+For a reading-order tour, see [`docs/TUTORIAL.md`](docs/TUTORIAL.md) (some paths are historical; live code lives under `dataflow/okx/kline/`, `dataflow/okx/trades/`, and `dataflow/clock_driver.py`).
 
-## Architecture (current)
+## Architecture (v4 — ClockDriver unified flush)
 
 Top-level [`factorengine.engine.Engine`](factorengine/engine.py) coordinates:
 
-1. **Dataflow** — one or more background paths depending on `data_source`:
-   - **Kline** — `KlineWorker`: OKX candle WS → `KlineAdapter` → `KlinePublisher` (round-batched `round_bars`).
-   - **Trades** — `TradesWorker`: OKX public **trades** WS → per-symbol `TradesAccumulator` (incremental `vwap`, `buy_vol`, `sell_vol` per bar bucket). Snapshots are attached when a round is flushed.
-   - **Trades-only flush** — `ClockDriver` calls `TradesWorker.flush` on wall-clock boundaries when `data_source="trades"` (no kline).
-2. **Runtime thread** — `bar_queue` carries **`(round_bars, round_trades | None)`**; builds `fe_runtime.BarData` (OHLCV + `ret` + optional trades fields) → `InferenceEngine.push_bars` → **signal deque**.
-3. **Main thread** — `get_factor_outputs()` (O(1)), optional `get_data()` (bar cache snapshot), `kline_stats` / `trades_stats`.
+1. **Dataflow threads** — independent workers, each collecting one data stream:
+   - **Kline** — `KlineWorker`: OKX candle WS → `KlineAdapter` → `KlinePublisher` (internal round buffer).
+   - **Trades** — `TradesWorker`: OKX public trades WS → per-symbol `TradesAccumulator` (incremental `vwap`, `buy_vol`, `sell_vol`, OHLCV per bar bucket).
+2. **ClockDriver thread** — the **single aggregation center**. Fires on wall-clock aligned boundaries (`:00`, `:05`, `:10`, …), calls `flush()` on every registered worker, merges results via `_aggregate()`, and pushes one `(merged_bars, merged_trades)` payload into `bar_queue`. Workers never touch `bar_queue`.
+3. **Runtime thread** — `bar_queue.get()` → builds `fe_runtime.BarData` (OHLCV + `ret` + optional trades fields) → `InferenceEngine.push_bars` → **signal deque**.
+4. **Main thread** — `get_factor_outputs()` (O(1)), optional `get_data()` (bar cache snapshot), `kline_stats` / `trades_stats` / `clock_stats`.
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  kline:  OKX candle WS → KlineWorker → KlinePublisher            │
-│  trades: OKX trades WS → TradesWorker → accumulators (O(1) / trade)│
-│         on round flush: snapshot → (round_bars, round_trades)      │
-│  trades-only: ClockDriver → TradesWorker.flush → bar_queue       │
-└───────────────────────────────┬──────────────────────────────────┘
-                                v
-┌──────────────────────────────────────────────────────────────────┐
-│  factor-infer: bar_queue → BarData(close…ret,vwap,buy_vol,sell_vol)│
-│                → InferenceEngine.push_bars → signal_deque          │
-└───────────────────────────────┬──────────────────────────────────┘
-                                v
-┌──────────────────────────────────────────────────────────────────┐
-│  C++ fe_runtime (FactorGraph, InferenceEngine) + fe_ops kernels   │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  okx-kline thread:  OKX candle WS → Adapter → Publisher (buffer)   │
+│  okx-trades thread: OKX trades WS → per-symbol Accumulators        │
+└─────────────────┬──────────────────────────┬────────────────────────┘
+                  │                          │
+                  v                          v
+         ┌──────────────────────────────────────────┐
+         │  ClockDriver (freq=5s, wall-clock aligned)│
+         │    kline_data  = kline_worker.flush()     │
+         │    trades_data = trades_worker.flush()    │
+         │    → _aggregate(kline priority per sym)   │
+         │    → bar_queue.put((merged_bars, trades)) │
+         └────────────────────┬──────────────────────┘
+                              v
+┌─────────────────────────────────────────────────────────────────────┐
+│  factor-infer thread:                                               │
+│    bar_queue → BarData(close…ret, vwap, buy_vol, sell_vol)          │
+│    → InferenceEngine.push_bars → signal_deque                       │
+└─────────────────────────────────────────────────────────────────────┘
+                              v
+┌─────────────────────────────────────────────────────────────────────┐
+│  C++ fe_runtime (FactorGraph, InferenceEngine) + fe_ops kernels     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### `data_source` (live)
 
-| Value | Meaning |
-|-------|---------|
-| **`kline`** | Candle WS only (default). Queue payload may omit trades; trade inputs in DAG are NaN unless you feed them elsewhere. |
-| **`trades`** | Trades WS only; **`ClockDriver`** flushes accumulators on each bar interval; synthetic OHLC rows come from the trades flush path (see implementation). |
-| **`kline_trades`** | Both streams; **kline round flush** drives the queue; publisher snapshots trades accumulators into `round_trades`. |
+| Value | Workers started | Who flushes |
+|-------|----------------|-------------|
+| **`kline`** | KlineWorker | ClockDriver (kline only) |
+| **`trades`** | TradesWorker | ClockDriver (trades only); OHLCV derived from trades |
+| **`kline_trades`** | Both | ClockDriver (both); kline bars take priority per symbol, trades snapshots merged |
 
 ### Core pieces
 
 | Area | Role |
 |------|------|
-| **`dataflow/okx/kline/`** | Candle WS: `collector` → `adapter` → `publisher` → `worker`; round batching into `bar_queue`. |
-| **`dataflow/okx/trades/`** | Trades WS: `collector` → `accumulator` → `worker`; incremental bucket stats, flush hooks. |
-| **`dataflow/clock_driver.py`** | Wall-clock periodic callbacks (trades-only mode). |
+| **`dataflow/okx/kline/`** | Candle WS: `collector` → `adapter` → `publisher`; `worker` exposes `flush()` for ClockDriver. |
+| **`dataflow/okx/trades/`** | Trades WS: `collector` → `accumulator` → `worker`; `flush()` returns `(round_bars, round_trades)`. |
+| **`dataflow/clock_driver.py`** | Unified wall-clock flush & aggregation center; `register(name, worker)` + `_aggregate()` → `bar_queue`. |
 | **`dataflow/simulation/`** | Synthetic bars + optional `bar_queue` for tests/demos. |
 | **`dataflow/cache.py`** | Rolling `BarCache` for `get_data()` snapshots. |
-| **`factorengine.Engine`** | `factor_group` as **str or list** of registry groups; **`data_source`**; **`get_factor_outputs`**, **`get_data`**, **`kline_stats`**, **`trades_stats`**. |
+| **`factorengine.Engine`** | `factor_group` as **str or list** of registry groups; **`data_source`**; **`get_factor_outputs`**, **`get_data`**, **`kline_stats`**, **`trades_stats`**, **`clock_stats`**. |
 | **`fe_ops` / `fe_runtime`** | Batch kernels + DAG streaming; **`BarData`** includes **`vwap`, `buy_vol`, `sell_vol`**; `add_input` supports those names. |
-| **`factorengine/factors/`** | `FactorRegistry`, `@register_factor`, visualization — e.g. **`okx_perp`** (kbar factors), **`okx_perp_trades`** (trades-augmented inputs). |
+| **`factorengine/factors/`** | `FactorRegistry`, `@register_factor`, visualization — e.g. **`okx_perp`** (60 kbar factors), **`okx_perp_trades`** (6 trades factors). |
 | **`factorengine/scheduler/`** | Older Python-side scheduler experiments (not the main C++ hot path). |
 
-Design references: [`docs/20260503/kline_v2/`](docs/20260503/kline_v2/), [`docs/20260503/trades_v1/trades_integration_design.md`](docs/20260503/trades_v1/trades_integration_design.md), [`docs/20260503/trades_v2/trades_v2_changelog.md`](docs/20260503/trades_v2/trades_v2_changelog.md).
+Design references: [`docs/20260503/kline_v2/`](docs/20260503/kline_v2/), [`docs/20260503/trades_v1/trades_integration_design.md`](docs/20260503/trades_v1/trades_integration_design.md), [`docs/20260503/trades_v2/`](docs/20260503/trades_v2/).
 
 ## Quick start
 
@@ -168,7 +176,7 @@ factors = engine.get_factor_outputs()
 engine.stop()
 ```
 
-`factor_group` must be set to start the inference thread and wire `bar_queue`; **kline** worker starts when `data_source` includes kline and factors are enabled; **trades** worker when `data_source` is `trades` or `kline_trades`.
+`factor_group` must be set to start the inference thread and wire `bar_queue`; workers are started based on `data_source`; ClockDriver is created when `factor_group` is set, registering the appropriate workers.
 
 ## Native C++ kernels (`fe_ops`)
 
@@ -205,17 +213,17 @@ FactorEngine/
 ├── examples/engine/           # engine_rt_live, engine_rt_simulation, engine_rt_trades
 ├── dataflow/
 │   ├── cache.py
-│   ├── clock_driver.py
+│   ├── clock_driver.py        # unified flush & aggregation center
 │   ├── okx/
 │   │   ├── common.py
-│   │   ├── kline/
-│   │   └── trades/
+│   │   ├── kline/             # collector → adapter → publisher → worker
+│   │   └── trades/            # collector → accumulator → worker
 │   └── simulation/
 ├── factorengine/
 │   ├── engine.py
 │   ├── factors/
-│   │   ├── okx_perp/
-│   │   └── okx_perp_trades/
+│   │   ├── okx_perp/          # 60 kline-based factors
+│   │   └── okx_perp_trades/   # 6 trades-based factors
 │   └── scheduler/
 ├── native/                    # CMake: fe_ops + fe_runtime
 └── tests/
@@ -234,7 +242,9 @@ FactorEngine/
 | [`docs/TUTORIAL.md`](docs/TUTORIAL.md) | Repo orientation. |
 | [`docs/20260503/kline_v2/kline_to_factor_pipeline.md`](docs/20260503/kline_v2/kline_to_factor_pipeline.md) | Kline → factor pipeline. |
 | [`docs/20260503/kline_v2/round_batching_design.md`](docs/20260503/kline_v2/round_batching_design.md) | Round batching. |
-| [`docs/20260503/trades_v1/trades_integration_design.md`](docs/20260503/trades_v1/trades_integration_design.md) | Trades integration design. |
+| [`docs/20260503/trades_v1/trades_integration_design.md`](docs/20260503/trades_v1/trades_integration_design.md) | Trades integration design (Phase 1). |
+| [`docs/20260503/trades_v1/trades_kline_full_pipeline.md`](docs/20260503/trades_v1/trades_kline_full_pipeline.md) | Full kline+trades pipeline walkthrough. |
+| [`docs/20260503/trades_v2/clockdriver_refactor_plan.md`](docs/20260503/trades_v2/clockdriver_refactor_plan.md) | ClockDriver refactor plan (Plan B). |
 | [`docs/20260503/trades_v2/trades_v2_changelog.md`](docs/20260503/trades_v2/trades_v2_changelog.md) | Trades v2 changelog / migration notes. |
 
 ## Authors
