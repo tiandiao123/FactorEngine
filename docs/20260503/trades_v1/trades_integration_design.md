@@ -912,6 +912,8 @@ vwap_ret = g.add_rolling(Op.TS_PCT, v, 1)   # vwap / prev_vwap - 1
 
 ### 实施节奏
 
+#### Phase 总览
+
 | 阶段 | 内容 | 前置 |
 |------|------|------|
 | **Phase 1** (当前文档) | `kline_trades` 模式: trades accumulator + kline flush 驱动 | 无 |
@@ -924,6 +926,289 @@ vwap_ret = g.add_rolling(Op.TS_PCT, v, 1)   # vwap / prev_vwap - 1
 - Phase 2 引入 ClockDriver 作为统一时钟源, trades-only 高频策略可独立运行
 - Phase 3 新数据流只需实现 Worker + `clock.register`, 零侵入扩展
 
+---
+
+#### Phase 1 详细实施计划
+
+Phase 1 目标: **`kline_trades` 模式跑通, trades 因子产出非 NaN 信号值。**
+
+拆分为 7 个 Step, 每步都可独立测试:
+
+##### Step 1: `TradesAccumulator` — 核心聚合器
+
+```
+新建: dataflow/okx/trades/__init__.py
+新建: dataflow/okx/trades/accumulator.py
+新建: tests/trades/test_accumulator.py
+```
+
+- 实现 `TradesAccumulator` 类 (本文档 §4.2 设计)
+- `update(px, sz, side)` — O(1) 增量累加
+- `snapshot_and_reset()` — 原子读取 + 清零
+- `threading.Lock` 保证线程安全
+
+验证:
+- 单元测试: 多次 `update()` 后 `snapshot_and_reset()` 返回正确的 vwap/buy_vol/sell_vol
+- 边界: 空 accumulator snapshot 返回 NaN/0
+- 线程安全: 多线程并发 update + snapshot 无竞态
+
+**无任何外部依赖, 第一个实现。**
+
+##### Step 2: `OXKTradesCollector` — WS 连接层
+
+```
+新建: dataflow/okx/trades/collector.py
+```
+
+- 仿照 `OXKKlineCollector` (`dataflow/okx/kline/collector.py`)
+- 连接 OKX 公共 WS (`wss://ws.okx.com:8443/ws/v5/public`)
+- 订阅 `trades` 频道
+- 回调: `on_trade(symbol, px, sz, side, ts_ms)`
+- 自动重连逻辑复用 kline collector 的 `_ws_loop` 模式
+
+与 kline collector 的区别:
+- 公共 WS (不是 business WS)
+- 无 confirm 概念, 每条消息都是已成交
+- JSON 结构不同 (`data[].px/sz/side` vs `data[].candle_array`)
+
+验证:
+- 复用 `tests/trades/websocket/bench_trades_throughput.py` 的连接逻辑
+- 启动后能收到 trades 数据并正确解析
+
+##### Step 3: `TradesWorker` — 线程管理
+
+```
+新建: dataflow/okx/trades/worker.py
+```
+
+- 仿照 `KlineWorker` (`dataflow/okx/kline/worker.py`)
+- 启一个 daemon 线程运行 asyncio 事件循环
+- 回调中调用对应 symbol 的 `accumulator.update()`
+- 暴露 `accumulators: dict[str, TradesAccumulator]` 给外部读取
+- **不自行触发 round flush** — Phase 1 由 KlinePublisher 驱动
+- `start()` / `stop()` 生命周期管理 + 统计日志
+
+验证:
+- 启动 TradesWorker, 10 秒后 stop, 检查各 symbol accumulator 计数 > 0
+
+##### Step 4: `KlinePublisher` 改造 — 撮合点
+
+```
+改: dataflow/okx/kline/publisher.py   — _flush_round() 中读 accumulator snapshot
+改: dataflow/okx/kline/worker.py      — 接收 accumulators 参数并传给 publisher
+改: tests/dataflow/test_okx_kline_worker.py — 更新集成测试
+```
+
+核心改动 (`_flush_round`):
+
+```python
+def _flush_round(self) -> bool:
+    round_bars = dict(self._pending_round)
+    # ... 现有的 forward-fill 逻辑 ...
+
+    # ── 新增: 读取 trades accumulator snapshot ──
+    round_trades = None
+    if self._accumulators:
+        round_trades = {}
+        for sym in round_bars:
+            acc = self._accumulators.get(sym)
+            if acc:
+                round_trades[sym] = acc.snapshot_and_reset()
+
+    # bar_queue 载荷从 dict 变为 tuple
+    payload = (round_bars, round_trades)
+    self._bar_queue.put(payload, block=False)
+```
+
+关键约束:
+- `accumulators` 可选 (None = 纯 kline 模式, 向后兼容)
+- 现有 kline-only 路径不受影响
+- bar_queue 载荷类型: `tuple[dict, dict | None]`
+
+验证:
+- 现有 kline 测试不 break (accumulators=None)
+- 集成测试: mock accumulator, 验证 flush 时 snapshot_and_reset 被调用
+
+##### Step 5: C++ 扩展 — BarData + FactorGraph + pybind
+
+```
+改: native/include/fe/runtime/inference_engine.hpp   — BarData 加 vwap/buy_vol/sell_vol
+改: native/include/fe/runtime/factor_graph.hpp       — Op 枚举 + add_input + push_bar
+改: native/pybind/fe_runtime_bind.cpp               — pybind11 绑定
+重编译: cd native && mkdir -p build && cd build && cmake .. && make -j
+```
+
+BarData 扩展:
+```cpp
+struct BarData {
+    FeFloat close = 0.0f, volume = NaN, open = NaN, high = NaN, low = NaN, ret = NaN;
+    FeFloat vwap = NaN, buy_vol = NaN, sell_vol = NaN;   // ← 新增
+};
+```
+
+Op 枚举扩展:
+```cpp
+INPUT_VWAP, INPUT_BUY_VOL, INPUT_SELL_VOL   // ← 新增
+```
+
+`add_input()` 扩展 (§5.2 前置修复已完成, 未知 feature 会 throw):
+```cpp
+else if (feature == "vwap")     node.op = Op::INPUT_VWAP;
+else if (feature == "buy_vol")  node.op = Op::INPUT_BUY_VOL;
+else if (feature == "sell_vol") node.op = Op::INPUT_SELL_VOL;
+```
+
+`push_bars` lambda 同步更新 (§5.3):
+```cpp
+runner->push_bar(b.close, b.volume, b.open, b.high, b.low, b.ret,
+                 b.vwap, b.buy_vol, b.sell_vol);
+```
+
+验证:
+- `python -c "import fe_runtime as rt; g = rt.FactorGraph(); g.add_input('vwap')"` 不报错
+- `g.add_input('unknown_field')` 抛 `ValueError`
+
+##### Step 6: 注册 trades 因子
+
+```
+改: factorengine/factors/okx_perp/factor_bank.py   — 添加 T001-T004
+```
+
+4 个因子覆盖三种场景:
+
+```python
+# T001: Trade Imbalance — 纯 trades 输入
+@register_factor("okx_perp", "T001")
+def build_trade_imbalance():
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    diff = g.add_binary(Op.SUB, bv, sv)
+    total = g.add_binary(Op.ADD, bv, sv)
+    imbalance = g.add_binary(Op.DIV, diff, total)
+    g.add_rolling(Op.TS_ZSCORE, imbalance, 120)
+    g.compile()
+    return g
+
+# T002: VWAP-Close Divergence — 混合输入 (kline + trades)
+@register_factor("okx_perp", "T002")
+def build_vwap_close_divergence():
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    vw = g.add_input("vwap")
+    dev = g.add_binary(Op.SUB, vw, c)
+    norm = g.add_binary(Op.DIV, dev, c)
+    g.add_rolling(Op.TS_ZSCORE, norm, 60)
+    g.compile()
+    return g
+
+# T003: VWAP Momentum — vwap 替代 close 做动量
+@register_factor("okx_perp", "T003")
+def build_vwap_momentum():
+    g = rt.FactorGraph()
+    vw = g.add_input("vwap")
+    log_vw = g.add_unary(Op.LOG, vw)
+    mom = g.add_rolling(Op.TS_DIFF, log_vw, 10)
+    vol = g.add_rolling(Op.TS_STD, g.add_rolling(Op.TS_DIFF, log_vw, 1), 60)
+    g.add_binary(Op.DIV, mom, vol)
+    g.compile()
+    return g
+
+# T004: Imbalance × Momentum — 混合因子
+@register_factor("okx_perp", "T004")
+def build_imbalance_momentum():
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    imb = g.add_binary(Op.DIV, g.add_binary(Op.SUB, bv, sv),
+                       g.add_binary(Op.ADD, bv, sv))
+    logc = g.add_unary(Op.LOG, c)
+    ret = g.add_rolling(Op.TS_DIFF, logc, 5)
+    g.add_rolling(Op.TS_ZSCORE, g.add_binary(Op.MUL, imb, ret), 120)
+    g.compile()
+    return g
+```
+
+因子场景覆盖:
+
+| 因子 | 输入 | 验证目标 |
+|------|------|---------|
+| T001 | buy_vol, sell_vol | 纯 trades 因子, trades-only 可用 |
+| T002 | close, vwap | kline + trades 混用 |
+| T003 | vwap | 用 vwap 替代 close 的动量因子 |
+| T004 | close, buy_vol, sell_vol | 混合 kline + trades 的复合因子 |
+
+验证:
+- `FactorRegistry().load_group("okx_perp")` 包含 T001-T004
+- 每个因子 `g.compile()` 无报错
+
+##### Step 7: Engine 集成 + 端到端验证
+
+```
+改: factorengine/engine.py — 启动 TradesWorker, _runtime_loop 解包 tuple, 构造完整 BarData
+新建/改: scripts/engine_rt_live.py 或类似入口 — 用 kline_trades 模式跑
+```
+
+Engine 改动:
+
+```python
+class Engine:
+    def __init__(self, ..., data_source: str = "kline"):
+        self._data_source = data_source
+        # kline_trades 或 trades 模式下创建 TradesWorker
+        if data_source in ("trades", "kline_trades"):
+            self._trades_worker = TradesWorker(symbols=..., ...)
+
+    def start(self):
+        if self._data_source in ("kline", "kline_trades"):
+            # 传 accumulators 给 KlineWorker/Publisher
+            self._kline_worker.start(accumulators=self._trades_worker.accumulators)
+        if self._data_source in ("trades", "kline_trades"):
+            self._trades_worker.start()
+
+    def _runtime_loop(self):
+        while True:
+            payload = self._bar_queue.get()
+            round_bars, round_trades = payload  # 解包 tuple
+            for sym in ...:
+                bar = round_bars[sym] if round_bars else None
+                trades = (round_trades or {}).get(sym, {})
+                batch[sym] = rt.BarData(
+                    close=..., volume=..., open_=..., high=..., low=..., ret=...,
+                    vwap=trades.get("vwap", float('nan')),
+                    buy_vol=trades.get("buy_vol", float('nan')),
+                    sell_vol=trades.get("sell_vol", float('nan')),
+                )
+```
+
+端到端验证 checklist:
+
+- [ ] `engine_rt_live.py` 以 `data_source="kline_trades"` 启动
+- [ ] 日志显示 KlineWorker 和 TradesWorker 均正常连接
+- [ ] signal_deque 输出中 T001-T004 因子值为非 NaN (warmup 后)
+- [ ] 现有 kline 因子 (0001-0065) 不受影响, 值与之前一致
+- [ ] `data_source="kline"` 模式 (默认) 行为完全不变
+- [ ] TradesWorker stop 时日志显示 trade_count > 0
+
+---
+
+#### 实施依赖关系
+
+```
+Step 1 (Accumulator) ─────┐
+                          │
+Step 2 (Collector)  ──────┼──→ Step 3 (Worker) ──→ Step 4 (Publisher 改造)
+                          │                                    │
+                          │                                    ↓
+                          │              Step 5 (C++) ──→ Step 6 (因子注册)
+                          │                                    │
+                          │                                    ↓
+                          └────────────────────────────→ Step 7 (Engine 集成)
+```
+
+Step 1 和 Step 2 可并行; Step 5 和 Step 4 可并行; Step 7 依赖所有前置。
+
 ### 300 symbols 资源估算
 
 | 资源 | kline 模式 | trades 模式 | kline_trades 模式 |
@@ -935,3 +1220,16 @@ vwap_ret = g.add_rolling(Op.TS_PCT, v, 1)   # vwap / prev_vwap - 1
 
 trades 模式的 CPU 负载约为 kline 的 30 倍, 但仍在单线程 asyncio
 可处理范围内 (Python `json.loads` 极限约 50K-100K msg/s)。
+
+### 吞吐量实测 (2026-05-03)
+
+基准测试脚本: `tests/trades/websocket/bench_trades_throughput.py`
+
+BTC 单品种 (30s, 非极端行情):
+- 平均 ~11 trades/s, 峰值 50, json.loads ~17μs/msg
+
+10 个主流品种 (30s):
+- 合计 ~100 trades/s, BTC peak=650, json.loads ~13μs/msg
+
+300 symbols 外推: 常态 ~500-1,000 trades/s, 仅占单线程 ~1% CPU。
+详见 `tests/trades/websocket/benchmark_report.md`。
