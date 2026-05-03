@@ -1,14 +1,15 @@
-"""Tests for dataflow.okx.kline.worker.KlineWorker lifecycle.
+"""Tests for dataflow.okx.kline.worker.KlineWorker lifecycle (v2).
 
-Uses a monkeypatched OKXKlineCollector to emit synthetic candles
+Uses a monkeypatched OXKlineCollector to emit synthetic candles
 without a real WebSocket connection.
 
 Covers:
   - start() spins up daemon thread and bars flow into bar_queue
-  - stop() cleanly terminates the thread
+  - Rounds contain all symbols (batched by publisher v2)
+  - stop() cleanly terminates the thread and flushes pending
   - stop() is idempotent (safe to call twice)
-  - stats() reflects bars processed
-  - bar_count matches expectations
+  - stats() reflects bars processed + round counts
+  - Unconfirmed candles are filtered
 """
 
 import asyncio
@@ -31,7 +32,7 @@ def _make_candle(ts_ms: int, c=100.0, confirm="1") -> list:
 
 
 class FakeCollector:
-    """Replaces OKXKlineCollector: emits a fixed set of candles then exits."""
+    """Replaces OXKlineCollector: emits a fixed set of candles then exits."""
 
     def __init__(self, candles: list[tuple[str, list]], on_candle):
         self._candles = candles
@@ -46,19 +47,19 @@ class FakeCollector:
         pass
 
 
-# ── Lifecycle tests ────────────────────────────────────────────
+# ── Lifecycle tests ───────────────────────────────────────────
 
 class TestKlineWorkerLifecycle:
-    def _make_worker(self, candles, freq_seconds=1):
+    def _make_worker(self, candles, symbols=None, freq_seconds=1):
         """Create a KlineWorker with a patched collector."""
+        if symbols is None:
+            symbols = sorted(set(sym for sym, _ in candles)) or ["BTC-USDT-SWAP"]
         bar_queue = queue.Queue(maxsize=100)
         worker = KlineWorker(
-            symbols=["BTC-USDT-SWAP"],
+            symbols=symbols,
             bar_queue=bar_queue,
             freq_seconds=freq_seconds,
         )
-
-        original_run = worker._run
 
         async def patched_run():
             collector = FakeCollector(candles, worker._on_candle)
@@ -68,13 +69,13 @@ class TestKlineWorkerLifecycle:
         worker._run = patched_run
         return worker, bar_queue
 
-    def test_start_enqueues_bars(self):
+    def test_start_single_symbol_enqueues_bars(self):
         candles = [
             ("BTC-USDT-SWAP", _make_candle(1000, c=100.0)),
             ("BTC-USDT-SWAP", _make_candle(2000, c=101.0)),
             ("BTC-USDT-SWAP", _make_candle(3000, c=102.0)),
         ]
-        worker, bar_queue = self._make_worker(candles, freq_seconds=1)
+        worker, bar_queue = self._make_worker(candles)
 
         worker.start()
         time.sleep(0.5)
@@ -83,28 +84,58 @@ class TestKlineWorkerLifecycle:
         assert worker.bar_count == 3
         assert bar_queue.qsize() == 3
 
-        bars = [bar_queue.get_nowait() for _ in range(3)]
-        closes = [list(b.values())[0][4] for b in bars]
-        assert closes == [100.0, 101.0, 102.0]
-
-    def test_start_with_aggregation(self):
+    def test_multi_symbol_rounds_batched(self):
+        """With 2 symbols, each ts produces 1 round with both symbols."""
         candles = [
             ("BTC-USDT-SWAP", _make_candle(1000, c=100.0)),
+            ("ETH-USDT-SWAP", _make_candle(1000, c=200.0)),
             ("BTC-USDT-SWAP", _make_candle(2000, c=101.0)),
-            ("BTC-USDT-SWAP", _make_candle(3000, c=102.0)),
+            ("ETH-USDT-SWAP", _make_candle(2000, c=201.0)),
         ]
-        worker, bar_queue = self._make_worker(candles, freq_seconds=3)
+        symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+        worker, bar_queue = self._make_worker(candles, symbols=symbols)
 
         worker.start()
         time.sleep(0.5)
         worker.stop()
 
-        assert worker.bar_count == 1
-        assert bar_queue.qsize() == 1
+        assert worker.bar_count == 4
+        assert bar_queue.qsize() == 2  # 2 complete rounds
+
+        round1 = bar_queue.get_nowait()
+        assert set(round1.keys()) == set(symbols)
+        assert round1["BTC-USDT-SWAP"][4] == 100.0
+        assert round1["ETH-USDT-SWAP"][4] == 200.0
+
+        round2 = bar_queue.get_nowait()
+        assert set(round2.keys()) == set(symbols)
+        assert round2["BTC-USDT-SWAP"][4] == 101.0
+        assert round2["ETH-USDT-SWAP"][4] == 201.0
+
+    def test_aggregation_with_batching(self):
+        """3s aggregation: 3 candles per symbol → 1 round with both symbols."""
+        candles = [
+            ("BTC-USDT-SWAP", _make_candle(1000, c=100.0)),
+            ("ETH-USDT-SWAP", _make_candle(1000, c=200.0)),
+            ("BTC-USDT-SWAP", _make_candle(2000, c=101.0)),
+            ("ETH-USDT-SWAP", _make_candle(2000, c=201.0)),
+            ("BTC-USDT-SWAP", _make_candle(3000, c=102.0)),
+            ("ETH-USDT-SWAP", _make_candle(3000, c=202.0)),
+        ]
+        symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+        worker, bar_queue = self._make_worker(candles, symbols=symbols, freq_seconds=3)
+
+        worker.start()
+        time.sleep(0.5)
+        worker.stop()
+
+        assert worker.bar_count == 2  # 1 aggregated bar per symbol
+        assert bar_queue.qsize() == 1  # 1 complete round
 
         round_bars = bar_queue.get_nowait()
-        bar = round_bars["BTC-USDT-SWAP"]
-        assert bar[4] == 102.0  # close = last
+        assert set(round_bars.keys()) == set(symbols)
+        assert round_bars["BTC-USDT-SWAP"][4] == 102.0  # close = last
+        assert round_bars["ETH-USDT-SWAP"][4] == 202.0
 
     def test_stop_terminates_thread(self):
         candles = [("BTC-USDT-SWAP", _make_candle(1000))]
@@ -123,9 +154,9 @@ class TestKlineWorkerLifecycle:
         worker.start()
         time.sleep(0.3)
         worker.stop()
-        worker.stop()  # second call should not raise
+        worker.stop()
 
-    def test_stats_reflect_bars(self):
+    def test_stats_reflect_bars_and_rounds(self):
         candles = [
             ("BTC-USDT-SWAP", _make_candle(1000)),
             ("BTC-USDT-SWAP", _make_candle(2000)),
@@ -139,13 +170,14 @@ class TestKlineWorkerLifecycle:
         stats = worker.stats()
         assert stats["adapter_bar_count"] == 2
         assert stats["bars_published"] == 2
+        assert stats["rounds_flushed"] == 2
         assert stats["dup_count"] == 0
         assert stats["drop_count"] == 0
 
     def test_unconfirmed_candles_not_counted(self):
         candles = [
             ("BTC-USDT-SWAP", _make_candle(1000, confirm="1")),
-            ("BTC-USDT-SWAP", _make_candle(2000, confirm="0")),  # unconfirmed
+            ("BTC-USDT-SWAP", _make_candle(2000, confirm="0")),
             ("BTC-USDT-SWAP", _make_candle(3000, confirm="1")),
         ]
         worker, bar_queue = self._make_worker(candles, freq_seconds=1)

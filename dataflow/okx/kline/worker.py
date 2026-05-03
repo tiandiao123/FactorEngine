@@ -56,8 +56,10 @@ class KlineWorker:
         self._adapter = KlineAdapter(freq_seconds=freq_seconds)
         self._publisher = KlinePublisher(
             bar_queue=bar_queue,
+            symbols=self.symbols,
             debug_cache=debug_cache,
             expected_interval_ms=freq_seconds * 1000,
+            batch_timeout_s=min(freq_seconds * 0.8, 4.0),
         )
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -86,10 +88,14 @@ class KlineWorker:
             self._loop.call_soon_threadsafe(self._cancel_loop)
         if self._thread is not None:
             self._thread.join(timeout=5)
+        self._publisher.flush()
         logger.info(
-            "KlineWorker stopped (bars=%d, published=%d, dups=%d, gaps=%d, drops=%d)",
+            "KlineWorker stopped (bars=%d, rounds=%d, published=%d, "
+            "ffill=%d, dups=%d, gaps=%d, drops=%d)",
             self._bar_count,
+            self._publisher.rounds_flushed,
             self._publisher.bars_published,
+            self._publisher.forward_fill_count,
             self._publisher.dup_count,
             self._publisher.gap_count,
             self._publisher.drop_count,
