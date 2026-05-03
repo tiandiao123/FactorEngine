@@ -168,9 +168,12 @@ class Engine:
                 )
 
             if data_source == "trades":
-                logger.info(
-                    "trades-only mode: KlineWorker not started. "
-                    "ClockDriver required for flush (Phase 2)."
+                logger.warning(
+                    "trades-only mode: KlineWorker not started and "
+                    "ClockDriver not yet implemented (Phase 2). "
+                    "Accumulators will collect but never flush — "
+                    "bar_queue will remain empty. "
+                    "Use data_source='kline_trades' for a working setup."
                 )
 
         elif mode == "simulation":
@@ -199,13 +202,15 @@ class Engine:
 
         reg = FactorRegistry()
         reg.load_group(group)
-        self._factor_ids = reg.factor_ids_by_group(group)
 
         self._inference = rt.InferenceEngine(num_threads=num_threads)
         for sym in self.symbols:
             self._inference.add_symbol(sym)
-            for fid, graph in reg.build_group(group).items():
+            graphs = reg.build_group(group)
+            for fid, graph in graphs.items():
                 self._inference.add_factor(sym, fid, graph)
+
+        self._factor_ids = reg.factor_ids_by_group(group)
 
         logger.info(
             "InferenceEngine initialized: %d symbols × %d factors, %d threads",
@@ -308,11 +313,19 @@ class Engine:
     def start(self):
         """Start the dataflow collection and (optionally) the inference thread."""
         if self._bar_queue is not None and self._inference is not None:
-            self._stop_event.clear()
-            self._runtime_thread = threading.Thread(
-                target=self._runtime_loop, daemon=True, name="factor-infer"
-            )
-            self._runtime_thread.start()
+            # In trades-only mode, bar_queue will never receive data
+            # (ClockDriver not yet implemented), so skip runtime thread.
+            if self._data_source == "trades":
+                logger.warning(
+                    "Skipping runtime thread: trades-only mode has no flush "
+                    "driver yet (Phase 2 — ClockDriver)."
+                )
+            else:
+                self._stop_event.clear()
+                self._runtime_thread = threading.Thread(
+                    target=self._runtime_loop, daemon=True, name="factor-infer"
+                )
+                self._runtime_thread.start()
 
         if self.mode == "live":
             if self._trades_worker is not None:

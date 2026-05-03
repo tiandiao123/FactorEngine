@@ -25,8 +25,12 @@ import logging
 import queue
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from dataflow.okx.trades.accumulator import TradesAccumulator
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +63,7 @@ class KlinePublisher:
         debug_cache=None,
         expected_interval_ms: int = 5000,
         batch_timeout_s: float | None = None,
-        accumulators: dict | None = None,
+        accumulators: dict[str, TradesAccumulator] | None = None,
     ):
         self._bar_queue = bar_queue
         self._debug_cache = debug_cache
@@ -75,7 +79,9 @@ class KlinePublisher:
         self._last_pushed_ts: dict[str, int] = {}
         self._lock = threading.Lock()
 
-        # Round-batching state (accessed only from the WS callback thread).
+        # Round-batching state — accessed only from the single WS callback
+        # thread (on_bar / _try_flush_timeout), never from the main thread.
+        # No lock needed as long as this single-writer invariant holds.
         self._pending_round: dict[str, np.ndarray] = {}
         self._round_start_time: float | None = None
         self._last_round: dict[str, np.ndarray] | None = None

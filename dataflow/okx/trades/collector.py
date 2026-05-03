@@ -52,6 +52,9 @@ class OKXTradesCollector:
         self.symbols = list(symbols)
         self.on_trade = on_trade
         self._running = True
+        # Written from asyncio WS thread, read from main thread via
+        # properties. Safe in CPython (GIL) but not portable to
+        # free-threaded builds.
         self._trade_count = 0
         self._msg_count = 0
 

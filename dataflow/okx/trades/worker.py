@@ -1,6 +1,6 @@
 """TradesWorker — manages the trades streaming thread.
 
-Assembles OXKTradesCollector → TradesAccumulator into a daemon thread
+Assembles OKXTradesCollector → TradesAccumulator into a daemon thread
 that can be started / stopped by Engine.
 
 The thread runs an asyncio event loop for the WebSocket collector; each
@@ -42,6 +42,9 @@ class TradesWorker:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._collector: OKXTradesCollector | None = None
+        # Written from the WS asyncio thread (_on_trade), read from main
+        # thread (stats/stop). Safe in CPython (GIL guarantees atomic int
+        # read/write) but not portable to free-threaded builds.
         self._trade_count = 0
 
     # ── public API ─────────────────────────────────────────────
