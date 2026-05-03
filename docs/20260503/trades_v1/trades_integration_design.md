@@ -591,3 +591,227 @@ Phase 1 之后, 按需逐步加入:
 | trades | `wss://ws.okx.com:8443/ws/v5/public` | `OKX_WS_PUBLIC` in `common.py` (已定义, 未使用) |
 
 `common.py` 中 `OKX_WS_PUBLIC` 已存在但当前无人使用, trades collector 可以直接引用。
+
+---
+
+## 附录 D: 数据源模式 (`data_source`) 设计方向
+
+### 动机
+
+高频策略可能完全不依赖 K 线, 只用 trades 聚合特征 (vwap, buy/sell volume
+imbalance 等) 构造因子。此时 kline 数据流是不必要的 CPU 开销。
+
+应提供 **数据源模式** 参数, 让 Engine 按需只启动所需的 Worker:
+
+```python
+engine = Engine(
+    symbols=symbols,
+    data_freq="1s",
+    data_source="trades",        # ← 新增参数
+    factor_group="okx_perp_hf",
+)
+```
+
+### 三种模式
+
+| `data_source` | 启动的 Worker | bar_queue 载荷 | 适用场景 |
+|---------------|--------------|----------------|----------|
+| `"kline"` | KlineWorker only | `(round_bars, None)` | K 线因子 (当前默认) |
+| `"trades"` | TradesWorker only | `(None, round_trades)` | 高频 trades-only 因子 |
+| `"kline_trades"` | 两者都启动 | `(round_bars, round_trades)` | 混合因子 |
+
+### trades-only 模式的关键问题: 谁驱动 round flush?
+
+在 `kline_trades` 模式下, kline 的 bar 边界自然驱动 flush — accumulator
+搭便车。但 `trades`-only 模式下没有 kline, 需要独立的 flush 机制。
+
+#### 方案 A: TradesWorker 内置定时 flush (推荐)
+
+```text
+TradesWorker:
+  trades WS → accumulator.update()       (每笔 trade, O(1))
+  timer(freq_seconds) → for sym in symbols:
+                           snap = acc[sym].snapshot_and_reset()
+                         → bar_queue.put((None, round_trades))
+```
+
+优点: 简单, TradesWorker 自包含, 不依赖外部组件。
+缺点: timer 精度受 asyncio 事件循环影响, 但 1s 级别完全够用。
+
+#### 方案 B: 独立 ClockDriver 组件
+
+```text
+ClockDriver(freq_seconds):
+  每 freq_seconds 触发回调 → publisher/worker flush
+```
+
+优点: 解耦, 可复用给未来的 orderbook 等数据流。
+缺点: 多一个组件, Phase 1 不需要这个复杂度。
+
+**推荐 Phase 2 用方案 A**, 后续如果有 orderbook 数据流再考虑方案 B。
+
+### Engine 层变更
+
+```python
+class Engine:
+    def __init__(self, ..., data_source: str = "kline"):
+        self._data_source = data_source
+
+    def start(self):
+        if self._data_source in ("kline", "kline_trades"):
+            self._kline_worker.start()
+        if self._data_source in ("trades", "kline_trades"):
+            self._trades_worker.start()
+
+    def stop(self):
+        if self._kline_worker:
+            self._kline_worker.stop()
+        if self._trades_worker:
+            self._trades_worker.stop()
+```
+
+### `_runtime_loop` 根据模式构造 BarData
+
+```python
+for sym in round_syms:
+    bar = round_bars.get(sym) if round_bars else None
+    trades = round_trades.get(sym) if round_trades else {}
+
+    close  = float(bar[4]) if bar is not None else float('nan')
+    volume = float(bar[5]) if bar is not None else float('nan')
+    ...
+    vwap     = trades.get("vwap", float('nan'))
+    buy_vol  = trades.get("buy_vol", float('nan'))
+    sell_vol = trades.get("sell_vol", float('nan'))
+
+    batch[sym] = rt.BarData(close, volume, open_, high, low, ret,
+                            vwap, buy_vol, sell_vol)
+```
+
+trades-only 模式下 OHLCV 全部为 NaN, 因子只使用 trades 输入:
+
+```python
+@register_factor("okx_perp_hf", "HF001")
+def build_trade_imbalance() -> rt.FactorGraph:
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    diff = g.add_binary(Op.SUB, bv, sv)
+    total = g.add_binary(Op.ADD, bv, sv)
+    imbalance = g.add_binary(Op.DIV, diff, total)
+    g.add_rolling(Op.TS_ZSCORE, imbalance, 120)
+    g.compile()
+    return g
+```
+
+C++ DAG 各节点独立, NaN 输入不影响不使用它的节点, **无需特殊处理**。
+
+### 从 trades 自建 K 线 (trades-only 模式的 OHLCV)
+
+K 线本质上就是 trades 在固定时间窗口内的聚合:
+
+```text
+open  = 窗口内第一笔 trade 的 px
+high  = max(所有 trade 的 px)
+low   = min(所有 trade 的 px)
+close = 窗口内最后一笔 trade 的 px
+vol   = Σ(sz)
+```
+
+因此在 `trades`-only 模式下, `TradesAccumulator` 可以**同时维护 OHLCV**,
+不再需要额外的 kline WS 连接:
+
+```python
+def update(self, px, sz, side):
+    with self._lock:
+        if self._count == 0:
+            self._open = px
+            self._high = px
+            self._low = px
+        else:
+            self._high = max(self._high, px)
+            self._low = min(self._low, px)
+        self._close = px
+        self._vol += sz
+        # ... 原有的 vwap, buy_vol, sell_vol 逻辑
+
+def snapshot_and_reset(self) -> dict:
+    with self._lock:
+        result = {
+            "open": self._open,
+            "high": self._high,
+            "low": self._low,
+            "close": self._close,
+            "vol": self._vol,
+            "vwap": self._sum_pv / self._sum_v if self._sum_v > 0 else float('nan'),
+            "buy_vol": self._buy_vol,
+            "sell_vol": self._sell_vol,
+            "trade_count": self._count,
+        }
+        # reset all fields ...
+        return result
+```
+
+这样 `BarData` 的所有字段都有值, 因子可以自由混用:
+
+```text
+data_source="trades" 时:
+  单条 WS 连接 (public) → trades 流
+  TradesAccumulator 同时产出:
+    → open, high, low, close, vol      (从 trades 自建的 K 线)
+    → vwap, buy_vol, sell_vol           (trades 聚合特征)
+    → ret = close / prev_close - 1      (Engine 侧计算, 有 close 即可)
+
+  BarData 所有字段都有意义
+  因子可以混用 close, volume, vwap, buy_vol 等任意输入
+```
+
+**优势**:
+
+| 项目 | trades-only (自建 OHLCV) | kline_trades (双 WS) |
+|------|------------------------|---------------------|
+| WS 连接 | 1 条 (public) | 2 条 (public + business) |
+| 频率灵活性 | 任意 (3s, 7s, 13s 等) | 受限于 OKX candle 频道 |
+| 数据一致性 | OHLCV 和 trades 来自同一数据源 | 两个独立推送, 可能微小不一致 |
+| CPU 开销 | 稍高 (自行聚合 OHLC) | 稍低 (OKX 服务端聚合) |
+| 可靠性 | WS 断线期间丢失 trades → OHLC 不完整 | candle 是 OKX 权威数据 |
+
+**建议**: Phase 2 实现 trades-only 模式时直接在 accumulator 里加入 OHLCV
+维护 (几行代码), 让 trades-only 模式成为真正的 **单数据源全功能方案**。
+
+### 关于 `ret` 字段
+
+trades-only 模式下, 如果 accumulator 自建了 OHLCV, `close` 可用,
+`Engine._runtime_loop` 可以正常计算 `ret = close / prev_close - 1`。
+
+如果只用 trades 原生特征, 也可以在 DAG 里用 vwap 替代:
+
+```python
+v = g.add_input("vwap")
+vwap_ret = g.add_rolling(Op.TS_PCT, v, 1)   # vwap / prev_vwap - 1
+```
+
+两种方式都可行, **推荐自建 OHLCV** 方案 — 让所有因子输入都有值, 更通用。
+
+### 实施节奏
+
+| 阶段 | 内容 | 前置 |
+|------|------|------|
+| **Phase 1** (当前文档) | `kline_trades` 模式: trades accumulator + kline flush 驱动 | 无 |
+| **Phase 2** | 加 `data_source` 参数, accumulator 自建 OHLCV, 支持 `trades`-only | Phase 1 |
+| **Phase 3** | 性能优化 / 多尺度 / 更多 trades 聚合量 | Phase 2 |
+
+每一步都是增量的, Phase 1 完成后已经可以验证 trades 因子,
+Phase 2 加入 trades-only 模式后高频策略可以用单条 WS 连接独立运行。
+
+### 300 symbols 资源估算
+
+| 资源 | kline 模式 | trades 模式 | kline_trades 模式 |
+|------|-----------|-------------|-------------------|
+| WS 连接数 | 2 (business) | 2 (public) | 4 (2+2) |
+| CPU (JSON 解析) | ~300 msg/s | ~9,000 msg/s | ~9,300 msg/s |
+| 内存 (额外) | ~2 MB | ~15 MB | ~17 MB |
+| 网络带宽 | ~75 KB/s | ~2.2 MB/s | ~2.3 MB/s |
+
+trades 模式的 CPU 负载约为 kline 的 30 倍, 但仍在单线程 asyncio
+可处理范围内 (Python `json.loads` 极限约 50K-100K msg/s)。
