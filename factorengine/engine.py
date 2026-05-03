@@ -19,7 +19,7 @@ Architecture (v3.1 — streaming, 3+ threads, trades support):
 
 data_source modes:
     "kline"        — kline WS only (default, backward compatible)
-    "trades"       — trades WS only (future Phase 2 with ClockDriver)
+    "trades"       — trades WS only; ClockDriver drives periodic flush
     "kline_trades" — both kline + trades WS, kline flush drives round
 
 Usage (live with kline + trades factors):

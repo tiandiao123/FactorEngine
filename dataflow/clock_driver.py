@@ -75,7 +75,7 @@ class ClockDriver:
         if self._loop is not None and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread is not None:
-            self._thread.join(timeout=self._freq + 2)
+            self._thread.join(timeout=min(self._freq + 2, 30.0))
         logger.info("ClockDriver stopped (ticks=%d)", self._tick_count)
 
     # ── stats ──────────────────────────────────────────────────

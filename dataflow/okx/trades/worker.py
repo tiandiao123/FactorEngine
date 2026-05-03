@@ -67,6 +67,7 @@ class TradesWorker:
         # read/write) but not portable to free-threaded builds.
         self._trade_count = 0
         self._flush_count = 0
+        self._freq_ms: float = 0.0  # set via set_freq(); 0 = no alignment
 
     # ── public API ─────────────────────────────────────────────
 
@@ -85,9 +86,8 @@ class TradesWorker:
         """
         ts_ms = time.time() * 1000
         # Align to freq boundary (same logic as ClockDriver).
-        freq_ms = getattr(self, "_freq_ms", 0)
-        if freq_ms > 0:
-            ts_ms = ts_ms - (ts_ms % freq_ms)
+        if self._freq_ms > 0:
+            ts_ms = ts_ms - (ts_ms % self._freq_ms)
         ts_ms = int(ts_ms)
 
         round_bars: dict[str, np.ndarray] = {}
