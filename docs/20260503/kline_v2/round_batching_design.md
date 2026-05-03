@@ -438,8 +438,53 @@ def _flush_round(self) -> bool:
 
 ---
 
-## 10. 一句话总结
+## 10. v2.1 补丁: Adapter 时间窗口对齐
+
+> 2026-05-03 追加
+
+### 10.1 问题
+
+v2 的 Publisher 攒批逻辑已正确实现, 但实测发现 `forward_fill_count` 仍然很高
+(约 50%). 根本原因: **`KlineAdapter` 的聚合是按"计数 N 根"独立处理每个 symbol 的**。
+
+不同 symbol 的 1s candle 确认时间不同步 (OKX 各交易对数据到达有先后),
+导致各 symbol 的聚合 bar 时间戳不一致:
+
+```text
+SOL: 1s candles at T+1,T+2,T+3,T+4,T+5 → 5s bar ts=T+1
+BTC: 1s candles at T+3,T+4,T+5,T+6,T+7 → 5s bar ts=T+3
+ETH: 1s candles at T+2,T+3,T+4,T+5,T+6 → 5s bar ts=T+2
+
+Publisher 收到 ts=T+1 (SOL) → pending round ts=T+1
+Publisher 收到 ts=T+2 (ETH) → ts 不同, 触发 flush → SOL 的 round 被 forward-fill!
+```
+
+### 10.2 修复
+
+修改 `KlineAdapter._aggregate()`, 用 **时间窗口边界** 代替 **计数**:
+
+```python
+window_start = ts_ms - (ts_ms % freq_ms)
+```
+
+所有 symbol 共享相同的窗口边界 (如 `freq=5s` 时, 窗口为 `[0, 5000), [5000, 10000), ...`).
+聚合输出的 bar `ts` 字段设为 `window_start` 而不是第一根 candle 的 ts.
+
+这样所有 symbol 的聚合结果 ts 一定相同, Publisher 可以正确匹配同一轮.
+
+### 10.3 影响
+
+- 聚合 bar 的 `ts` 字段含义从"第一根 candle 的 ts" 变为"对齐后的窗口起始 ts"
+- 窗口切换时, 如果旧窗口不完整 (未攒够 N 根), 旧 buffer 直接丢弃 (等价于 gap)
+- `forward_fill_count` 预计大幅下降 (从 ~50% 降至接近 0)
+
+---
+
+## 11. 一句话总结
 
 改造 `KlinePublisher`: 把逐 symbol 推送改成攒批推送, 等所有 symbol 到齐
 (或超时后 forward-fill) 再一次性 `bar_queue.put()`, 与 simulation 行为对齐,
 消除因子结果不对齐和重复计算的问题。
+
+v2.1 补丁: 修复 `KlineAdapter` 聚合窗口对齐, 确保不同 symbol 产出的 bar
+具有相同时间戳, 从根本上解决 Publisher 攒批时的 ts 不匹配问题。

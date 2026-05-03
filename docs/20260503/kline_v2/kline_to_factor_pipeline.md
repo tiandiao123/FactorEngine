@@ -1,7 +1,7 @@
 # OKX Kline → Factor Engine 完整链路讲解
 
 > 日期: 2026-05-03
-> 版本: v2 (round batching)
+> 版本: v2.1 (round batching + time-aligned aggregation)
 > 适用代码: `dataflow/okx/kline/`, `factorengine/engine.py`, `factorengine/factors/`
 
 ---
@@ -31,12 +31,13 @@
 │                               │   "12.3","1169115","1169115","1"])       │
 │                               ▼                                          │
 │  ┌──────────────────────────────────────────────────────────────┐        │
-│  │  KlineAdapter                                                │        │
+│  │  KlineAdapter (v2.1 time-aligned)                             │        │
 │  │  • 过滤: raw[-1] != "1" → 返回 None (丢弃未确认 candle)      │        │
 │  │  • 解析: raw → BarPoint (np.ndarray, shape=(8,), float64)    │        │
-│  │  • 聚合: freq < 60s → 攒 N 根 1s candle, 合并为 1 根 Ns bar  │        │
+│  │  • 聚合: freq < 60s → 按时间窗口对齐聚合 (见下文详述)         │        │
 │  │          freq >= 60s → 直接输出 (WS 频道已匹配)               │        │
-│  │  • Gap 检测: ts 跳变 > 2×interval → 清空 buffer, 重新聚合    │        │
+│  │  • 窗口对齐: ts % (freq*1000) 确定窗口边界                    │        │
+│  │  • Gap 检测: 窗口内 ts 跳变 > 2s → 清空 buffer, 重新聚合     │        │
 │  └────────────────────────────┬─────────────────────────────────┘        │
 │                               │ BarPoint (5s bar) 或 None                │
 │                               ▼                                          │
@@ -167,7 +168,7 @@ index  字段           示例
 
 Collector 收到后, 对每条 `data` 记录调用 `on_candle("BTC-USDT-SWAP", raw_array)`.
 
-### 阶段 2: 过滤 + 聚合
+### 阶段 2: 过滤 + 时间对齐聚合
 
 **组件**: `KlineAdapter` (`dataflow/okx/kline/adapter.py`)
 
@@ -186,19 +187,55 @@ OKX 在一秒内可能推送多次同一 candle (进行中 + 最终确认), 只�
 raw (string list) → np.array([ts, open, high, low, close, vol, volCcy, volCcyQuote], dtype=float64)
 ```
 
-**步骤 3: 聚合 (仅 freq < 60s)**
+**步骤 3: 时间对齐聚合 (仅 freq < 60s, v2.1 改进)**
 
-以 `data_freq="5s"` 为例, 攒 5 根 1s candle 后合并:
+> **v2.1 核心改进**: 聚合窗口不再按"攒够 N 根"来计数, 而是按时间窗口边界对齐.
+> 所有 symbol 共享相同的窗口边界: `window_start = ts - (ts % (freq * 1000))`.
+> 这确保不同 symbol 的聚合结果始终具有相同的 `ts`, 使得 Publisher 能正确攒批.
+
+**为什么需要时间对齐?**
+
+旧方案 (v2): 每个 symbol 独立计数 N 根 candle. 由于不同 symbol 的第一根确认 candle
+到达时间不同 (如 SOL 在 T+1s 确认, BTC 在 T+3s 确认), 它们各自聚合出的 5s bar
+时间戳不一致:
 
 ```text
-1s candle 1:  ts=T+0  open=100 high=105 low=95  close=102 vol=10  volCcy=1020
-1s candle 2:  ts=T+1  open=102 high=108 low=101 close=107 vol=12  volCcy=1284
-1s candle 3:  ts=T+2  open=107 high=109 low=103 close=104 vol=8   volCcy=832
-1s candle 4:  ts=T+3  open=104 high=106 low=100 close=105 vol=15  volCcy=1575
-1s candle 5:  ts=T+4  open=105 high=110 low=104 close=109 vol=11  volCcy=1199
+旧方案 (计数聚合, 已弃用):
+  SOL: 1s candles at T+1,T+2,T+3,T+4,T+5 → 5s bar ts=T+1  ← SOL的起始时刻
+  BTC: 1s candles at T+3,T+4,T+5,T+6,T+7 → 5s bar ts=T+3  ← BTC的起始时刻
+  ETH: 1s candles at T+2,T+3,T+4,T+5,T+6 → 5s bar ts=T+2  ← ETH的起始时刻
+
+  三个 symbol 的 bar ts 分别是 T+1, T+3, T+2 → Publisher 无法识别为同一轮!
+  → 频繁 timeout + forward-fill → forward_fill_count 很高
+```
+
+新方案 (v2.1, 时间窗口对齐):
+
+```text
+freq_ms = 5000
+
+所有 symbol 的窗口边界完全一致:
+  window_start = ts_ms - (ts_ms % 5000)
+
+  BTC candle ts=1000 → window_start=0     (窗口 [0, 5000))
+  BTC candle ts=3000 → window_start=0     (同一窗口)
+  SOL candle ts=1000 → window_start=0     (同一窗口)
+  SOL candle ts=4000 → window_start=0     (同一窗口)
+
+  所有 symbol 的 5s bar 输出 ts=0 → Publisher 识别为同一轮 ✓
+```
+
+以 `data_freq="5s"` 为例, 窗口 [0, 5000) 内的 candles:
+
+```text
+1s candle 1:  ts=0     open=100 high=105 low=95  close=102 vol=10  volCcy=1020
+1s candle 2:  ts=1000  open=102 high=108 low=101 close=107 vol=12  volCcy=1284
+1s candle 3:  ts=2000  open=107 high=109 low=103 close=104 vol=8   volCcy=832
+1s candle 4:  ts=3000  open=104 high=106 low=100 close=105 vol=15  volCcy=1575
+1s candle 5:  ts=4000  open=105 high=110 low=104 close=109 vol=11  volCcy=1199
 
 聚合结果 (5s bar):
-  ts       = T+0       (第一根的 ts)
+  ts       = 0         (对齐后的窗口起始时间, 不是第一根的 ts!)
   open     = 100       (第一根的 open)
   high     = 110       (所有 high 的最大值)
   low      = 95        (所有 low 的最小值)
@@ -209,6 +246,23 @@ raw (string list) → np.array([ts, open, high, low, close, vol, volCcy, volCcyQ
 ```
 
 前 4 根返回 `None`, 第 5 根返回聚合后的 `BarPoint`.
+
+**窗口边界行为**:
+
+```text
+情况 1: 窗口内连续 → 正常聚合
+  candles: ts=0, 1000, 2000, 3000, 4000 (all in [0, 5000))
+  → 输出 bar ts=0
+
+情况 2: candle 跳到下一个窗口 → 旧窗口不完整被丢弃
+  candles: ts=0, 1000 (2/5 in [0, 5000)), then ts=5000
+  → [0, 5000) 不够 5 根, 丢弃
+  → ts=5000 开始新窗口 [5000, 10000)
+
+情况 3: 窗口内有 gap (> 2s) → buffer 重置
+  candles: ts=0, 1000, 5000 (gap > 2s)
+  → 窗口切换到 [5000, 10000), 旧 buffer 丢弃
+```
 
 ### 阶段 3: 攒批推送
 
@@ -415,8 +469,26 @@ _init_inference("okx_perp", 4)
 
 ---
 
+## 版本变更记录
+
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| v2 | 2026-05-03 | Publisher 攒批 (round batching + timeout + forward-fill) |
+| v2.1 | 2026-05-03 | Adapter 时间窗口对齐聚合, 解决跨 symbol 时间戳不一致导致高 forward-fill 的问题 |
+
+**v2.1 问题背景**: v2 的 Publisher 攒批已经正确实现, 但 Adapter 聚合仍按"计数 N 根"
+的方式独立处理每个 symbol. 由于不同 symbol 的 1s candle 确认时间不同步,
+聚合产出的 bar 时间戳各不相同, Publisher 无法将它们识别为同一轮, 导致频繁超时和
+forward-fill (实测 `forward_fill_count` 约占 50%).
+
+**v2.1 修复**: Adapter 的聚合改为按 `ts % (freq * 1000)` 计算统一的窗口边界.
+所有 symbol 的聚合 bar 输出相同的 aligned ts, Publisher 能正确识别同一轮, 大幅降低
+forward-fill 比例.
+
+---
+
 ## 一句话总结
 
-OKX 1s K线 → Collector 收取 → Adapter 过滤聚合为 5s bar →
+OKX 1s K线 → Collector 收取 → Adapter 过滤 + 时间对齐聚合为 Ns bar →
 Publisher 攒齐所有 symbol 为一轮 → bar_queue → 推理线程把 bar 喂给
 C++ InferenceEngine 并行计算 60 个因子 → signal_deque → 主线程随时读取最新因子值.

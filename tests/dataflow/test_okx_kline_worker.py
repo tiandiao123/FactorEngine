@@ -113,14 +113,14 @@ class TestKlineWorkerLifecycle:
         assert round2["ETH-USDT-SWAP"][4] == 201.0
 
     def test_aggregation_with_batching(self):
-        """3s aggregation: 3 candles per symbol → 1 round with both symbols."""
+        """3s aggregation: 3 candles per symbol in window [0,3000) → 1 round."""
         candles = [
-            ("BTC-USDT-SWAP", _make_candle(1000, c=100.0)),
-            ("ETH-USDT-SWAP", _make_candle(1000, c=200.0)),
-            ("BTC-USDT-SWAP", _make_candle(2000, c=101.0)),
-            ("ETH-USDT-SWAP", _make_candle(2000, c=201.0)),
-            ("BTC-USDT-SWAP", _make_candle(3000, c=102.0)),
-            ("ETH-USDT-SWAP", _make_candle(3000, c=202.0)),
+            ("BTC-USDT-SWAP", _make_candle(0, c=100.0)),
+            ("ETH-USDT-SWAP", _make_candle(0, c=200.0)),
+            ("BTC-USDT-SWAP", _make_candle(1000, c=101.0)),
+            ("ETH-USDT-SWAP", _make_candle(1000, c=201.0)),
+            ("BTC-USDT-SWAP", _make_candle(2000, c=102.0)),
+            ("ETH-USDT-SWAP", _make_candle(2000, c=202.0)),
         ]
         symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
         worker, bar_queue = self._make_worker(candles, symbols=symbols, freq_seconds=3)
@@ -136,6 +136,8 @@ class TestKlineWorkerLifecycle:
         assert set(round_bars.keys()) == set(symbols)
         assert round_bars["BTC-USDT-SWAP"][4] == 102.0  # close = last
         assert round_bars["ETH-USDT-SWAP"][4] == 202.0
+        assert round_bars["BTC-USDT-SWAP"][0] == 0.0  # aligned ts
+        assert round_bars["ETH-USDT-SWAP"][0] == 0.0  # same aligned ts
 
     def test_stop_terminates_thread(self):
         candles = [("BTC-USDT-SWAP", _make_candle(1000))]

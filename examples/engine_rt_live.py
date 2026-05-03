@@ -18,7 +18,7 @@ logging.basicConfig(
 engine = Engine(
     symbols=["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
     mode="live",
-    data_freq="5s",
+    data_freq="1s",
     factor_group="okx_perp",
     num_threads=4,
 )
@@ -31,7 +31,7 @@ engine.start()
 
 try:
     for cycle in range(1, 200):
-        time.sleep(5.0)
+        time.sleep(1)
 
         factors = engine.get_factor_outputs()
         snapshot = engine.get_data()
