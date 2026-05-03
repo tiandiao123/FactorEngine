@@ -1,10 +1,10 @@
 """Real-time factor inference demo using OKX kline + trades streams.
 
-Shows the kline_trades architecture:
-  - KlineWorker collects OKX WebSocket candles → bar_queue
+Shows the v4 ClockDriver architecture:
+  - KlineWorker collects OKX WebSocket candles → internal buffer
   - TradesWorker collects OKX trades → per-symbol TradesAccumulators
-  - KlinePublisher snapshots accumulators on each flush, producing
-    (round_bars, round_trades) tuples
+  - ClockDriver flushes both workers on wall-clock boundaries,
+    aggregates data, and pushes (merged_bars, merged_trades) to bar_queue
   - Runtime thread: bar_queue → push_bars (C++ parallel) → signal_deque
   - Main thread polls get_factor_outputs() at its own pace
 
@@ -55,12 +55,12 @@ try:
         print(
             f"\n═══ Cycle {cycle:3d}  bars_pushed={engine.bars_pushed:4d}  "
             f"kline={engine.kline_stats}  "
-            f"trades={engine.trades_stats}"
+            f"trades={engine.trades_stats}  "
+            f"clock={engine.clock_stats}"
         )
         for ln in lines:
             print(ln)
 
-        # every cycle: show all factor values per symbol
         for sym in engine.symbols:
             fvals = factors.get(sym, {})
             if not fvals:
@@ -71,7 +71,6 @@ try:
             )
             print(f"  {sym:<16s}  {items}")
 
-        # every 10 cycles: detailed breakdown
         if cycle % 10 == 0:
             sym0 = engine.symbols[0]
             fvals = factors.get(sym0, {})

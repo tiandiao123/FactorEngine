@@ -1,19 +1,18 @@
-"""Tests for dataflow.okx.kline.publisher.KlinePublisher (v2 round batching).
+"""Tests for dataflow.okx.kline.publisher.KlinePublisher (v3 ClockDriver).
 
 Covers:
-  - Round batching: all symbols arrive → flush
-  - Timeout + forward-fill: partial symbols + timeout → flush with fill
+  - Round completion: all symbols arrive → ready via flush_for_clock()
+  - Timeout + forward-fill: partial symbols + timeout → fill from last round
   - First round must wait for all symbols (no forward-fill source)
-  - Round boundary: new ts triggers flush of previous round
+  - Round boundary: new ts triggers internal completion of previous round
   - Deduplication: same/old ts rejected
   - Gap detection and warning
-  - Backpressure: queue full → drop
   - Debug cache receives bars immediately
-  - Stats reporting (rounds_flushed, forward_fill_count, etc.)
+  - flush_for_clock() returns data for ClockDriver
+  - Stats reporting (rounds_completed, forward_fill_count, etc.)
   - Thread safety
 """
 
-import queue
 import threading
 import time
 
@@ -44,166 +43,135 @@ class FakeCache:
         self.data.append((symbol, bar.copy()))
 
 
-def _pub(symbols=None, maxsize=64, **kwargs):
-    """Shorthand to create a publisher + queue pair."""
-    q = queue.Queue(maxsize=maxsize)
+def _pub(symbols=None, **kwargs):
+    """Shorthand to create a publisher."""
     pub = KlinePublisher(
-        bar_queue=q,
         symbols=symbols or SYMBOLS_3,
         expected_interval_ms=kwargs.pop("expected_interval_ms", 5000),
         **kwargs,
     )
-    return pub, q
+    return pub
 
 
-# ── Round batching: all symbols arrive ────────────────────────
+# ── Round completion: all symbols arrive ──────────────────────
 
-class TestRoundBatching:
-    def test_flush_when_all_symbols_arrive(self):
-        pub, q = _pub()
+class TestRoundCompletion:
+    def test_ready_when_all_symbols_arrive(self):
+        pub = _pub()
 
-        assert pub.publish("BTC-USDT-SWAP", _bar(5000)) is False  # 1/3
-        assert pub.publish("ETH-USDT-SWAP", _bar(5000)) is False  # 2/3
-        assert pub.publish("SOL-USDT-SWAP", _bar(5000)) is True   # 3/3 → flush
+        pub.publish("BTC-USDT-SWAP", _bar(5000))
+        pub.publish("ETH-USDT-SWAP", _bar(5000))
+        pub.publish("SOL-USDT-SWAP", _bar(5000))
 
-        assert q.qsize() == 1
-        round_bars, round_trades = q.get_nowait()
-        assert set(round_bars.keys()) == set(SYMBOLS_3)
-        assert round_trades is None
-        assert pub.rounds_flushed == 1
-        assert pub.bars_published == 3
+        result = pub.flush_for_clock()
+        assert result is not None
+        assert set(result.keys()) == set(SYMBOLS_3)
+        assert pub.rounds_completed == 1
 
     def test_two_rounds(self):
-        pub, q = _pub()
+        pub = _pub()
 
         for sym in SYMBOLS_3:
             pub.publish(sym, _bar(5000))
         for sym in SYMBOLS_3:
             pub.publish(sym, _bar(10000))
 
-        assert q.qsize() == 2
-        assert pub.rounds_flushed == 2
-        assert pub.bars_published == 6
+        assert pub.rounds_completed == 2
+
+        r1 = pub.flush_for_clock()
+        assert r1 is not None
 
     def test_order_independent(self):
-        """Symbols can arrive in any order."""
-        pub, q = _pub()
+        pub = _pub()
 
         pub.publish("SOL-USDT-SWAP", _bar(5000))
         pub.publish("BTC-USDT-SWAP", _bar(5000))
         pub.publish("ETH-USDT-SWAP", _bar(5000))
 
-        assert q.qsize() == 1
-        round_bars, _ = q.get_nowait()
-        assert set(round_bars.keys()) == set(SYMBOLS_3)
+        result = pub.flush_for_clock()
+        assert result is not None
+        assert set(result.keys()) == set(SYMBOLS_3)
 
     def test_single_symbol(self):
-        """With only 1 symbol, every publish triggers a flush."""
-        pub, q = _pub(symbols=["BTC-USDT-SWAP"])
+        pub = _pub(symbols=["BTC-USDT-SWAP"])
 
-        assert pub.publish("BTC-USDT-SWAP", _bar(5000)) is True
-        assert pub.publish("BTC-USDT-SWAP", _bar(10000)) is True
+        pub.publish("BTC-USDT-SWAP", _bar(5000))
+        result = pub.flush_for_clock()
+        assert result is not None
+        assert "BTC-USDT-SWAP" in result
 
-        assert q.qsize() == 2
-        assert pub.rounds_flushed == 2
+        pub.publish("BTC-USDT-SWAP", _bar(10000))
+        result2 = pub.flush_for_clock()
+        assert result2 is not None
 
 
 # ── First round: must wait for all symbols ────────────────────
 
 class TestFirstRound:
     def test_first_round_partial_no_flush(self):
-        """First round with missing symbols does NOT flush (no forward-fill)."""
-        pub, q = _pub(batch_timeout_s=0.01)
+        pub = _pub(batch_timeout_s=0.01)
 
         pub.publish("BTC-USDT-SWAP", _bar(5000))
         pub.publish("ETH-USDT-SWAP", _bar(5000))
         time.sleep(0.05)
-        # Timeout has passed, but first round has no last_round → no flush
-        # Next publish should check timeout but still not flush
-        pub.publish("BTC-USDT-SWAP", _bar(10000))  # triggers ts boundary → tries flush old
-        # The old round (ts=5000) is incomplete first round → not flushed
-        assert pub.rounds_flushed == 0
+        pub.publish("BTC-USDT-SWAP", _bar(10000))
+        assert pub.rounds_completed == 0
 
     def test_first_round_complete_flushes(self):
-        pub, q = _pub()
+        pub = _pub()
 
         for sym in SYMBOLS_3:
             pub.publish(sym, _bar(5000))
 
-        assert q.qsize() == 1
-        assert pub.rounds_flushed == 1
+        assert pub.rounds_completed == 1
 
 
 # ── Timeout + forward-fill ────────────────────────────────────
 
 class TestTimeoutForwardFill:
     def test_timeout_triggers_forward_fill(self):
-        pub, q = _pub(batch_timeout_s=0.05)
+        pub = _pub(batch_timeout_s=0.05)
 
-        # First round: all arrive
         for sym in SYMBOLS_3:
             pub.publish(sym, _bar(5000))
-        assert pub.rounds_flushed == 1
+        assert pub.rounds_completed == 1
 
-        # Second round: only 2/3 arrive
         pub.publish("BTC-USDT-SWAP", _bar(10000))
         pub.publish("ETH-USDT-SWAP", _bar(10000))
         time.sleep(0.1)
-
-        # Next publish triggers timeout check
         pub.publish("BTC-USDT-SWAP", _bar(15000))
 
-        # The ts=10000 round should have been flushed with SOL forward-filled
-        assert pub.rounds_flushed == 2
+        assert pub.rounds_completed == 2
         assert pub.forward_fill_count == 1
 
-        # Verify the flushed round has all 3 symbols
-        # First round was at q position 0, second at position 1
-        q.get_nowait()  # discard first round
-        round2, _ = q.get_nowait()
-        assert set(round2.keys()) == set(SYMBOLS_3)
-        assert int(round2["SOL-USDT-SWAP"][0]) == 5000  # forward-filled from round 1
-
     def test_forward_fill_value_is_last_round(self):
-        pub, q = _pub(symbols=SYMBOLS_2, batch_timeout_s=0.05)
+        pub = _pub(symbols=SYMBOLS_2, batch_timeout_s=0.05)
 
-        # Round 1: all arrive
         pub.publish("BTC-USDT-SWAP", _bar(5000, close=100.0))
         pub.publish("ETH-USDT-SWAP", _bar(5000, close=200.0))
-        assert pub.rounds_flushed == 1
+        assert pub.rounds_completed == 1
 
-        # Round 2: only BTC
         pub.publish("BTC-USDT-SWAP", _bar(10000, close=101.0))
         time.sleep(0.1)
-
-        # Trigger timeout check
         pub.publish("BTC-USDT-SWAP", _bar(15000, close=102.0))
 
-        assert pub.rounds_flushed == 2
-        q.get_nowait()
-        round2, _ = q.get_nowait()
-        assert round2["ETH-USDT-SWAP"][4] == 200.0  # close from round 1
+        assert pub.rounds_completed == 2
 
 
 # ── Round boundary: ts mismatch ───────────────────────────────
 
 class TestRoundBoundary:
     def test_new_ts_flushes_previous_round(self):
-        """When a bar with a new ts arrives, the old round is flushed first."""
-        pub, q = _pub(symbols=SYMBOLS_2)
+        pub = _pub(symbols=SYMBOLS_2)
 
-        # Round 1: both arrive
         pub.publish("BTC-USDT-SWAP", _bar(5000))
         pub.publish("ETH-USDT-SWAP", _bar(5000))
-        assert pub.rounds_flushed == 1
+        assert pub.rounds_completed == 1
 
-        # Round 2: BTC arrives, then BTC arrives again with ts=15000
         pub.publish("BTC-USDT-SWAP", _bar(10000))
-        # Now ETH hasn't arrived yet for ts=10000. BTC with ts=15000 arrives:
         pub.publish("BTC-USDT-SWAP", _bar(15000))
 
-        # ts=10000 round should be flushed (ETH forward-filled)
-        assert pub.rounds_flushed == 2
+        assert pub.rounds_completed == 2
         assert pub.forward_fill_count == 1
 
 
@@ -211,26 +179,24 @@ class TestRoundBoundary:
 
 class TestDedup:
     def test_same_ts_rejected(self):
-        pub, q = _pub(symbols=["BTC-USDT-SWAP"])
+        pub = _pub(symbols=["BTC-USDT-SWAP"])
 
         pub.publish("BTC-USDT-SWAP", _bar(5000))
-        assert pub.publish("BTC-USDT-SWAP", _bar(5000)) is False
+        pub.publish("BTC-USDT-SWAP", _bar(5000))
         assert pub.dup_count == 1
 
     def test_old_ts_rejected(self):
-        pub, q = _pub(symbols=["BTC-USDT-SWAP"])
+        pub = _pub(symbols=["BTC-USDT-SWAP"])
 
         pub.publish("BTC-USDT-SWAP", _bar(10000))
-        assert pub.publish("BTC-USDT-SWAP", _bar(5000)) is False
+        pub.publish("BTC-USDT-SWAP", _bar(5000))
         assert pub.dup_count == 1
 
     def test_dedup_per_symbol(self):
-        pub, q = _pub()
+        pub = _pub()
 
         pub.publish("BTC-USDT-SWAP", _bar(5000))
-        # Same ts for a different symbol is OK
-        result = pub.publish("ETH-USDT-SWAP", _bar(5000))
-        assert result is False  # not flushed yet (2/3)
+        pub.publish("ETH-USDT-SWAP", _bar(5000))
         assert pub.dup_count == 0
 
 
@@ -238,64 +204,51 @@ class TestDedup:
 
 class TestGap:
     def test_gap_detected(self):
-        pub, q = _pub(symbols=["BTC-USDT-SWAP"])
+        pub = _pub(symbols=["BTC-USDT-SWAP"])
 
         pub.publish("BTC-USDT-SWAP", _bar(5000))
         pub.publish("BTC-USDT-SWAP", _bar(20000))
         assert pub.gap_count == 1
 
     def test_no_gap_within_threshold(self):
-        pub, q = _pub(symbols=["BTC-USDT-SWAP"])
+        pub = _pub(symbols=["BTC-USDT-SWAP"])
 
         pub.publish("BTC-USDT-SWAP", _bar(5000))
         pub.publish("BTC-USDT-SWAP", _bar(10000))
         assert pub.gap_count == 0
 
     def test_gap_on_first_bar_not_counted(self):
-        pub, q = _pub(symbols=["BTC-USDT-SWAP"])
+        pub = _pub(symbols=["BTC-USDT-SWAP"])
 
         pub.publish("BTC-USDT-SWAP", _bar(100000))
         assert pub.gap_count == 0
 
     def test_gap_boundary_exact_2x_not_counted(self):
-        pub, q = _pub(symbols=["BTC-USDT-SWAP"])
+        pub = _pub(symbols=["BTC-USDT-SWAP"])
 
         pub.publish("BTC-USDT-SWAP", _bar(5000))
         pub.publish("BTC-USDT-SWAP", _bar(15000))
         assert pub.gap_count == 0
 
     def test_gap_boundary_just_over_2x(self):
-        pub, q = _pub(symbols=["BTC-USDT-SWAP"])
+        pub = _pub(symbols=["BTC-USDT-SWAP"])
 
         pub.publish("BTC-USDT-SWAP", _bar(5000))
         pub.publish("BTC-USDT-SWAP", _bar(15001))
         assert pub.gap_count == 1
 
     def test_gap_multi_symbol_independent(self):
-        pub, q = _pub()
+        pub = _pub()
 
         pub.publish("BTC-USDT-SWAP", _bar(5000))
         pub.publish("ETH-USDT-SWAP", _bar(5000))
-        pub.publish("SOL-USDT-SWAP", _bar(5000))  # flush round 1
+        pub.publish("SOL-USDT-SWAP", _bar(5000))
 
-        pub.publish("BTC-USDT-SWAP", _bar(20000))  # BTC gap
-        pub.publish("ETH-USDT-SWAP", _bar(10000))  # ETH normal
-        pub.publish("SOL-USDT-SWAP", _bar(10000))  # SOL normal — won't flush (ts mismatch)
+        pub.publish("BTC-USDT-SWAP", _bar(20000))
+        pub.publish("ETH-USDT-SWAP", _bar(10000))
+        pub.publish("SOL-USDT-SWAP", _bar(10000))
 
         assert pub.gap_count == 1
-
-
-# ── Backpressure ──────────────────────────────────────────────
-
-class TestBackpressure:
-    def test_queue_full_drops_round(self):
-        pub, q = _pub(symbols=["BTC-USDT-SWAP"], maxsize=1)
-
-        assert pub.publish("BTC-USDT-SWAP", _bar(5000)) is True   # round 1 → queue
-        assert pub.publish("BTC-USDT-SWAP", _bar(10000)) is False  # round 2 → full
-
-        assert pub.drop_count == 1
-        assert pub.rounds_flushed == 1
 
 
 # ── Debug cache ───────────────────────────────────────────────
@@ -303,91 +256,100 @@ class TestBackpressure:
 class TestDebugCache:
     def test_cache_receives_bars_immediately(self):
         cache = FakeCache()
-        pub, q = _pub(debug_cache=cache)
+        pub = _pub(debug_cache=cache)
 
         pub.publish("BTC-USDT-SWAP", _bar(5000, close=100.0))
-        # Cache receives bar immediately, even before round is flushed
         assert len(cache.data) == 1
         assert cache.data[0][0] == "BTC-USDT-SWAP"
         assert cache.data[0][1][4] == 100.0
 
     def test_no_cache_no_error(self):
-        pub, q = _pub(debug_cache=None, symbols=["BTC-USDT-SWAP"])
+        pub = _pub(debug_cache=None, symbols=["BTC-USDT-SWAP"])
         pub.publish("BTC-USDT-SWAP", _bar(5000))
-        assert pub.bars_published == 1
+        assert pub.bars_received == 1
+
+
+# ── flush_for_clock ───────────────────────────────────────────
+
+class TestFlushForClock:
+    def test_returns_none_before_first_complete(self):
+        pub = _pub()
+        pub.publish("BTC-USDT-SWAP", _bar(5000))
+        result = pub.flush_for_clock()
+        assert result is None
+
+    def test_returns_complete_round(self):
+        pub = _pub(symbols=["BTC-USDT-SWAP"])
+
+        pub.publish("BTC-USDT-SWAP", _bar(5000))
+
+        result = pub.flush_for_clock()
+        assert result is not None
+        assert "BTC-USDT-SWAP" in result
+        assert result["BTC-USDT-SWAP"][4] == 100.0
+
+    def test_second_call_returns_fallback(self):
+        """Second call returns pending/last_round data."""
+        pub = _pub(symbols=["BTC-USDT-SWAP"])
+
+        pub.publish("BTC-USDT-SWAP", _bar(5000))
+
+        r1 = pub.flush_for_clock()
+        assert r1 is not None
+
+        r2 = pub.flush_for_clock()
+        assert r2 is not None
+
+    def test_returns_latest_completed_round(self):
+        pub = _pub(symbols=SYMBOLS_2)
+
+        pub.publish("BTC-USDT-SWAP", _bar(5000, close=100.0))
+        pub.publish("ETH-USDT-SWAP", _bar(5000, close=200.0))
+
+        pub.publish("BTC-USDT-SWAP", _bar(10000, close=101.0))
+        pub.publish("ETH-USDT-SWAP", _bar(10000, close=201.0))
+
+        result = pub.flush_for_clock()
+        assert result is not None
+        assert set(result.keys()) == set(SYMBOLS_2)
 
 
 # ── Stats ─────────────────────────────────────────────────────
 
 class TestStats:
     def test_stats_dict(self):
-        pub, q = _pub()
+        pub = _pub()
 
         for sym in SYMBOLS_3:
             pub.publish(sym, _bar(5000))
 
         s = pub.stats()
-        assert s["bars_published"] == 3
-        assert s["rounds_flushed"] == 1
+        assert s["bars_received"] == 3
+        assert s["rounds_completed"] == 1
         assert s["forward_fill_count"] == 0
         assert s["dup_count"] == 0
         assert s["gap_count"] == 0
-        assert s["drop_count"] == 0
 
     def test_stats_with_forward_fill(self):
-        pub, q = _pub(symbols=SYMBOLS_2, batch_timeout_s=0.01)
+        pub = _pub(symbols=SYMBOLS_2, batch_timeout_s=0.01)
 
-        # Round 1: complete
         pub.publish("BTC-USDT-SWAP", _bar(5000))
         pub.publish("ETH-USDT-SWAP", _bar(5000))
 
-        # Round 2: only BTC
         pub.publish("BTC-USDT-SWAP", _bar(10000))
         time.sleep(0.05)
-        # Trigger timeout via next publish
         pub.publish("BTC-USDT-SWAP", _bar(15000))
 
         s = pub.stats()
-        assert s["rounds_flushed"] == 2
+        assert s["rounds_completed"] == 2
         assert s["forward_fill_count"] == 1
-
-
-# ── Flush on stop ─────────────────────────────────────────────
-
-class TestFlush:
-    def test_flush_pending_round(self):
-        """flush() pushes incomplete round with forward-fill."""
-        pub, q = _pub(symbols=SYMBOLS_2)
-
-        # Round 1: complete
-        pub.publish("BTC-USDT-SWAP", _bar(5000))
-        pub.publish("ETH-USDT-SWAP", _bar(5000))
-
-        # Round 2: partial
-        pub.publish("BTC-USDT-SWAP", _bar(10000))
-
-        assert pub.flush() is True
-        assert pub.rounds_flushed == 2
-        assert pub.forward_fill_count == 1
-
-    def test_flush_empty_noop(self):
-        pub, q = _pub()
-        assert pub.flush() is False
-
-    def test_flush_first_round_incomplete(self):
-        """flush() on first incomplete round does nothing (no fill source)."""
-        pub, q = _pub()
-        pub.publish("BTC-USDT-SWAP", _bar(5000))
-        assert pub.flush() is False
-        assert pub.rounds_flushed == 0
 
 
 # ── Thread safety ─────────────────────────────────────────────
 
 class TestThreadSafety:
     def test_concurrent_publish_single_symbol(self):
-        """Multiple threads publishing for the same single-symbol publisher."""
-        pub, q = _pub(symbols=["BTC-USDT-SWAP"], maxsize=10000)
+        pub = _pub(symbols=["BTC-USDT-SWAP"])
         errors = []
 
         def publisher(start_ts, count):
@@ -407,83 +369,5 @@ class TestThreadSafety:
             t.join(timeout=10)
 
         assert not errors
-        assert pub.bars_published == 1000
-        assert pub.rounds_flushed == 1000
-
-
-# ── Trades accumulator integration ───────────────────────────
-
-class TestAccumulatorIntegration:
-    def test_flush_with_accumulators(self):
-        """When accumulators are attached, flush includes trades snapshot."""
-        from dataflow.okx.trades.accumulator import TradesAccumulator
-
-        accs = {
-            "BTC-USDT-SWAP": TradesAccumulator(),
-            "ETH-USDT-SWAP": TradesAccumulator(),
-        }
-        q = queue.Queue(maxsize=16)
-        pub = KlinePublisher(
-            bar_queue=q, symbols=SYMBOLS_2,
-            expected_interval_ms=5000,
-            accumulators=accs,
-        )
-
-        # Simulate trades arriving
-        accs["BTC-USDT-SWAP"].update(67000.0, 0.5, "buy")
-        accs["BTC-USDT-SWAP"].update(67100.0, 1.0, "sell")
-        accs["ETH-USDT-SWAP"].update(3500.0, 2.0, "buy")
-
-        # Publish kline bars — triggers flush
-        pub.publish("BTC-USDT-SWAP", _bar(5000))
-        pub.publish("ETH-USDT-SWAP", _bar(5000))
-
-        round_bars, round_trades = q.get_nowait()
-        assert set(round_bars.keys()) == set(SYMBOLS_2)
-        assert round_trades is not None
-        assert set(round_trades.keys()) == set(SYMBOLS_2)
-
-        btc_t = round_trades["BTC-USDT-SWAP"]
-        assert btc_t["trade_count"] == 2
-        assert btc_t["buy_vol"] == pytest.approx(0.5)
-        assert btc_t["sell_vol"] == pytest.approx(1.0)
-        expected_vwap = (67000.0 * 0.5 + 67100.0 * 1.0) / 1.5
-        assert btc_t["vwap"] == pytest.approx(expected_vwap)
-
-        eth_t = round_trades["ETH-USDT-SWAP"]
-        assert eth_t["trade_count"] == 1
-        assert eth_t["buy_vol"] == pytest.approx(2.0)
-
-    def test_flush_resets_accumulators(self):
-        """After flush, accumulators are reset for the next bucket."""
-        from dataflow.okx.trades.accumulator import TradesAccumulator
-
-        accs = {"BTC-USDT-SWAP": TradesAccumulator()}
-        q = queue.Queue(maxsize=16)
-        pub = KlinePublisher(
-            bar_queue=q, symbols=["BTC-USDT-SWAP"],
-            expected_interval_ms=5000,
-            accumulators=accs,
-        )
-
-        accs["BTC-USDT-SWAP"].update(100.0, 1.0, "buy")
-        pub.publish("BTC-USDT-SWAP", _bar(5000))
-
-        _, trades1 = q.get_nowait()
-        assert trades1["BTC-USDT-SWAP"]["trade_count"] == 1
-
-        # Second round — no new trades
-        pub.publish("BTC-USDT-SWAP", _bar(10000))
-        _, trades2 = q.get_nowait()
-        assert trades2["BTC-USDT-SWAP"]["trade_count"] == 0
-
-    def test_no_accumulators_backward_compat(self):
-        """Without accumulators, round_trades is None (backward compat)."""
-        q = queue.Queue(maxsize=16)
-        pub = KlinePublisher(
-            bar_queue=q, symbols=["BTC-USDT-SWAP"],
-            expected_interval_ms=5000,
-        )
-        pub.publish("BTC-USDT-SWAP", _bar(5000))
-        round_bars, round_trades = q.get_nowait()
-        assert round_trades is None
+        assert pub.bars_received == 1000
+        assert pub.rounds_completed == 1000

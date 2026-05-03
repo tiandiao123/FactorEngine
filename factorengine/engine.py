@@ -4,11 +4,18 @@ Engine is the single entry point: it owns the Dataflow thread, optionally
 runs a separate factor inference thread, and exposes get_data() /
 get_factor_outputs() for pulling snapshots.
 
-Architecture (v3.1 — streaming, 3+ threads, trades support):
+Architecture (v4 — ClockDriver unified flush):
 
-    [dataflow thread(s)]
-        okx-kline  → KlineWorker  → bar_queue.put((round_bars, round_trades))
-        okx-trades → TradesWorker → accumulators (read by KlinePublisher)
+    [dataflow thread(s)]  — each worker collects data independently
+        okx-kline  → KlineWorker   (WS → adapter → publisher buffer)
+        okx-trades → TradesWorker  (WS → per-symbol accumulators)
+
+    [clock-driver thread]  — unified flush & aggregation
+        ClockDriver(freq=5s)
+          every tick:
+            kline_data  = kline_worker.flush()
+            trades_data = trades_worker.flush()
+            → aggregate → bar_queue.put((merged_bars, merged_trades))
 
     [runtime thread]  factor-infer
         bar_queue.get() → push_bars (C++ parallel) → signal_deque.append()
@@ -19,13 +26,16 @@ Architecture (v3.1 — streaming, 3+ threads, trades support):
 
 data_source modes:
     "kline"        — kline WS only (default, backward compatible)
-    "trades"       — trades WS only; ClockDriver drives periodic flush
-    "kline_trades" — both kline + trades WS, kline flush drives round
+    "trades"       — trades WS only; ClockDriver flushes trades
+    "kline_trades" — both kline + trades WS, ClockDriver flushes both
+
+In all live modes with factor_group, ClockDriver is the single component
+that pushes aggregated data to bar_queue.  Workers never touch bar_queue.
 
 Usage (live with kline + trades factors):
     engine = Engine(symbols=["BTC-USDT-SWAP"], mode="live", data_freq="5s",
-                    factor_group="okx_perp", num_threads=4,
-                    data_source="kline_trades")
+                    factor_group=["okx_perp", "okx_perp_trades"],
+                    num_threads=4, data_source="kline_trades")
     engine.start()
     time.sleep(30)
     factors = engine.get_factor_outputs()
@@ -110,7 +120,7 @@ class Engine:
             self._factor_groups = list(factor_group)
         else:
             self._factor_groups = []
-        self._factor_group = factor_group  # original value for logging
+        self._factor_group = factor_group
 
         # C++ factor inference engine (optional).
         self._inference = None
@@ -120,7 +130,7 @@ class Engine:
         self._prev_closes: dict[str, float] = {}
         self._bars_pushed = 0
 
-        # Inter-thread communication: dataflow → runtime.
+        # Inter-thread communication: ClockDriver → runtime.
         self._bar_queue: queue.Queue | None = None
         self._bar_queue_timeout = bar_queue_timeout
         self._runtime_thread: threading.Thread | None = None
@@ -138,55 +148,7 @@ class Engine:
         self._dataflow = None
 
         if mode == "live":
-            from dataflow.cache import BarCache
-
-            bar_channel, _ = resolve_bar_channel(self.data_freq_seconds)
-            logger.info(
-                "Live mode: data_freq=%s (%ds) → channel=%s, factors=%s, data_source=%s",
-                data_freq, self.data_freq_seconds, bar_channel,
-                factor_group or "none", data_source,
-            )
-
-            if enable_debug_cache:
-                self._debug_cache = BarCache(window_length=bar_window_length)
-
-            # Start TradesWorker if data_source includes trades.
-            accumulators = None
-            if data_source in ("trades", "kline_trades"):
-                from dataflow.okx.trades.worker import TradesWorker
-
-                trades_queue = self._bar_queue if data_source == "trades" else None
-                self._trades_worker = TradesWorker(
-                    symbols=symbols,
-                    bar_queue=trades_queue,
-                )
-                self._trades_worker.set_freq(self.data_freq_seconds)
-                accumulators = self._trades_worker.accumulators
-
-            # Start KlineWorker if data_source includes kline.
-            if self._bar_queue is not None and data_source in ("kline", "kline_trades"):
-                from dataflow.okx.kline.worker import KlineWorker
-
-                self._kline_worker = KlineWorker(
-                    symbols=symbols,
-                    bar_queue=self._bar_queue,
-                    freq_seconds=self.data_freq_seconds,
-                    debug_cache=self._debug_cache,
-                    accumulators=accumulators,
-                )
-            elif self._bar_queue is None:
-                logger.info(
-                    "Live mode without factor_group: KlineWorker not started "
-                    "(no bar_queue consumer).",
-                )
-
-            # trades-only mode: ClockDriver drives periodic flush.
-            if data_source == "trades" and self._trades_worker is not None:
-                from dataflow.clock_driver import ClockDriver
-
-                self._clock_driver = ClockDriver(freq_seconds=self.data_freq_seconds)
-                self._clock_driver.register(self._trades_worker.flush)
-
+            self._init_live(data_source, symbols, enable_debug_cache)
         elif mode == "simulation":
             from dataflow.simulation.manager import SimDataflowManager
             self._dataflow = SimDataflowManager(
@@ -204,6 +166,55 @@ class Engine:
             )
         else:
             raise ValueError(f"Unknown mode: {mode!r}. Use 'live' or 'simulation'.")
+
+    def _init_live(self, data_source: str, symbols: list[str], enable_debug_cache: bool):
+        """Wire up live mode workers and ClockDriver."""
+        from dataflow.cache import BarCache
+
+        bar_channel, _ = resolve_bar_channel(self.data_freq_seconds)
+        logger.info(
+            "Live mode: data_freq=%s (%ds) → channel=%s, factors=%s, data_source=%s",
+            self.data_freq, self.data_freq_seconds, bar_channel,
+            self._factor_group or "none", data_source,
+        )
+
+        if enable_debug_cache:
+            self._debug_cache = BarCache(window_length=self.bar_window_length)
+
+        # ── Create workers based on data_source ──
+        if data_source in ("kline", "kline_trades"):
+            from dataflow.okx.kline.worker import KlineWorker
+
+            self._kline_worker = KlineWorker(
+                symbols=symbols,
+                freq_seconds=self.data_freq_seconds,
+                debug_cache=self._debug_cache,
+            )
+
+        if data_source in ("trades", "kline_trades"):
+            from dataflow.okx.trades.worker import TradesWorker
+
+            self._trades_worker = TradesWorker(symbols=symbols)
+            self._trades_worker.set_freq(self.data_freq_seconds)
+
+        # ── ClockDriver: unified flush & aggregation ──
+        if self._bar_queue is not None:
+            from dataflow.clock_driver import ClockDriver
+
+            self._clock_driver = ClockDriver(
+                freq_seconds=self.data_freq_seconds,
+                bar_queue=self._bar_queue,
+            )
+
+            if self._kline_worker is not None:
+                self._clock_driver.register("kline", self._kline_worker)
+            if self._trades_worker is not None:
+                self._clock_driver.register("trades", self._trades_worker)
+        else:
+            logger.info(
+                "Live mode without factor_group: ClockDriver not created "
+                "(no bar_queue consumer).",
+            )
 
     # ── Factor inference ──────────────────────────────────────
 
@@ -223,7 +234,6 @@ class Engine:
                 for fid, graph in graphs.items():
                     self._inference.add_factor(sym, fid, graph)
 
-        # Set factor ID list once after all symbols are wired up.
         self._factor_ids = []
         for group in groups:
             self._factor_ids.extend(reg.factor_ids_by_group(group))
@@ -237,7 +247,6 @@ class Engine:
 
     def _runtime_loop(self):
         """Runtime thread main loop: pull bars from queue, infer, write deque."""
-        import math
         import fe_runtime as rt
 
         nan = float("nan")
@@ -248,7 +257,7 @@ class Engine:
             except queue.Empty:
                 continue
 
-            # Unpack: KlinePublisher sends (round_bars, round_trades | None).
+            # Unpack: ClockDriver sends (round_bars, round_trades | None).
             if isinstance(payload, tuple):
                 round_bars, round_trades = payload
             else:
@@ -417,8 +426,15 @@ class Engine:
     def trades_stats(self) -> dict[str, int]:
         """Live trades worker statistics (empty dict if not active)."""
         if self._trades_worker is not None:
-            stats = self._trades_worker.stats()
-            if self._clock_driver is not None:
-                stats["clock_ticks"] = self._clock_driver.tick_count
-            return stats
+            return self._trades_worker.stats()
+        return {}
+
+    @property
+    def clock_stats(self) -> dict[str, int]:
+        """ClockDriver statistics (empty dict if not active)."""
+        if self._clock_driver is not None:
+            return {
+                "clock_ticks": self._clock_driver.tick_count,
+                "clock_drops": self._clock_driver.drop_count,
+            }
         return {}

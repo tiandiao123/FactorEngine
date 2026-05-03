@@ -15,7 +15,8 @@ from factorengine.factors import FactorRegistry
 
 N = 500
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
-NUM_FACTORS = 60
+NUM_FACTORS = 66  # total: 60 kline (okx_perp) + 6 trades (okx_perp_trades)
+NUM_KLINE_FACTORS = 60
 
 
 def make_ohlcv(seed: int, n: int = N):
@@ -40,7 +41,7 @@ class TestFactorRegistry:
     def test_load_group(self):
         reg = FactorRegistry()
         reg.load_group("okx_perp")
-        assert len(reg) == NUM_FACTORS
+        assert len(reg) == NUM_KLINE_FACTORS
         assert reg.groups == ["okx_perp"]
 
     def test_build_all(self):
@@ -56,7 +57,7 @@ class TestFactorRegistry:
         reg = FactorRegistry()
         reg.load_group("okx_perp")
         graphs = reg.build_group("okx_perp")
-        assert len(graphs) == NUM_FACTORS
+        assert len(graphs) == NUM_KLINE_FACTORS
 
     def test_build_single(self):
         reg = FactorRegistry()

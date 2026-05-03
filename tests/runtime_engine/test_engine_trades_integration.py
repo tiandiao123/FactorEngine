@@ -1,11 +1,14 @@
-"""Tests for Engine trades integration (data_source parameter).
+"""Tests for Engine trades integration (v4 ClockDriver architecture).
 
 Covers:
   - data_source parameter validation
   - data_source="kline" backward compatibility
-  - data_source="kline_trades" wiring (TradesWorker + KlineWorker + accumulators)
   - _runtime_loop correctly unpacks (round_bars, round_trades) tuples
   - _runtime_loop builds BarData with trades fields (vwap, buy_vol, sell_vol)
+  - TradesWorker.flush() returns correct payloads (no bar_queue)
+  - ClockDriver aggregation logic
+  - Engine wiring: ClockDriver registered for all live modes
+  - Multi-group factor loading
 
 Usage:
     pytest tests/runtime_engine/test_engine_trades_integration.py -v
@@ -276,31 +279,25 @@ class TestMultiGroupEngine:
             num_threads=1,
             data_source="kline",
         )
-        # Should have factors from both groups.
         assert any(fid.startswith("0") for fid in engine.factor_ids)
         assert any(fid.startswith("T") for fid in engine.factor_ids)
         engine.stop()
 
 
 class TestTradesWorkerFlush:
-    """Test TradesWorker.flush() builds correct payloads."""
+    """Test TradesWorker.flush() returns correct payloads (no bar_queue)."""
 
-    def test_flush_builds_bar_and_trades(self):
+    def test_flush_returns_bar_and_trades(self):
         from dataflow.okx.trades.worker import TradesWorker
 
-        q = queue.Queue(maxsize=4)
-        worker = TradesWorker(symbols=["BTC", "ETH"], bar_queue=q)
+        worker = TradesWorker(symbols=["BTC", "ETH"])
         worker.set_freq(5.0)
 
         worker._accumulators["BTC"].update(100.0, 2.0, "buy")
         worker._accumulators["BTC"].update(105.0, 1.0, "sell")
         worker._accumulators["ETH"].update(3000.0, 5.0, "buy")
 
-        worker.flush()
-
-        payload = q.get_nowait()
-        assert isinstance(payload, tuple)
-        round_bars, round_trades = payload
+        round_bars, round_trades = worker.flush()
 
         assert "BTC" in round_bars
         assert "ETH" in round_bars
@@ -323,42 +320,167 @@ class TestTradesWorkerFlush:
     def test_flush_resets_accumulators(self):
         from dataflow.okx.trades.worker import TradesWorker
 
-        q = queue.Queue(maxsize=4)
-        worker = TradesWorker(symbols=["BTC"], bar_queue=q)
+        worker = TradesWorker(symbols=["BTC"])
 
         worker._accumulators["BTC"].update(100.0, 1.0, "buy")
-        worker.flush()
-        q.get_nowait()
+        round_bars, round_trades = worker.flush()
+        assert round_trades["BTC"]["trade_count"] == 1
 
-        worker.flush()
-        _, round_trades = q.get_nowait()
-        assert round_trades["BTC"]["trade_count"] == 0
-        assert math.isnan(round_trades["BTC"]["vwap"])
-
-    def test_flush_without_bar_queue(self):
-        from dataflow.okx.trades.worker import TradesWorker
-
-        worker = TradesWorker(symbols=["BTC"], bar_queue=None)
-        worker._accumulators["BTC"].update(100.0, 1.0, "buy")
-        worker.flush()
-        assert worker.flush_count == 1
+        _, round_trades2 = worker.flush()
+        assert round_trades2["BTC"]["trade_count"] == 0
+        assert math.isnan(round_trades2["BTC"]["vwap"])
 
     def test_flush_count_increments(self):
         from dataflow.okx.trades.worker import TradesWorker
 
-        q = queue.Queue(maxsize=4)
-        worker = TradesWorker(symbols=["BTC"], bar_queue=q)
+        worker = TradesWorker(symbols=["BTC"])
         assert worker.flush_count == 0
         worker.flush()
         worker.flush()
         assert worker.flush_count == 2
 
 
+class TestClockDriverAggregation:
+    """Test ClockDriver._aggregate() merges worker outputs correctly."""
+
+    def test_kline_only(self):
+        from dataflow.clock_driver import ClockDriver
+
+        q = queue.Queue(maxsize=4)
+        cd = ClockDriver(freq_seconds=5.0, bar_queue=q)
+
+        kline_data = {
+            "BTC": np.array([5000, 100, 105, 99, 101, 50, 0, 0], dtype=np.float64),
+        }
+        merged_bars, merged_trades = cd._aggregate({"kline": kline_data})
+
+        assert "BTC" in merged_bars
+        assert merged_bars["BTC"][4] == 101.0
+        assert merged_trades == {}
+
+    def test_trades_only(self):
+        from dataflow.clock_driver import ClockDriver
+
+        q = queue.Queue(maxsize=4)
+        cd = ClockDriver(freq_seconds=5.0, bar_queue=q)
+
+        trades_bars = {
+            "BTC": np.array([5000, 100, 105, 99, 101, 50, 0, 0], dtype=np.float64),
+        }
+        trades_snaps = {"BTC": {"vwap": 100.5, "buy_vol": 30, "sell_vol": 20}}
+        trades_data = (trades_bars, trades_snaps)
+
+        merged_bars, merged_trades = cd._aggregate({"trades": trades_data})
+
+        assert "BTC" in merged_bars
+        assert "BTC" in merged_trades
+        assert merged_trades["BTC"]["vwap"] == 100.5
+
+    def test_kline_overrides_trades_bar(self):
+        """When both kline and trades provide bars, kline takes priority."""
+        from dataflow.clock_driver import ClockDriver
+
+        q = queue.Queue(maxsize=4)
+        cd = ClockDriver(freq_seconds=5.0, bar_queue=q)
+
+        kline_bar = np.array([5000, 100, 106, 98, 103, 80, 0, 0], dtype=np.float64)
+        trades_bar = np.array([5000, 100, 105, 99, 101, 50, 0, 0], dtype=np.float64)
+        trades_snaps = {"BTC": {"vwap": 100.5, "buy_vol": 30, "sell_vol": 20}}
+
+        raw = {
+            "kline": {"BTC": kline_bar},
+            "trades": ({"BTC": trades_bar}, trades_snaps),
+        }
+        merged_bars, merged_trades = cd._aggregate(raw)
+
+        assert merged_bars["BTC"][4] == 103.0  # kline close, not trades close
+        assert merged_trades["BTC"]["vwap"] == 100.5
+
+    def test_multi_symbol_merge(self):
+        """Kline has BTC+ETH, trades has BTC+SOL → merged has all three."""
+        from dataflow.clock_driver import ClockDriver
+
+        q = queue.Queue(maxsize=4)
+        cd = ClockDriver(freq_seconds=5.0, bar_queue=q)
+
+        kline_data = {
+            "BTC": np.array([5000, 100, 106, 98, 103, 80, 0, 0], dtype=np.float64),
+            "ETH": np.array([5000, 3000, 3100, 2900, 3050, 400, 0, 0], dtype=np.float64),
+        }
+        trades_bars = {
+            "BTC": np.array([5000, 100, 105, 99, 101, 50, 0, 0], dtype=np.float64),
+            "SOL": np.array([5000, 150, 155, 145, 152, 200, 0, 0], dtype=np.float64),
+        }
+        trades_snaps = {
+            "BTC": {"vwap": 100.5},
+            "SOL": {"vwap": 152.3},
+        }
+
+        raw = {
+            "kline": kline_data,
+            "trades": (trades_bars, trades_snaps),
+        }
+        merged_bars, merged_trades = cd._aggregate(raw)
+
+        assert set(merged_bars.keys()) == {"BTC", "ETH", "SOL"}
+        assert merged_bars["BTC"][4] == 103.0   # kline priority
+        assert merged_bars["SOL"][4] == 152.0   # from trades
+        assert merged_bars["ETH"][4] == 3050.0  # kline only
+
+    def test_flush_and_aggregate_pushes_to_queue(self):
+        """End-to-end: ClockDriver._flush_and_aggregate pushes to bar_queue."""
+        from dataflow.clock_driver import ClockDriver
+
+        q = queue.Queue(maxsize=4)
+        cd = ClockDriver(freq_seconds=5.0, bar_queue=q)
+
+        class FakeKlineWorker:
+            def flush(self):
+                return {
+                    "BTC": np.array([5000, 100, 106, 98, 103, 80, 0, 0], dtype=np.float64),
+                }
+
+        class FakeTradesWorker:
+            def flush(self):
+                bars = {
+                    "BTC": np.array([5000, 100, 105, 99, 101, 50, 0, 0], dtype=np.float64),
+                }
+                snaps = {"BTC": {"vwap": 100.5, "buy_vol": 30, "sell_vol": 20}}
+                return (bars, snaps)
+
+        cd.register("kline", FakeKlineWorker())
+        cd.register("trades", FakeTradesWorker())
+
+        cd._flush_and_aggregate()
+
+        assert q.qsize() == 1
+        round_bars, round_trades = q.get_nowait()
+        assert "BTC" in round_bars
+        assert round_bars["BTC"][4] == 103.0
+        assert round_trades["BTC"]["vwap"] == 100.5
+
+    def test_empty_flush_no_push(self):
+        """If all workers return empty, nothing is pushed."""
+        from dataflow.clock_driver import ClockDriver
+
+        q = queue.Queue(maxsize=4)
+        cd = ClockDriver(freq_seconds=5.0, bar_queue=q)
+
+        class EmptyWorker:
+            def flush(self):
+                return None
+
+        cd.register("kline", EmptyWorker())
+        cd._flush_and_aggregate()
+
+        assert q.qsize() == 0
+
+
 class TestEngineTradesOnlyMode:
     """Test Engine with data_source='trades' — ClockDriver driven."""
 
     def test_trades_only_runtime_loop(self):
-        """Simulate trades-only: push trades-derived bars via flush and
+        """Simulate trades-only: push trades-derived bars via queue and
         verify _runtime_loop processes them correctly."""
         engine = Engine(
             symbols=["BTC-USDT-SWAP"],
@@ -378,11 +500,11 @@ class TestEngineTradesOnlyMode:
             for i in range(150):
                 bar = np.array([
                     float(i * 5000),
-                    100.0 + i * 0.1,    # open
-                    102.0 + i * 0.1,    # high
-                    99.0 + i * 0.1,     # low
-                    101.0 + i * 0.1,    # close
-                    1000.0 + i,         # volume
+                    100.0 + i * 0.1,
+                    102.0 + i * 0.1,
+                    99.0 + i * 0.1,
+                    101.0 + i * 0.1,
+                    1000.0 + i,
                     0.0, 0.0,
                 ])
                 trades = {
@@ -409,3 +531,16 @@ class TestEngineTradesOnlyMode:
         assert sym in factors
         fvals = factors[sym]
         assert len(fvals) > 0
+
+
+class TestClockStats:
+    """Test Engine.clock_stats property."""
+
+    def test_clock_stats_empty_simulation(self):
+        engine = Engine(
+            symbols=["BTC-USDT-SWAP"],
+            mode="simulation",
+            sim_seed=42,
+        )
+        assert engine.clock_stats == {}
+        engine.stop()
