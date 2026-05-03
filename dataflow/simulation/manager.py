@@ -11,7 +11,7 @@ import threading
 
 import numpy as np
 
-from dataflow.livetrading.cache import BarCache
+from dataflow.cache import BarCache
 
 from .generator import BarGenerator
 from .symbols import DEFAULT_BASE_PRICE, SYMBOL_BASE_PRICES
@@ -21,7 +21,7 @@ from .worker import SimBarWorker
 class SimDataflowManager:
     """Manage a simulated bar data stream.
 
-    Public interface mirrors ``dataflow.livetrading.manager.DataflowManager``
+    Provides the same public interface as the live OKX dataflow workers
     so that ``Engine`` can delegate without knowing which backend is active.
     """
 

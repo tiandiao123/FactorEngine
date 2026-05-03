@@ -9,7 +9,7 @@ import time
 
 import numpy as np
 
-from dataflow.livetrading.cache import BarCache
+from dataflow.cache import BarCache
 
 from .generator import BarGenerator
 

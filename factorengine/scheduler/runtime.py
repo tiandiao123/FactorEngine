@@ -6,7 +6,11 @@ import time
 
 import numpy as np
 
-from dataflow.events import ASK_SZ_SLICE, BAR_NUM_FIELDS, BID_SZ_SLICE, BOOK_NUM_FIELDS, TRADE_NUM_FIELDS
+BAR_NUM_FIELDS = 8
+TRADE_NUM_FIELDS = 3
+BOOK_NUM_FIELDS = 20
+BID_SZ_SLICE = slice(5, 10)
+ASK_SZ_SLICE = slice(15, 20)
 from factorengine.engine import Engine
 
 from .factor_snapshot import FactorSnapshot

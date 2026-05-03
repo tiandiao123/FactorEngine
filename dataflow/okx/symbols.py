@@ -25,4 +25,3 @@ async def fetch_all_swap_symbols(session: aiohttp.ClientSession) -> list[str]:
     symbols = [inst["instId"] for inst in instruments if inst.get("state") == "live"]
     logger.info("Fetched %d live SWAP symbols from OKX", len(symbols))
     return sorted(symbols)
-
