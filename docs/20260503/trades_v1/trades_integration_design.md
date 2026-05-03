@@ -625,7 +625,7 @@ engine = Engine(
 在 `kline_trades` 模式下, kline 的 bar 边界自然驱动 flush — accumulator
 搭便车。但 `trades`-only 模式下没有 kline, 需要独立的 flush 机制。
 
-#### 方案 A: TradesWorker 内置定时 flush (推荐)
+#### 方案 A: TradesWorker 内置定时 flush
 
 ```text
 TradesWorker:
@@ -636,19 +636,125 @@ TradesWorker:
 ```
 
 优点: 简单, TradesWorker 自包含, 不依赖外部组件。
-缺点: timer 精度受 asyncio 事件循环影响, 但 1s 级别完全够用。
+缺点:
+- timer 精度受 asyncio 事件循环影响 (协作式调度, sleep 只保证"至少等 N 秒",
+  实际延迟取决于事件循环是否空闲, 1s 级别误差约 1-5ms, 可接受)
+- 每新增一种数据流 (orderbook, funding_rate, liquidation 等) 都要各自实现 timer,
+  多个独立 timer 之间存在微小时间偏移, 且代码分散难维护
 
-#### 方案 B: 独立 ClockDriver 组件
+#### 方案 B: 独立 ClockDriver 组件 (推荐)
+
+**统一时钟源, 所有数据流在同一个节拍上 flush。**
 
 ```text
 ClockDriver(freq_seconds):
-  每 freq_seconds 触发回调 → publisher/worker flush
+  每 freq_seconds 触发回调 → 注册的所有 worker flush
 ```
 
-优点: 解耦, 可复用给未来的 orderbook 等数据流。
-缺点: 多一个组件, Phase 1 不需要这个复杂度。
+架构全景:
 
-**推荐 Phase 2 用方案 A**, 后续如果有 orderbook 数据流再考虑方案 B。
+```text
+┌──────────────────────────────────────────────────┐
+│ ClockDriver(freq=5s)                             │
+│   每 5s → flush_callbacks:                       │
+│           → trades_worker.flush()                │
+│           → orderbook_worker.flush()  (未来)     │
+│           → funding_worker.flush()    (未来)     │
+│   所有数据流在同一时刻 flush, 时间精确同步        │
+└──────────────────────────────────────────────────┘
+          ↕ flush()                ↕ update()
+┌──────────────────┐    ┌──────────────────────────┐
+│ TradesWorker     │    │ OKX trades WS            │
+│  accumulators    │←───│  collector → update()     │
+└──────────────────┘    └──────────────────────────┘
+```
+
+参考实现:
+
+```python
+class ClockDriver:
+    """Unified clock that drives periodic flush for all data streams.
+
+    All registered callbacks are invoked at the same wall-clock boundary,
+    ensuring time alignment across heterogeneous data sources.
+    """
+
+    def __init__(self, freq_seconds: float):
+        self._freq = freq_seconds
+        self._callbacks: list[Callable[[], None]] = []
+        self._running = False
+
+    def register(self, callback: Callable[[], None]):
+        """Register a flush callback (e.g. worker.flush)."""
+        self._callbacks.append(callback)
+
+    async def run(self):
+        """Block forever, firing all callbacks every freq_seconds.
+
+        Aligns to wall-clock boundaries: if freq=5s, fires at
+        :00, :05, :10, ... regardless of when run() was called.
+        """
+        self._running = True
+        freq_ms = self._freq * 1000
+        while self._running:
+            now_ms = time.time() * 1000
+            next_boundary = now_ms - (now_ms % freq_ms) + freq_ms
+            sleep_s = (next_boundary - now_ms) / 1000
+            await asyncio.sleep(max(sleep_s, 0.001))
+
+            for cb in self._callbacks:
+                try:
+                    cb()
+                except Exception:
+                    logger.exception("ClockDriver callback error")
+
+    def stop(self):
+        self._running = False
+```
+
+关键设计点:
+
+1. **Wall-clock 对齐**: 不是简单 `sleep(freq)`, 而是对齐到整数时间边界
+   (与 `KlineAdapter` 的窗口对齐策略一致), 保证 flush 时间可预测
+2. **单点控制**: 所有数据流的 flush 频率、时间对齐由一个组件管理
+3. **注册式扩展**: 新数据流只需 `clock.register(new_worker.flush)`, 零侵入
+4. **timer 精度**: asyncio 事件循环的协作式调度会引入 1-5ms 延迟,
+   对 1s+ 级别的 bar 频率完全可接受
+
+为什么选方案 B 而不是 A:
+
+| 维度 | 方案 A (各自 timer) | 方案 B (ClockDriver) |
+|------|-------------------|---------------------|
+| 新数据流接入 | 每个 Worker 自建 timer | `clock.register(worker.flush)` 一行 |
+| 多数据流时间同步 | 各自计时, 有偏移 | 统一节拍, 精确同步 |
+| flush 频率调整 | 改每个 Worker | 改一处 `ClockDriver(freq)` |
+| 代码维护 | timer 逻辑分散在各 Worker | timer 逻辑集中在 ClockDriver |
+| 调试 | 需要对比各 Worker 的 flush 时间 | 看 ClockDriver 日志即可 |
+
+后续数据流接入路径 (均只需 `clock.register`):
+
+```text
+Phase 2: clock.register(trades_worker.flush)
+Phase 3: clock.register(orderbook_worker.flush)
+Phase 4: clock.register(funding_worker.flush)
+         clock.register(liquidation_worker.flush)
+```
+
+### `kline_trades` 模式下 ClockDriver 与 KlinePublisher 的关系
+
+在 `kline_trades` 模式下, kline 的 bar 边界仍然由 `KlinePublisher` 自行管理
+(因为 kline 到达时间由 OKX 服务端推送决定)。ClockDriver 只驱动**非 kline 数据流**
+的 flush。两者通过 `bar_queue` 汇合:
+
+```text
+kline_trades 模式:
+  KlinePublisher._flush_round() → 读 accumulator snapshot → bar_queue
+  (kline 到达驱动, 不经过 ClockDriver)
+
+trades-only 模式:
+  ClockDriver → trades_worker.flush() → accumulator snapshot → bar_queue
+  (ClockDriver 驱动)
+```
 
 ### Engine 层变更
 
@@ -656,14 +762,25 @@ ClockDriver(freq_seconds):
 class Engine:
     def __init__(self, ..., data_source: str = "kline"):
         self._data_source = data_source
+        self._clock_driver: ClockDriver | None = None
 
     def start(self):
         if self._data_source in ("kline", "kline_trades"):
             self._kline_worker.start()
         if self._data_source in ("trades", "kline_trades"):
             self._trades_worker.start()
+        # trades-only 或未来多数据流模式: 启动 ClockDriver
+        if self._data_source != "kline":
+            self._clock_driver = ClockDriver(self._freq_seconds)
+            if self._data_source == "trades":
+                self._clock_driver.register(self._trades_worker.flush)
+            # kline_trades 模式: kline 驱动 flush, ClockDriver 不注册 trades
+            # (未来 orderbook 等可在此注册)
+            self._start_clock_thread()
 
     def stop(self):
+        if self._clock_driver:
+            self._clock_driver.stop()
         if self._kline_worker:
             self._kline_worker.stop()
         if self._trades_worker:
@@ -798,11 +915,14 @@ vwap_ret = g.add_rolling(Op.TS_PCT, v, 1)   # vwap / prev_vwap - 1
 | 阶段 | 内容 | 前置 |
 |------|------|------|
 | **Phase 1** (当前文档) | `kline_trades` 模式: trades accumulator + kline flush 驱动 | 无 |
-| **Phase 2** | 加 `data_source` 参数, accumulator 自建 OHLCV, 支持 `trades`-only | Phase 1 |
-| **Phase 3** | 性能优化 / 多尺度 / 更多 trades 聚合量 | Phase 2 |
+| **Phase 2** | `ClockDriver` + `data_source` 参数, accumulator 自建 OHLCV, 支持 `trades`-only | Phase 1 |
+| **Phase 3** | 新数据流接入 (orderbook, funding_rate 等), 通过 `clock.register` 挂载 | Phase 2 |
+| **Phase 4** | 性能优化 / 多尺度 / 更多聚合量 | Phase 3 |
 
-每一步都是增量的, Phase 1 完成后已经可以验证 trades 因子,
-Phase 2 加入 trades-only 模式后高频策略可以用单条 WS 连接独立运行。
+每一步都是增量的:
+- Phase 1 完成后已经可以验证 trades 因子
+- Phase 2 引入 ClockDriver 作为统一时钟源, trades-only 高频策略可独立运行
+- Phase 3 新数据流只需实现 Worker + `clock.register`, 零侵入扩展
 
 ### 300 symbols 资源估算
 
