@@ -25,6 +25,9 @@ from .adapter import KlineAdapter
 from .collector import OKXKlineCollector
 from .publisher import KlinePublisher
 
+if TYPE_CHECKING:
+    from dataflow.okx.trades.accumulator import TradesAccumulator
+
 logger = logging.getLogger(__name__)
 
 

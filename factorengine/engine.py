@@ -168,13 +168,20 @@ class Engine:
                 )
 
             if data_source == "trades":
-                logger.warning(
-                    "trades-only mode: KlineWorker not started and "
-                    "ClockDriver not yet implemented (Phase 2). "
-                    "Accumulators will collect but never flush — "
-                    "bar_queue will remain empty. "
-                    "Use data_source='kline_trades' for a working setup."
-                )
+                if self._bar_queue is not None:
+                    logger.warning(
+                        "data_source='trades' with factor_group='%s' in live mode: "
+                        "no component pushes bars to the queue "
+                        "(ClockDriver not yet implemented — Phase 2). "
+                        "Accumulators will collect but never flush. "
+                        "Use data_source='kline_trades' to get inference results now.",
+                        factor_group,
+                    )
+                else:
+                    logger.warning(
+                        "trades-only mode: KlineWorker not started. "
+                        "ClockDriver required for flush (Phase 2)."
+                    )
 
         elif mode == "simulation":
             from dataflow.simulation.manager import SimDataflowManager
@@ -210,6 +217,7 @@ class Engine:
             for fid, graph in graphs.items():
                 self._inference.add_factor(sym, fid, graph)
 
+        # Set factor ID list once after all symbols are wired up.
         self._factor_ids = reg.factor_ids_by_group(group)
 
         logger.info(
