@@ -107,13 +107,12 @@ Phase 1 不做多尺度 (如 30s VWAP 和 1min buy_vol 共存)。
 ### 3.1 结论: **流式增量 + 桶边界输出**
 
 ```
-每笔 trade 到达:
-    accumulator.update(px, sz, side)   # O(1)
+每笔 trade 到达 (trades WS 线程):
+    accumulator.update(px, sz, side)        # O(1), 持锁
 
-当 K 线桶关闭 (KlinePublisher flush round):
-    snapshot = accumulator.snapshot()   # 读出 vwap, buy_vol, sell_vol
-    accumulator.reset()                 # 清零, 开始下一桶
-    → 把 snapshot 附到 round_bars 上 → bar_queue
+当 K 线桶关闭 (kline 线程, KlinePublisher flush round):
+    snap = accumulator.snapshot_and_reset() # 原子读取 + 清零, 持锁
+    → 把 snap 附到 round_bars 上 → bar_queue
 ```
 
 **不缓存原始 trades list, 不在 bar 关闭时批量计算**。
@@ -165,43 +164,50 @@ dataflow/okx/trades/
 
 ```python
 class TradesAccumulator:
-    def __init__(self, freq_seconds: int):
-        self._freq_ms = freq_seconds * 1000
+    def __init__(self):
+        self._lock = threading.Lock()
         self._sum_pv: float = 0.0     # Σ(px * sz)
         self._sum_v: float = 0.0      # Σ(sz)
         self._buy_vol: float = 0.0    # Σ(sz) where side == "buy"
         self._sell_vol: float = 0.0   # Σ(sz) where side == "sell"
         self._count: int = 0
-        self._bucket_start_ms: int = 0
 
-    def update(self, px: float, sz: float, side: str, ts_ms: int):
-        """每笔 trade 调用一次, O(1)."""
-        bucket = ts_ms - (ts_ms % self._freq_ms)
-        if bucket != self._bucket_start_ms:
-            # 新桶开始, 先 reset (旧桶数据由外部在 snapshot 后已读走)
-            self._reset(bucket)
-        self._sum_pv += px * sz
-        self._sum_v += sz
-        if side == "buy":
-            self._buy_vol += sz
-        else:
-            self._sell_vol += sz
-        self._count += 1
+    def update(self, px: float, sz: float, side: str):
+        """每笔 trade 调用一次, O(1). 由 trades WS 线程调用."""
+        with self._lock:
+            self._sum_pv += px * sz
+            self._sum_v += sz
+            if side == "buy":
+                self._buy_vol += sz
+            elif side == "sell":
+                self._sell_vol += sz
+            # else: ignore unknown side
+            self._count += 1
 
-    def snapshot(self) -> dict:
-        """返回当前桶的聚合结果."""
-        vwap = self._sum_pv / self._sum_v if self._sum_v > 0 else float('nan')
-        return {
-            "vwap": vwap,
-            "buy_vol": self._buy_vol,
-            "sell_vol": self._sell_vol,
-            "trade_count": self._count,
-        }
-
-    def reset(self):
-        """外部在 round flush 后调用."""
-        ...
+    def snapshot_and_reset(self) -> dict:
+        """原子地读取当前聚合结果并清零. 由 kline 线程在 round flush 时调用."""
+        with self._lock:
+            vwap = self._sum_pv / self._sum_v if self._sum_v > 0 else float('nan')
+            result = {
+                "vwap": vwap,
+                "buy_vol": self._buy_vol,
+                "sell_vol": self._sell_vol,
+                "trade_count": self._count,
+            }
+            self._sum_pv = 0.0
+            self._sum_v = 0.0
+            self._buy_vol = 0.0
+            self._sell_vol = 0.0
+            self._count = 0
+            return result
 ```
+
+> **设计要点 (修复竞态)**:
+> - `update()` **不检测桶边界、不自动 reset** — 只做增量累加
+> - 桶切换完全由 kline 线程通过 `snapshot_and_reset()` 驱动
+> - 两者都持 `self._lock`, 保证原子性
+> - 跨桶的少量 trades (差几十毫秒) 会被算进当前桶, 误差可忽略
+> - `side` 校验改为 `elif`, 未知 side 静默忽略而非误算入 `sell_vol`
 
 #### `TradesWorker`
 
@@ -308,12 +314,39 @@ void push_bar(FeFloat close,
 `add_input("vwap")` / `add_input("buy_vol")` / `add_input("sell_vol")`
 映射到对应的 `INPUT_VWAP` / `INPUT_BUY_VOL` / `INPUT_SELL_VOL`。
 
-### 5.3 pybind11 绑定
+> **前置修复 (已完成)**: `add_input()` 对未知 feature 原来会静默降级为
+> `INPUT_CLOSE`, 已改为抛出 `std::invalid_argument`. 这确保了在 Step 4
+> 添加新 Op 之前, 任何 `add_input("vwap")` 调用会直接报错, 而不是静默
+> 使用 close 计算出错误的因子值.
+
+### 5.3 `InferenceEngine::push_bars` lambda 同步更新
+
+⚠️ **关键**: `inference_engine.hpp` 的 `push_bars` 方法中, lambda 目前只转发 6 个字段:
+
+```cpp
+pool_->submit([runner, b, barrier] {
+    runner->push_bar(b.close, b.volume, b.open, b.high, b.low, b.ret);
+    //              ^^^^^^ 只有 6 个字段, 新字段不会传!
+});
+```
+
+Step 4 扩展 `BarData` 后, **必须同步修改此 lambda**, 否则新字段永远是 NaN:
+
+```cpp
+pool_->submit([runner, b, barrier] {
+    runner->push_bar(b.close, b.volume, b.open, b.high, b.low, b.ret,
+                     b.vwap, b.buy_vol, b.sell_vol);
+});
+```
+
+同理, `InferenceEngine::push_bar` 单 symbol 版本也需要转发新字段.
+
+### 5.4 pybind11 绑定
 
 `fe_runtime_bind.cpp` 对 `BarData`, `push_bar`, `FactorGraph.push_bar`
 的绑定同步扩展, 新字段默认 NaN, **完全向后兼容**。
 
-### 5.4 向后兼容
+### 5.5 向后兼容
 
 - 所有新字段默认 NaN → 不传就不影响现有因子
 - 现有因子只 `add_input("close")` / `"volume"` 等 → 不碰新字段
@@ -352,19 +385,24 @@ def __init__(self, ..., enable_trades: bool = False):
 def _flush_round(self) -> bool:
     round_bars: dict[str, np.ndarray] = dict(self._pending_round)
     ...
-    # 如果有 trades accumulators, 读取并 reset
+    # 如果有 trades accumulators, 原子读取并清零
+    round_trades = None
     if self._accumulators:
-        self._round_trades = {}
+        round_trades = {}
         for sym in round_bars:
             acc = self._accumulators.get(sym)
             if acc:
-                self._round_trades[sym] = acc.snapshot()
-                acc.reset()
+                round_trades[sym] = acc.snapshot_and_reset()
     ...
+    # 推送 (round_bars, round_trades) 元组
+    self._bar_queue.put((round_bars, round_trades), block=False)
 ```
 
-或者: 在 `bar_queue` 里的 round 载荷从 `dict[str, np.ndarray]` 扩展为
-`dict[str, BarRound]`, 其中 `BarRound` 包含 bar array + trades snapshot。
+`bar_queue` 载荷从 `dict[str, np.ndarray]` 变为 `(round_bars, round_trades)` 元组.
+`round_trades` 为 `None` 时表示未启用 trades, `Engine._runtime_loop` 按需解包.
+
+> **注意**: accumulators 应通过 `Engine → KlineWorker → KlinePublisher` 链路注入,
+> 而不是 Engine 直接传给 Publisher, 以保持层级清晰.
 
 ### 6.3 `Engine._runtime_loop` 变更
 
