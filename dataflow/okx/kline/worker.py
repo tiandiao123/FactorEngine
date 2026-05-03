@@ -38,6 +38,10 @@ class KlineWorker:
     debug_cache : object, optional
         If provided, must have ``append(symbol, bar)`` — receives every
         published bar for debug / monitoring purposes.
+    accumulators : dict[str, TradesAccumulator], optional
+        If provided, the publisher will call ``snapshot_and_reset()`` on
+        each symbol's accumulator during ``_flush_round()``, attaching
+        trades aggregation data to the queue payload.
     """
 
     def __init__(
@@ -46,6 +50,7 @@ class KlineWorker:
         bar_queue: queue.Queue,
         freq_seconds: int = 5,
         debug_cache=None,
+        accumulators: dict | None = None,
     ):
         self.symbols = list(symbols)
 
@@ -60,6 +65,7 @@ class KlineWorker:
             debug_cache=debug_cache,
             expected_interval_ms=freq_seconds * 1000,
             batch_timeout_s=min(freq_seconds * 0.8, 4.0),
+            accumulators=accumulators,
         )
 
         self._loop: asyncio.AbstractEventLoop | None = None

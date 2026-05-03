@@ -9,6 +9,14 @@ v2 round-batching design:
   5. Non-blocking ``bar_queue.put()`` with backpressure drop.
   6. Optional write to a debug BarCache.
   7. Counters for monitoring.
+
+Queue payload format::
+
+    (round_bars: dict[str, np.ndarray], round_trades: dict[str, dict] | None)
+
+When ``accumulators`` is not provided (pure kline mode), ``round_trades``
+is ``None``.  When provided (kline_trades mode), ``round_trades`` maps
+each symbol to its ``TradesAccumulator.snapshot_and_reset()`` output.
 """
 
 from __future__ import annotations
@@ -51,11 +59,13 @@ class KlinePublisher:
         debug_cache=None,
         expected_interval_ms: int = 5000,
         batch_timeout_s: float | None = None,
+        accumulators: dict | None = None,
     ):
         self._bar_queue = bar_queue
         self._debug_cache = debug_cache
         self._expected_interval_ms = expected_interval_ms
         self._expected_symbols: set[str] = set(symbols)
+        self._accumulators = accumulators
 
         if batch_timeout_s is not None:
             self._batch_timeout_s = batch_timeout_s
@@ -151,7 +161,6 @@ class KlinePublisher:
             fill_count = 0
             for sym in self._expected_symbols:
                 if sym not in round_bars:
-                    # Copy the previous bar so round_bars owns its own arrays.
                     round_bars[sym] = self._last_round[sym].copy()
                     fill_count += 1
                     logger.info(
@@ -166,14 +175,24 @@ class KlinePublisher:
         if self._last_round is None and set(round_bars.keys()) < self._expected_symbols:
             return False
 
+        # Snapshot trades accumulators (if attached).
+        round_trades: dict[str, dict] | None = None
+        if self._accumulators:
+            round_trades = {}
+            for sym in round_bars:
+                acc = self._accumulators.get(sym)
+                if acc is not None:
+                    round_trades[sym] = acc.snapshot_and_reset()
+
         # Update dedup timestamps.
         with self._lock:
             for sym, bar in round_bars.items():
                 self._last_pushed_ts[sym] = int(bar[0])
 
-        # Push to queue.
+        # Push to queue: tuple(round_bars, round_trades | None).
+        payload = (round_bars, round_trades)
         try:
-            self._bar_queue.put(round_bars, block=False)
+            self._bar_queue.put(payload, block=False)
         except queue.Full:
             with self._lock:
                 self._drop_count += 1

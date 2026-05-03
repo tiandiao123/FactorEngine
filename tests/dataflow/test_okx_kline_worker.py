@@ -102,15 +102,17 @@ class TestKlineWorkerLifecycle:
         assert worker.bar_count == 4
         assert bar_queue.qsize() == 2  # 2 complete rounds
 
-        round1 = bar_queue.get_nowait()
+        round1, trades1 = bar_queue.get_nowait()
         assert set(round1.keys()) == set(symbols)
         assert round1["BTC-USDT-SWAP"][4] == 100.0
         assert round1["ETH-USDT-SWAP"][4] == 200.0
+        assert trades1 is None
 
-        round2 = bar_queue.get_nowait()
+        round2, trades2 = bar_queue.get_nowait()
         assert set(round2.keys()) == set(symbols)
         assert round2["BTC-USDT-SWAP"][4] == 101.0
         assert round2["ETH-USDT-SWAP"][4] == 201.0
+        assert trades2 is None
 
     def test_aggregation_with_batching(self):
         """3s aggregation: 3 candles per symbol in window [0,3000) → 1 round."""
@@ -132,12 +134,13 @@ class TestKlineWorkerLifecycle:
         assert worker.bar_count == 2  # 1 aggregated bar per symbol
         assert bar_queue.qsize() == 1  # 1 complete round
 
-        round_bars = bar_queue.get_nowait()
+        round_bars, round_trades = bar_queue.get_nowait()
         assert set(round_bars.keys()) == set(symbols)
         assert round_bars["BTC-USDT-SWAP"][4] == 102.0  # close = last
         assert round_bars["ETH-USDT-SWAP"][4] == 202.0
         assert round_bars["BTC-USDT-SWAP"][0] == 0.0  # aligned ts
         assert round_bars["ETH-USDT-SWAP"][0] == 0.0  # same aligned ts
+        assert round_trades is None
 
     def test_stop_terminates_thread(self):
         candles = [("BTC-USDT-SWAP", _make_candle(1000))]

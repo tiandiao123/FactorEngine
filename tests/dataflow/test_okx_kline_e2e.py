@@ -75,8 +75,9 @@ class TestAdapterToPublisherPipeline:
 
         # Each round must contain both symbols
         for _ in range(3):
-            round_bars = bar_queue.get_nowait()
+            round_bars, round_trades = bar_queue.get_nowait()
             assert set(round_bars.keys()) == set(symbols)
+            assert round_trades is None
 
         # Cache receives bars immediately (not batched)
         assert len(cache.data["BTC-USDT-SWAP"]) == 3
@@ -97,9 +98,11 @@ class TestAdapterToPublisherPipeline:
         bar = adapter.on_candle("BTC-USDT-SWAP", raw)
         publisher.publish("BTC-USDT-SWAP", bar)
 
-        round_bars = bar_queue.get_nowait()
+        payload = bar_queue.get_nowait()
+        round_bars, round_trades = payload
         assert isinstance(round_bars, dict)
         assert "BTC-USDT-SWAP" in round_bars
+        assert round_trades is None
 
         bar = round_bars["BTC-USDT-SWAP"]
         assert isinstance(bar, np.ndarray)
@@ -152,7 +155,7 @@ class TestConsumerThread:
         def consumer():
             while not stop.is_set():
                 try:
-                    round_bars = bar_queue.get(timeout=0.1)
+                    round_bars, _ = bar_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
                 consumed_rounds.append(round_bars)
@@ -222,5 +225,5 @@ class TestPipelineStress:
         assert bar_queue.qsize() == n_rounds
 
         # Verify each round has all symbols
-        sample = bar_queue.get_nowait()
+        sample, _ = bar_queue.get_nowait()
         assert set(sample.keys()) == set(symbols)

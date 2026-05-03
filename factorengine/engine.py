@@ -4,10 +4,11 @@ Engine is the single entry point: it owns the Dataflow thread, optionally
 runs a separate factor inference thread, and exposes get_data() /
 get_factor_outputs() for pulling snapshots.
 
-Architecture (v3 — streaming, 3 threads):
+Architecture (v3.1 — streaming, 3+ threads, trades support):
 
-    [dataflow thread]  okx-kline / sim-bars
-        WS candle / synthetic bar → bar_queue.put()
+    [dataflow thread(s)]
+        okx-kline  → KlineWorker  → bar_queue.put((round_bars, round_trades))
+        okx-trades → TradesWorker → accumulators (read by KlinePublisher)
 
     [runtime thread]  factor-infer
         bar_queue.get() → push_bars (C++ parallel) → signal_deque.append()
@@ -16,9 +17,15 @@ Architecture (v3 — streaming, 3 threads):
         get_factor_outputs() → signal_deque[-1]   (O(1), no compute)
         get_data()           → debug BarCache.snapshot() (copy, optional)
 
-Usage (live with factors):
+data_source modes:
+    "kline"        — kline WS only (default, backward compatible)
+    "trades"       — trades WS only (future Phase 2 with ClockDriver)
+    "kline_trades" — both kline + trades WS, kline flush drives round
+
+Usage (live with kline + trades factors):
     engine = Engine(symbols=["BTC-USDT-SWAP"], mode="live", data_freq="5s",
-                    factor_group="okx_perp", num_threads=4)
+                    factor_group="okx_perp", num_threads=4,
+                    data_source="kline_trades")
     engine.start()
     time.sleep(30)
     factors = engine.get_factor_outputs()
@@ -61,6 +68,8 @@ def parse_freq(freq: str) -> int:
 class Engine:
     """Top-level entry point. Owns the dataflow manager and shared bar cache."""
 
+    _VALID_DATA_SOURCES = ("kline", "trades", "kline_trades")
+
     def __init__(
         self,
         symbols: list[str],
@@ -76,12 +85,20 @@ class Engine:
         bar_queue_size: int = 16,
         bar_queue_timeout: float = 0.5,
         enable_debug_cache: bool = True,
+        data_source: str = "kline",
     ):
+        if data_source not in self._VALID_DATA_SOURCES:
+            raise ValueError(
+                f"Invalid data_source: {data_source!r}. "
+                f"Use one of {self._VALID_DATA_SOURCES}"
+            )
+
         self.symbols = symbols
         self.data_freq = data_freq
         self.pull_interval = pull_interval
         self.bar_window_length = bar_window_length
         self.mode = mode
+        self._data_source = data_source
 
         self.data_freq_seconds = parse_freq(data_freq)
         self.pull_interval_seconds = parse_freq(pull_interval)
@@ -108,6 +125,7 @@ class Engine:
         # Debug bar cache (optional, not on the main compute path).
         self._debug_cache = None
         self._kline_worker = None
+        self._trades_worker = None
         self._dataflow = None
 
         if mode == "live":
@@ -115,15 +133,24 @@ class Engine:
 
             bar_channel, _ = resolve_bar_channel(self.data_freq_seconds)
             logger.info(
-                "Live mode: data_freq=%s (%ds) → channel=%s, factors=%s",
+                "Live mode: data_freq=%s (%ds) → channel=%s, factors=%s, data_source=%s",
                 data_freq, self.data_freq_seconds, bar_channel,
-                factor_group or "none",
+                factor_group or "none", data_source,
             )
 
             if enable_debug_cache:
                 self._debug_cache = BarCache(window_length=bar_window_length)
 
-            if self._bar_queue is not None:
+            # Start TradesWorker if data_source includes trades.
+            accumulators = None
+            if data_source in ("trades", "kline_trades"):
+                from dataflow.okx.trades.worker import TradesWorker
+
+                self._trades_worker = TradesWorker(symbols=symbols)
+                accumulators = self._trades_worker.accumulators
+
+            # Start KlineWorker if data_source includes kline.
+            if self._bar_queue is not None and data_source in ("kline", "kline_trades"):
                 from dataflow.okx.kline.worker import KlineWorker
 
                 self._kline_worker = KlineWorker(
@@ -131,12 +158,19 @@ class Engine:
                     bar_queue=self._bar_queue,
                     freq_seconds=self.data_freq_seconds,
                     debug_cache=self._debug_cache,
+                    accumulators=accumulators,
                 )
-            else:
+            elif self._bar_queue is None:
                 logger.info(
                     "Live mode without factor_group: KlineWorker not started "
                     "(no bar_queue consumer). Use get_data() is unavailable "
                     "without a streaming data source.",
+                )
+
+            if data_source == "trades":
+                logger.info(
+                    "trades-only mode: KlineWorker not started. "
+                    "ClockDriver required for flush (Phase 2)."
                 )
 
         elif mode == "simulation":
@@ -180,14 +214,22 @@ class Engine:
 
     def _runtime_loop(self):
         """Runtime thread main loop: pull bars from queue, infer, write deque."""
+        import math
         import fe_runtime as rt
 
+        nan = float("nan")
         logger.info("factor-infer thread started")
         while not self._stop_event.is_set():
             try:
-                round_bars = self._bar_queue.get(timeout=self._bar_queue_timeout)
+                payload = self._bar_queue.get(timeout=self._bar_queue_timeout)
             except queue.Empty:
                 continue
+
+            # Unpack: KlinePublisher sends (round_bars, round_trades | None).
+            if isinstance(payload, tuple):
+                round_bars, round_trades = payload
+            else:
+                round_bars, round_trades = payload, None
 
             ts_ms = 0
             batch: dict[str, rt.BarData] = {}
@@ -200,8 +242,22 @@ class Engine:
                 low = float(bar[3])
                 prev_close = self._prev_closes.get(sym, close)
                 ret = (close / prev_close - 1.0) if prev_close != 0 else 0.0
-                batch[sym] = rt.BarData(close, volume, open_, high, low, ret)
                 self._prev_closes[sym] = close
+
+                vwap = nan
+                buy_vol = nan
+                sell_vol = nan
+                if round_trades:
+                    trades = round_trades.get(sym)
+                    if trades:
+                        vwap = trades.get("vwap", nan)
+                        buy_vol = trades.get("buy_vol", nan)
+                        sell_vol = trades.get("sell_vol", nan)
+
+                batch[sym] = rt.BarData(
+                    close, volume, open_, high, low, ret,
+                    vwap, buy_vol, sell_vol,
+                )
 
             self._inference.push_bars(batch)
             self._bars_pushed += 1
@@ -258,23 +314,29 @@ class Engine:
             )
             self._runtime_thread.start()
 
-        if self.mode == "live" and self._kline_worker is not None:
-            self._kline_worker.start()
+        if self.mode == "live":
+            if self._trades_worker is not None:
+                self._trades_worker.start()
+            if self._kline_worker is not None:
+                self._kline_worker.start()
         elif self._dataflow is not None:
             self._dataflow.start()
 
         logger.info(
             "Engine started: mode=%s, %d symbols, data_freq=%s (%ds), "
-            "bar_window=%d, factors=%s",
+            "bar_window=%d, factors=%s, data_source=%s",
             self.mode, len(self.symbols), self.data_freq,
             self.data_freq_seconds, self.bar_window_length,
-            self._factor_group or "none",
+            self._factor_group or "none", self._data_source,
         )
 
     def stop(self):
         """Stop the dataflow collection and inference thread."""
-        if self.mode == "live" and self._kline_worker is not None:
-            self._kline_worker.stop()
+        if self.mode == "live":
+            if self._kline_worker is not None:
+                self._kline_worker.stop()
+            if self._trades_worker is not None:
+                self._trades_worker.stop()
         elif self._dataflow is not None:
             self._dataflow.stop()
 
@@ -312,8 +374,20 @@ class Engine:
         return 0
 
     @property
+    def data_source(self) -> str:
+        """Active data source mode."""
+        return self._data_source
+
+    @property
     def kline_stats(self) -> dict[str, int]:
         """Live kline worker statistics (empty dict in simulation mode)."""
         if self._kline_worker is not None:
             return self._kline_worker.stats()
+        return {}
+
+    @property
+    def trades_stats(self) -> dict[str, int]:
+        """Live trades worker statistics (empty dict if not active)."""
+        if self._trades_worker is not None:
+            return self._trades_worker.stats()
         return {}

@@ -33,9 +33,12 @@ public:
 
     void push_bar(FeFloat close, FeFloat volume = kNaN,
                   FeFloat open = kNaN, FeFloat high = kNaN,
-                  FeFloat low = kNaN, FeFloat ret = kNaN) {
+                  FeFloat low = kNaN, FeFloat ret = kNaN,
+                  FeFloat vwap = kNaN, FeFloat buy_vol = kNaN,
+                  FeFloat sell_vol = kNaN) {
         for (std::size_t i = 0; i < graphs_.size(); ++i) {
-            graphs_[i].push_bar(close, volume, open, high, low, ret);
+            graphs_[i].push_bar(close, volume, open, high, low, ret,
+                                vwap, buy_vol, sell_vol);
             outputs_[i] = graphs_[i].output();
         }
         ++bars_pushed_;

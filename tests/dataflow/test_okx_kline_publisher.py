@@ -67,8 +67,9 @@ class TestRoundBatching:
         assert pub.publish("SOL-USDT-SWAP", _bar(5000)) is True   # 3/3 → flush
 
         assert q.qsize() == 1
-        round_bars = q.get_nowait()
+        round_bars, round_trades = q.get_nowait()
         assert set(round_bars.keys()) == set(SYMBOLS_3)
+        assert round_trades is None
         assert pub.rounds_flushed == 1
         assert pub.bars_published == 3
 
@@ -93,7 +94,7 @@ class TestRoundBatching:
         pub.publish("ETH-USDT-SWAP", _bar(5000))
 
         assert q.qsize() == 1
-        round_bars = q.get_nowait()
+        round_bars, _ = q.get_nowait()
         assert set(round_bars.keys()) == set(SYMBOLS_3)
 
     def test_single_symbol(self):
@@ -159,7 +160,7 @@ class TestTimeoutForwardFill:
         # Verify the flushed round has all 3 symbols
         # First round was at q position 0, second at position 1
         q.get_nowait()  # discard first round
-        round2 = q.get_nowait()
+        round2, _ = q.get_nowait()
         assert set(round2.keys()) == set(SYMBOLS_3)
         assert int(round2["SOL-USDT-SWAP"][0]) == 5000  # forward-filled from round 1
 
@@ -180,7 +181,7 @@ class TestTimeoutForwardFill:
 
         assert pub.rounds_flushed == 2
         q.get_nowait()
-        round2 = q.get_nowait()
+        round2, _ = q.get_nowait()
         assert round2["ETH-USDT-SWAP"][4] == 200.0  # close from round 1
 
 
@@ -408,3 +409,81 @@ class TestThreadSafety:
         assert not errors
         assert pub.bars_published == 1000
         assert pub.rounds_flushed == 1000
+
+
+# ── Trades accumulator integration ───────────────────────────
+
+class TestAccumulatorIntegration:
+    def test_flush_with_accumulators(self):
+        """When accumulators are attached, flush includes trades snapshot."""
+        from dataflow.okx.trades.accumulator import TradesAccumulator
+
+        accs = {
+            "BTC-USDT-SWAP": TradesAccumulator(),
+            "ETH-USDT-SWAP": TradesAccumulator(),
+        }
+        q = queue.Queue(maxsize=16)
+        pub = KlinePublisher(
+            bar_queue=q, symbols=SYMBOLS_2,
+            expected_interval_ms=5000,
+            accumulators=accs,
+        )
+
+        # Simulate trades arriving
+        accs["BTC-USDT-SWAP"].update(67000.0, 0.5, "buy")
+        accs["BTC-USDT-SWAP"].update(67100.0, 1.0, "sell")
+        accs["ETH-USDT-SWAP"].update(3500.0, 2.0, "buy")
+
+        # Publish kline bars — triggers flush
+        pub.publish("BTC-USDT-SWAP", _bar(5000))
+        pub.publish("ETH-USDT-SWAP", _bar(5000))
+
+        round_bars, round_trades = q.get_nowait()
+        assert set(round_bars.keys()) == set(SYMBOLS_2)
+        assert round_trades is not None
+        assert set(round_trades.keys()) == set(SYMBOLS_2)
+
+        btc_t = round_trades["BTC-USDT-SWAP"]
+        assert btc_t["trade_count"] == 2
+        assert btc_t["buy_vol"] == pytest.approx(0.5)
+        assert btc_t["sell_vol"] == pytest.approx(1.0)
+        expected_vwap = (67000.0 * 0.5 + 67100.0 * 1.0) / 1.5
+        assert btc_t["vwap"] == pytest.approx(expected_vwap)
+
+        eth_t = round_trades["ETH-USDT-SWAP"]
+        assert eth_t["trade_count"] == 1
+        assert eth_t["buy_vol"] == pytest.approx(2.0)
+
+    def test_flush_resets_accumulators(self):
+        """After flush, accumulators are reset for the next bucket."""
+        from dataflow.okx.trades.accumulator import TradesAccumulator
+
+        accs = {"BTC-USDT-SWAP": TradesAccumulator()}
+        q = queue.Queue(maxsize=16)
+        pub = KlinePublisher(
+            bar_queue=q, symbols=["BTC-USDT-SWAP"],
+            expected_interval_ms=5000,
+            accumulators=accs,
+        )
+
+        accs["BTC-USDT-SWAP"].update(100.0, 1.0, "buy")
+        pub.publish("BTC-USDT-SWAP", _bar(5000))
+
+        _, trades1 = q.get_nowait()
+        assert trades1["BTC-USDT-SWAP"]["trade_count"] == 1
+
+        # Second round — no new trades
+        pub.publish("BTC-USDT-SWAP", _bar(10000))
+        _, trades2 = q.get_nowait()
+        assert trades2["BTC-USDT-SWAP"]["trade_count"] == 0
+
+    def test_no_accumulators_backward_compat(self):
+        """Without accumulators, round_trades is None (backward compat)."""
+        q = queue.Queue(maxsize=16)
+        pub = KlinePublisher(
+            bar_queue=q, symbols=["BTC-USDT-SWAP"],
+            expected_interval_ms=5000,
+        )
+        pub.publish("BTC-USDT-SWAP", _bar(5000))
+        round_bars, round_trades = q.get_nowait()
+        assert round_trades is None

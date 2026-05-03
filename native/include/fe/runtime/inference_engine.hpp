@@ -16,7 +16,7 @@
  *
  *   // Batch push (parallel)
  *   std::unordered_map<std::string, BarData> bars;
- *   bars["BTC-USDT"] = {close, volume, open, high, low, ret};
+ *   bars["BTC-USDT"] = {close, volume, open, high, low, ret, vwap, buy_vol, sell_vol};
  *   engine.push_bars(bars);
  *
  *   auto outputs = engine.get_outputs("BTC-USDT");
@@ -42,12 +42,15 @@ namespace fe::runtime {
 // ── BarData — OHLCV tuple for batch push ──────────────────────
 
 struct BarData {
-    FeFloat close  = 0.0f;
-    FeFloat volume = std::numeric_limits<FeFloat>::quiet_NaN();
-    FeFloat open   = std::numeric_limits<FeFloat>::quiet_NaN();
-    FeFloat high   = std::numeric_limits<FeFloat>::quiet_NaN();
-    FeFloat low    = std::numeric_limits<FeFloat>::quiet_NaN();
-    FeFloat ret    = std::numeric_limits<FeFloat>::quiet_NaN();
+    FeFloat close    = 0.0f;
+    FeFloat volume   = std::numeric_limits<FeFloat>::quiet_NaN();
+    FeFloat open     = std::numeric_limits<FeFloat>::quiet_NaN();
+    FeFloat high     = std::numeric_limits<FeFloat>::quiet_NaN();
+    FeFloat low      = std::numeric_limits<FeFloat>::quiet_NaN();
+    FeFloat ret      = std::numeric_limits<FeFloat>::quiet_NaN();
+    FeFloat vwap     = std::numeric_limits<FeFloat>::quiet_NaN();
+    FeFloat buy_vol  = std::numeric_limits<FeFloat>::quiet_NaN();
+    FeFloat sell_vol = std::numeric_limits<FeFloat>::quiet_NaN();
 };
 
 // ── ThreadPool — lightweight fixed-size pool ──────────────────
@@ -142,11 +145,14 @@ public:
     void push_bar(const std::string& symbol,
                   FeFloat close, FeFloat volume = kNaN,
                   FeFloat open = kNaN, FeFloat high = kNaN,
-                  FeFloat low = kNaN, FeFloat ret = kNaN) {
+                  FeFloat low = kNaN, FeFloat ret = kNaN,
+                  FeFloat vwap = kNaN, FeFloat buy_vol = kNaN,
+                  FeFloat sell_vol = kNaN) {
         auto it = runners_.find(symbol);
         if (it == runners_.end())
             throw std::runtime_error("Symbol not registered: " + symbol);
-        it->second.push_bar(close, volume, open, high, low, ret);
+        it->second.push_bar(close, volume, open, high, low, ret,
+                             vwap, buy_vol, sell_vol);
     }
 
     // ── Batch push (parallel via thread pool) ────────────────
@@ -172,7 +178,8 @@ public:
             BarData b = bar;
 
             pool_->submit([runner, b, barrier] {
-                runner->push_bar(b.close, b.volume, b.open, b.high, b.low, b.ret);
+                runner->push_bar(b.close, b.volume, b.open, b.high, b.low, b.ret,
+                                 b.vwap, b.buy_vol, b.sell_vol);
                 if (barrier->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     std::lock_guard<std::mutex> lk(barrier->mtx);
                     barrier->cv.notify_one();

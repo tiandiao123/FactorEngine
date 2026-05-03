@@ -12,7 +12,8 @@
  *   g.compile();
  *
  *   // per tick:
- *   g.push_bar(close_val, volume_val, open_val, high_val, low_val, ret_val);
+ *   g.push_bar(close_val, volume_val, open_val, high_val, low_val, ret_val,
+ *              vwap_val, buy_vol_val, sell_vol_val);
  *   if (g.ready()) { float signal = g.output(); }
  */
 
@@ -32,6 +33,7 @@ namespace fe::runtime {
 enum class Op {
     // Inputs
     INPUT_CLOSE, INPUT_VOLUME, INPUT_OPEN, INPUT_HIGH, INPUT_LOW, INPUT_RET,
+    INPUT_VWAP, INPUT_BUY_VOL, INPUT_SELL_VOL,
 
     // P0 unary (stateless)
     NEG, ABS, LOG, SQR, INV, SIGN, TANH, SLOG1P,
@@ -113,15 +115,18 @@ public:
 
     int add_input(const std::string& feature) {
         FactorNode node;
-        if      (feature == "close")  node.op = Op::INPUT_CLOSE;
-        else if (feature == "volume") node.op = Op::INPUT_VOLUME;
-        else if (feature == "open")   node.op = Op::INPUT_OPEN;
-        else if (feature == "high")   node.op = Op::INPUT_HIGH;
-        else if (feature == "low")    node.op = Op::INPUT_LOW;
-        else if (feature == "ret")    node.op = Op::INPUT_RET;
+        if      (feature == "close")    node.op = Op::INPUT_CLOSE;
+        else if (feature == "volume")  node.op = Op::INPUT_VOLUME;
+        else if (feature == "open")    node.op = Op::INPUT_OPEN;
+        else if (feature == "high")    node.op = Op::INPUT_HIGH;
+        else if (feature == "low")     node.op = Op::INPUT_LOW;
+        else if (feature == "ret")     node.op = Op::INPUT_RET;
+        else if (feature == "vwap")    node.op = Op::INPUT_VWAP;
+        else if (feature == "buy_vol") node.op = Op::INPUT_BUY_VOL;
+        else if (feature == "sell_vol")node.op = Op::INPUT_SELL_VOL;
         else throw std::invalid_argument(
             "Unknown input feature: \"" + feature + "\". "
-            "Supported: close, volume, open, high, low, ret");
+            "Supported: close, volume, open, high, low, ret, vwap, buy_vol, sell_vol");
         nodes_.push_back(std::move(node));
         return static_cast<int>(nodes_.size()) - 1;
     }
@@ -209,7 +214,9 @@ public:
 
     void push_bar(FeFloat close, FeFloat volume = kNaN,
                   FeFloat open = kNaN, FeFloat high = kNaN,
-                  FeFloat low = kNaN, FeFloat ret = kNaN) {
+                  FeFloat low = kNaN, FeFloat ret = kNaN,
+                  FeFloat vwap = kNaN, FeFloat buy_vol = kNaN,
+                  FeFloat sell_vol = kNaN) {
         assert(compiled_ && "Must call compile() before push_bar()");
         int n = static_cast<int>(nodes_.size());
 
@@ -220,12 +227,15 @@ public:
 
             switch (nd.op) {
             // ── Inputs ──
-            case Op::INPUT_CLOSE:  values_[i] = close;  break;
-            case Op::INPUT_VOLUME: values_[i] = volume;  break;
-            case Op::INPUT_OPEN:   values_[i] = open;    break;
-            case Op::INPUT_HIGH:   values_[i] = high;    break;
-            case Op::INPUT_LOW:    values_[i] = low;     break;
-            case Op::INPUT_RET:    values_[i] = ret;     break;
+            case Op::INPUT_CLOSE:    values_[i] = close;    break;
+            case Op::INPUT_VOLUME:  values_[i] = volume;   break;
+            case Op::INPUT_OPEN:    values_[i] = open;     break;
+            case Op::INPUT_HIGH:    values_[i] = high;     break;
+            case Op::INPUT_LOW:     values_[i] = low;      break;
+            case Op::INPUT_RET:     values_[i] = ret;      break;
+            case Op::INPUT_VWAP:    values_[i] = vwap;     break;
+            case Op::INPUT_BUY_VOL: values_[i] = buy_vol;  break;
+            case Op::INPUT_SELL_VOL:values_[i] = sell_vol;  break;
 
             // ── P0 unary — direct calls to fe::ops scalar functions ──
             case Op::NEG:    values_[i] = fe::ops::neg(a);     break;
@@ -333,12 +343,15 @@ public:
 private:
     static std::string op_name(Op op) {
         switch (op) {
-        case Op::INPUT_CLOSE:  return "INPUT_CLOSE";
-        case Op::INPUT_VOLUME: return "INPUT_VOLUME";
-        case Op::INPUT_OPEN:   return "INPUT_OPEN";
-        case Op::INPUT_HIGH:   return "INPUT_HIGH";
-        case Op::INPUT_LOW:    return "INPUT_LOW";
-        case Op::INPUT_RET:    return "INPUT_RET";
+        case Op::INPUT_CLOSE:    return "INPUT_CLOSE";
+        case Op::INPUT_VOLUME:  return "INPUT_VOLUME";
+        case Op::INPUT_OPEN:    return "INPUT_OPEN";
+        case Op::INPUT_HIGH:    return "INPUT_HIGH";
+        case Op::INPUT_LOW:     return "INPUT_LOW";
+        case Op::INPUT_RET:     return "INPUT_RET";
+        case Op::INPUT_VWAP:    return "INPUT_VWAP";
+        case Op::INPUT_BUY_VOL: return "INPUT_BUY_VOL";
+        case Op::INPUT_SELL_VOL:return "INPUT_SELL_VOL";
         case Op::NEG:     return "NEG";
         case Op::ABS:     return "ABS";
         case Op::LOG:     return "LOG";
