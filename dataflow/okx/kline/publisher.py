@@ -63,9 +63,9 @@ class KlinePublisher:
         self._last_pushed_ts: dict[str, int] = {}
         self._lock = threading.Lock()
 
-        # Round-batching state — accessed only from the single WS callback
-        # thread (publish), never from the main thread.
-        # No lock needed as long as this single-writer invariant holds.
+        # Round-batching state — written by the WS callback thread (publish),
+        # read by the ClockDriver thread (flush_for_clock fallback paths).
+        # GIL-safe in CPython (dict/float reads are atomic); no lock needed.
         self._pending_round: dict[str, np.ndarray] = {}
         self._round_start_time: float | None = None
         self._last_round: dict[str, np.ndarray] | None = None
@@ -143,22 +143,33 @@ class KlinePublisher:
         Called by ClockDriver on each tick.  Returns ``None`` if no
         complete round is available yet (e.g. first round still filling).
 
-        If no new round has completed since the last call but a previous
-        round exists, returns a forward-filled copy of the pending data.
+        Three paths, tried in order:
+
+        1. **Ready buffer** — a freshly completed round is waiting.
+           This is the normal fast path when kline data arrives on time.
+
+        2. **Pending + last_round** — some bars arrived but the round
+           isn't complete.  Missing symbols are forward-filled from the
+           previous round.
+
+        3. **Full forward-fill** — no new bars at all since the last
+           tick (e.g. kline WS delayed).  Returns the last known round
+           as-is.  ``_runtime_loop`` will see ret≈0 for these bars
+           because close hasn't changed.  This is rare in practice:
+           OKX closes 1s klines at/before the wall-clock boundary.
         """
-        # First try: take the ready buffer if available.
+        # Path 1: take the ready buffer if available.
         with self._ready_lock:
             if self._ready_round is not None:
                 result = self._ready_round
                 self._ready_round = None
                 return result
 
-        # Fallback: try to assemble from pending + last_round.
+        # Path 2: assemble from pending + last_round.
         if self._pending_round:
             return self._build_round_from_pending()
 
-        # Nothing pending — if we have a previous round, return it
-        # (forward-fill entire round).
+        # Path 3: full forward-fill from last round.
         if self._last_round is not None:
             with self._lock:
                 self._forward_fill_count += len(self._last_round)
