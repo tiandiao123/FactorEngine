@@ -119,7 +119,9 @@ public:
         else if (feature == "high")   node.op = Op::INPUT_HIGH;
         else if (feature == "low")    node.op = Op::INPUT_LOW;
         else if (feature == "ret")    node.op = Op::INPUT_RET;
-        else                          node.op = Op::INPUT_CLOSE;
+        else throw std::invalid_argument(
+            "Unknown input feature: \"" + feature + "\". "
+            "Supported: close, volume, open, high, low, ret");
         nodes_.push_back(std::move(node));
         return static_cast<int>(nodes_.size()) - 1;
     }
