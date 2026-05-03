@@ -296,6 +296,70 @@ freq_ms = 5000
            └→ bar_queue.put({"BTC":新, "ETH":新, "SOL":旧})
 ```
 
+### 两层异常处理对比
+
+数据从 OKX 到 `bar_queue` 经过两层处理, 各自有独立的异常兜底机制:
+
+```text
+┌─────────────────────────────────────────────────────────────────────┐
+│  层级          │  什么情况会触发     │  处理方式        │  数据丢弃?   │
+├─────────────────────────────────────────────────────────────────────┤
+│  Adapter       │  聚合窗口内 candle  │  丢弃旧 buffer   │  是          │
+│  (聚合层)      │  未攒满就切窗口     │  新窗口从零开始   │  未攒满的    │
+│                │                    │                  │  1s candle   │
+│                │                    │                  │  全部丢弃    │
+├─────────────────────────────────────────────────────────────────────┤
+│  Publisher     │  部分 symbol 的 bar │  forward-fill    │  否          │
+│  (攒批层)      │  未在超时内到达     │  用上一轮旧值填充  │  已到达的 bar│
+│                │                    │  缺失 symbol     │  全部保留    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Adapter 层 (聚合, 仅 freq < 60s 且 freq > 1s 时生效)**:
+
+```text
+场景: BTC 的窗口 [0, 5000) 只攒了 3 根 1s candle, 第 4 根属于 [5000, 10000)
+
+  ts=0     → buffer=[bar0]           (1/5)
+  ts=1000  → buffer=[bar0,bar1]      (2/5)
+  ts=2000  → buffer=[bar0,bar1,bar2] (3/5)
+  ts=5000  → 窗口切换! buffer 只有 3/5, 不完整
+             → 丢弃 bar0, bar1, bar2 (无法合成有效的 OHLCV)
+             → 新窗口 [5000, 10000) 从 ts=5000 重新开始
+
+影响: 这轮 BTC 的聚合 bar 缺失, Publisher 层会等待或 forward-fill
+注意: data_freq="1s" 时不存在聚合, 此层无丢弃风险
+```
+
+**Publisher 层 (攒批, 始终生效)**:
+
+```text
+场景: ts=5000 轮, BTC 和 ETH 到了, SOL 没到
+
+  BTC bar(ts=5000) 到达 → _pending_round["BTC"] = bar  (1/3)
+  ETH bar(ts=5000) 到达 → _pending_round["ETH"] = bar  (2/3)
+  超时 or 下一轮 ts 到来 → flush:
+    → SOL 缺失, 用 _last_round["SOL"].copy() 补上
+    → bar_queue.put({"BTC": 新bar, "ETH": 新bar, "SOL": 上一轮旧bar})
+    → forward_fill_count += 1
+
+影响: SOL 的因子用旧数据计算, 有微小偏差, 但滚动窗口保持连续
+特例: 第一轮无历史可填充, 必须等所有 symbol 到齐
+```
+
+**两层的关系**:
+
+```text
+OKX 1s candle → [Adapter: 聚合 N 根 → 可能丢弃不完整窗口]
+             → [Publisher: 攒齐所有 symbol → 可能 forward-fill 缺失]
+             → bar_queue
+
+Adapter 丢弃会导致某个 symbol 的 bar 延迟产出,
+Publisher 的 forward-fill 兜底了这种情况, 确保推理引擎始终收到完整的一轮数据.
+```
+
+---
+
 ### 阶段 4: 因子推理
 
 **组件**: `Engine._runtime_loop` (`factorengine/engine.py`)
