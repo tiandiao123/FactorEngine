@@ -136,8 +136,11 @@ class KlineWorker:
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._run())
-        except RuntimeError:
-            pass
+        except RuntimeError as exc:
+            # A RuntimeError is raised when the loop is stopped from outside
+            # (e.g. via call_soon_threadsafe during stop()); log at DEBUG so
+            # normal shutdown is not noisy, but unexpected errors are visible.
+            logger.debug("KlineWorker event loop exited with RuntimeError: %s", exc)
         finally:
             pending = asyncio.all_tasks(self._loop)
             if pending:

@@ -86,16 +86,13 @@ class KlinePublisher:
         """
         ts = int(bar[0])
 
-        # ── Dedup ──
+        # ── Dedup + Gap detection ──
         with self._lock:
             last_ts = self._last_pushed_ts.get(symbol)
-            if last_ts is not None and ts <= last_ts:
-                self._dup_count += 1
-                return False
-
-        # ── Gap detection ──
-        with self._lock:
             if last_ts is not None:
+                if ts <= last_ts:
+                    self._dup_count += 1
+                    return False
                 actual_gap = ts - last_ts
                 if actual_gap > self._expected_interval_ms * 2:
                     self._gap_count += 1
@@ -151,15 +148,19 @@ class KlinePublisher:
 
         # Forward-fill missing symbols from last round.
         if self._last_round is not None:
+            fill_count = 0
             for sym in self._expected_symbols:
                 if sym not in round_bars:
-                    round_bars[sym] = self._last_round[sym]
-                    with self._lock:
-                        self._forward_fill_count += 1
+                    # Copy the previous bar so round_bars owns its own arrays.
+                    round_bars[sym] = self._last_round[sym].copy()
+                    fill_count += 1
                     logger.info(
                         "Forward-fill: %s missing in round, using previous bar",
                         sym,
                     )
+            if fill_count:
+                with self._lock:
+                    self._forward_fill_count += fill_count
 
         # First round must have all symbols — no forward-fill source.
         if self._last_round is None and set(round_bars.keys()) < self._expected_symbols:
