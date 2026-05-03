@@ -136,6 +136,39 @@ class TestPublishGap:
         pub.publish("BTC", _bar(100000))
         assert pub.gap_count == 0
 
+    def test_gap_boundary_exact_2x_not_counted(self):
+        """actual_gap == 2 * expected is NOT a gap (condition is strictly >)."""
+        q = queue.Queue(maxsize=16)
+        pub = KlinePublisher(bar_queue=q, expected_interval_ms=5000)
+
+        pub.publish("BTC", _bar(5000))
+        pub.publish("BTC", _bar(15000))  # gap = 10000 == 2 * 5000, not >
+
+        assert pub.gap_count == 0
+
+    def test_gap_boundary_just_over_2x(self):
+        """actual_gap == 2 * expected + 1 IS a gap."""
+        q = queue.Queue(maxsize=16)
+        pub = KlinePublisher(bar_queue=q, expected_interval_ms=5000)
+
+        pub.publish("BTC", _bar(5000))
+        pub.publish("BTC", _bar(15001))  # gap = 10001 > 10000
+
+        assert pub.gap_count == 1
+
+    def test_gap_multi_symbol_independent(self):
+        """Gap on BTC should not affect ETH's gap count."""
+        q = queue.Queue(maxsize=16)
+        pub = KlinePublisher(bar_queue=q, expected_interval_ms=5000)
+
+        pub.publish("BTC", _bar(5000))
+        pub.publish("ETH", _bar(5000))
+        pub.publish("BTC", _bar(20000))  # BTC gap: 15000 > 10000
+        pub.publish("ETH", _bar(10000))  # ETH normal: 5000 <= 10000
+
+        assert pub.gap_count == 1
+        assert pub.bars_published == 4
+
 
 # ── Backpressure ───────────────────────────────────────────────
 

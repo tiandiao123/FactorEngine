@@ -103,6 +103,34 @@ class TestAdapterAggregation:
         assert bar[4] == 104.0       # close = last
         assert bar[5] == 45.0        # vol = sum(10, 20, 15)
 
+    def test_3s_aggregation_vol_ccy_fields(self):
+        """Verify vol_ccy and vol_ccy_quote are summed correctly during aggregation."""
+        adapter = KlineAdapter(freq_seconds=3)
+
+        r1 = adapter.on_candle("BTC", _make_candle(
+            1000, o=100, h=105, l=95, c=102,
+            vol=10, vol_ccy=500.0, vol_ccy_quote=501.0,
+        ))
+        r2 = adapter.on_candle("BTC", _make_candle(
+            2000, o=102, h=108, l=99, c=106,
+            vol=20, vol_ccy=1100.0, vol_ccy_quote=1102.0,
+        ))
+        r3 = adapter.on_candle("BTC", _make_candle(
+            3000, o=106, h=110, l=97, c=104,
+            vol=15, vol_ccy=800.0, vol_ccy_quote=803.0,
+        ))
+
+        assert r1 is None
+        assert r2 is None
+        assert r3 is not None
+
+        bar = r3
+        assert bar.shape == (8,)
+        assert bar.dtype == np.float64
+        assert bar[5] == 45.0           # vol = 10 + 20 + 15
+        assert bar[6] == 2400.0         # vol_ccy = 500 + 1100 + 800
+        assert bar[7] == 2406.0         # vol_ccy_quote = 501 + 1102 + 803
+
     def test_5s_aggregation(self):
         adapter = KlineAdapter(freq_seconds=5)
         for i in range(4):

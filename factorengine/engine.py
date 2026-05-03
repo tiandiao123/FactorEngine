@@ -112,27 +112,32 @@ class Engine:
 
         if mode == "live":
             from dataflow.cache import BarCache
-            from dataflow.okx.kline.worker import KlineWorker
 
-            bar_channel, needs_agg = resolve_bar_channel(self.data_freq_seconds)
+            bar_channel, _ = resolve_bar_channel(self.data_freq_seconds)
             logger.info(
-                "Live mode: data_freq=%s (%ds) → channel=%s, aggregation=%s",
+                "Live mode: data_freq=%s (%ds) → channel=%s, factors=%s",
                 data_freq, self.data_freq_seconds, bar_channel,
-                f"{self.data_freq_seconds}s" if needs_agg else "none (direct)",
+                factor_group or "none",
             )
 
             if enable_debug_cache:
                 self._debug_cache = BarCache(window_length=bar_window_length)
 
-            if self._bar_queue is None:
-                self._bar_queue = queue.Queue(maxsize=bar_queue_size)
+            if self._bar_queue is not None:
+                from dataflow.okx.kline.worker import KlineWorker
 
-            self._kline_worker = KlineWorker(
-                symbols=symbols,
-                bar_queue=self._bar_queue,
-                freq_seconds=self.data_freq_seconds,
-                debug_cache=self._debug_cache,
-            )
+                self._kline_worker = KlineWorker(
+                    symbols=symbols,
+                    bar_queue=self._bar_queue,
+                    freq_seconds=self.data_freq_seconds,
+                    debug_cache=self._debug_cache,
+                )
+            else:
+                logger.info(
+                    "Live mode without factor_group: KlineWorker not started "
+                    "(no bar_queue consumer). Use get_data() is unavailable "
+                    "without a streaming data source.",
+                )
 
         elif mode == "simulation":
             from dataflow.simulation.manager import SimDataflowManager
@@ -253,7 +258,7 @@ class Engine:
             )
             self._runtime_thread.start()
 
-        if self.mode == "live":
+        if self.mode == "live" and self._kline_worker is not None:
             self._kline_worker.start()
         elif self._dataflow is not None:
             self._dataflow.start()

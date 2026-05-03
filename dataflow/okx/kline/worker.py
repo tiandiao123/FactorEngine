@@ -49,7 +49,7 @@ class KlineWorker:
     ):
         self.symbols = list(symbols)
 
-        channel, needs_agg = resolve_bar_channel(freq_seconds)
+        channel, _ = resolve_bar_channel(freq_seconds)
         self._channel = channel
         self._freq_seconds = freq_seconds
 
