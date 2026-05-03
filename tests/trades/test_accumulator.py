@@ -31,6 +31,11 @@ class TestBasic:
         assert snap["buy_vol"] == 0.0
         assert snap["sell_vol"] == 0.0
         assert snap["trade_count"] == 0
+        assert math.isnan(snap["open"])
+        assert math.isnan(snap["high"])
+        assert math.isnan(snap["low"])
+        assert math.isnan(snap["close"])
+        assert snap["volume"] == 0.0
 
     def test_single_buy(self):
         acc = TradesAccumulator()
@@ -40,6 +45,11 @@ class TestBasic:
         assert snap["buy_vol"] == pytest.approx(2.0)
         assert snap["sell_vol"] == 0.0
         assert snap["trade_count"] == 1
+        assert snap["open"] == pytest.approx(100.0)
+        assert snap["high"] == pytest.approx(100.0)
+        assert snap["low"] == pytest.approx(100.0)
+        assert snap["close"] == pytest.approx(100.0)
+        assert snap["volume"] == pytest.approx(2.0)
 
     def test_single_sell(self):
         acc = TradesAccumulator()
@@ -49,6 +59,9 @@ class TestBasic:
         assert snap["buy_vol"] == 0.0
         assert snap["sell_vol"] == pytest.approx(5.0)
         assert snap["trade_count"] == 1
+        assert snap["open"] == pytest.approx(200.0)
+        assert snap["close"] == pytest.approx(200.0)
+        assert snap["volume"] == pytest.approx(5.0)
 
     def test_multiple_trades_vwap(self):
         acc = TradesAccumulator()
@@ -62,6 +75,11 @@ class TestBasic:
         assert snap["buy_vol"] == pytest.approx(3.0)
         assert snap["sell_vol"] == pytest.approx(1.0)
         assert snap["trade_count"] == 2
+        assert snap["open"] == pytest.approx(100.0)
+        assert snap["high"] == pytest.approx(200.0)
+        assert snap["low"] == pytest.approx(100.0)
+        assert snap["close"] == pytest.approx(200.0)
+        assert snap["volume"] == pytest.approx(4.0)
 
     def test_unknown_side_ignored(self):
         acc = TradesAccumulator()
@@ -88,6 +106,11 @@ class TestReset:
         assert snap2["buy_vol"] == 0.0
         assert snap2["sell_vol"] == 0.0
         assert snap2["trade_count"] == 0
+        assert math.isnan(snap2["open"])
+        assert math.isnan(snap2["high"])
+        assert math.isnan(snap2["low"])
+        assert math.isnan(snap2["close"])
+        assert snap2["volume"] == 0.0
 
     def test_accumulate_after_reset(self):
         acc = TradesAccumulator()
@@ -102,6 +125,11 @@ class TestReset:
         assert snap["buy_vol"] == pytest.approx(3.0)
         assert snap["sell_vol"] == pytest.approx(2.0)
         assert snap["trade_count"] == 2
+        assert snap["open"] == pytest.approx(200.0)
+        assert snap["high"] == pytest.approx(300.0)
+        assert snap["low"] == pytest.approx(200.0)
+        assert snap["close"] == pytest.approx(300.0)
+        assert snap["volume"] == pytest.approx(5.0)
 
     def test_multiple_resets(self):
         acc = TradesAccumulator()
@@ -243,3 +271,66 @@ class TestIntrospection:
         r = repr(acc)
         assert "TradesAccumulator" in r
         assert "count=1" in r
+
+
+# ── OHLCV from trades ───────────────────────────────────────────
+
+
+class TestOHLCV:
+    def test_ohlcv_basic_sequence(self):
+        """open=first, high=max, low=min, close=last."""
+        acc = TradesAccumulator()
+        acc.update(100.0, 1.0, "buy")   # open
+        acc.update(105.0, 1.0, "buy")   # high
+        acc.update(95.0, 1.0, "sell")   # low
+        acc.update(102.0, 1.0, "buy")   # close
+        snap = acc.snapshot_and_reset()
+        assert snap["open"] == pytest.approx(100.0)
+        assert snap["high"] == pytest.approx(105.0)
+        assert snap["low"] == pytest.approx(95.0)
+        assert snap["close"] == pytest.approx(102.0)
+        assert snap["volume"] == pytest.approx(4.0)
+
+    def test_ohlcv_monotonic_up(self):
+        acc = TradesAccumulator()
+        for px in [100, 101, 102, 103]:
+            acc.update(float(px), 1.0, "buy")
+        snap = acc.snapshot_and_reset()
+        assert snap["open"] == pytest.approx(100.0)
+        assert snap["high"] == pytest.approx(103.0)
+        assert snap["low"] == pytest.approx(100.0)
+        assert snap["close"] == pytest.approx(103.0)
+
+    def test_ohlcv_monotonic_down(self):
+        acc = TradesAccumulator()
+        for px in [200, 190, 180, 170]:
+            acc.update(float(px), 2.0, "sell")
+        snap = acc.snapshot_and_reset()
+        assert snap["open"] == pytest.approx(200.0)
+        assert snap["high"] == pytest.approx(200.0)
+        assert snap["low"] == pytest.approx(170.0)
+        assert snap["close"] == pytest.approx(170.0)
+        assert snap["volume"] == pytest.approx(8.0)
+
+    def test_ohlcv_single_trade(self):
+        acc = TradesAccumulator()
+        acc.update(50000.0, 0.5, "buy")
+        snap = acc.snapshot_and_reset()
+        assert snap["open"] == snap["high"] == snap["low"] == snap["close"]
+        assert snap["open"] == pytest.approx(50000.0)
+
+    def test_ohlcv_reset_between_buckets(self):
+        acc = TradesAccumulator()
+        acc.update(100.0, 1.0, "buy")
+        acc.update(110.0, 1.0, "buy")
+        snap1 = acc.snapshot_and_reset()
+        assert snap1["open"] == pytest.approx(100.0)
+        assert snap1["close"] == pytest.approx(110.0)
+
+        acc.update(200.0, 1.0, "sell")
+        acc.update(190.0, 1.0, "sell")
+        snap2 = acc.snapshot_and_reset()
+        assert snap2["open"] == pytest.approx(200.0)
+        assert snap2["high"] == pytest.approx(200.0)
+        assert snap2["low"] == pytest.approx(190.0)
+        assert snap2["close"] == pytest.approx(190.0)

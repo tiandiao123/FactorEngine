@@ -8,7 +8,9 @@ Shows the kline_trades architecture:
   - Runtime thread: bar_queue → push_bars (C++ parallel) → signal_deque
   - Main thread polls get_factor_outputs() at its own pace
 
-Trades-derived factors (T0001–T0006) use vwap, buy_vol, sell_vol inputs.
+factor_group accepts a single group string or a list of groups:
+  - "okx_perp_trades"                   → trades-only factors (T0001–T0006)
+  - ["okx_perp", "okx_perp_trades"]     → kline + trades factors combined
 """
 import logging
 import time
@@ -24,7 +26,7 @@ engine = Engine(
     symbols=["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
     mode="live",
     data_freq="5s",
-    factor_group="okx_perp_trades",
+    factor_group=["okx_perp", "okx_perp_trades"],
     num_threads=4,
     data_source="kline_trades",
 )
@@ -33,6 +35,8 @@ print(f"Symbols:     {len(engine.symbols)}")
 print(f"Factors:     {len(engine.factor_ids)}")
 print(f"Factor IDs:  {engine.factor_ids}")
 print(f"Data source: {engine.data_source}")
+
+
 
 engine.start()
 

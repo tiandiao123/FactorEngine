@@ -7,22 +7,33 @@ The thread runs an asyncio event loop for the WebSocket collector; each
 incoming trade is routed to the corresponding symbol's
 :class:`TradesAccumulator` via a synchronous callback.
 
-**The worker does not trigger round flush.** In ``kline_trades`` mode the
-flush is driven by ``KlinePublisher``; in ``trades``-only mode by
-``ClockDriver``.  Both read accumulators via the public
-:attr:`accumulators` dict.
+Flush modes:
+
+* **kline_trades**: ``KlinePublisher`` reads accumulators directly via
+  the :attr:`accumulators` dict.  Worker does not push to ``bar_queue``.
+* **trades-only**: ``ClockDriver`` calls :meth:`flush` periodically.
+  ``flush()`` snapshots all accumulators, builds BarPoint arrays from
+  trades-derived OHLCV, and pushes ``(round_bars, round_trades)`` into
+  the shared ``bar_queue``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import queue
 import threading
+import time
+
+import numpy as np
 
 from .accumulator import TradesAccumulator
 from .collector import OKXTradesCollector
 
 logger = logging.getLogger(__name__)
+
+_NAN = float("nan")
 
 
 class TradesWorker:
@@ -32,10 +43,19 @@ class TradesWorker:
     ----------
     symbols : list[str]
         Instruments to subscribe, e.g. ``["BTC-USDT-SWAP", ...]``.
+    bar_queue : queue.Queue or None
+        If provided (trades-only mode), :meth:`flush` pushes
+        ``(round_bars, round_trades)`` here.  In kline_trades mode this
+        is ``None`` — ``KlinePublisher`` reads accumulators directly.
     """
 
-    def __init__(self, symbols: list[str]):
+    def __init__(
+        self,
+        symbols: list[str],
+        bar_queue: queue.Queue | None = None,
+    ):
         self.symbols = list(symbols)
+        self._bar_queue = bar_queue
         self._accumulators: dict[str, TradesAccumulator] = {
             sym: TradesAccumulator() for sym in self.symbols
         }
@@ -46,6 +66,7 @@ class TradesWorker:
         # thread (stats/stop). Safe in CPython (GIL guarantees atomic int
         # read/write) but not portable to free-threaded builds.
         self._trade_count = 0
+        self._flush_count = 0
 
     # ── public API ─────────────────────────────────────────────
 
@@ -53,6 +74,60 @@ class TradesWorker:
     def accumulators(self) -> dict[str, TradesAccumulator]:
         """Per-symbol accumulators — read by KlinePublisher or ClockDriver."""
         return self._accumulators
+
+    def flush(self) -> None:
+        """Snapshot all accumulators and push to bar_queue.
+
+        Called by ``ClockDriver`` in trades-only mode.  Builds BarPoint
+        arrays ``[ts, open, high, low, close, vol, NaN, NaN]`` from the
+        accumulator's OHLCV fields so ``Engine._runtime_loop`` can
+        process them identically to kline-sourced bars.
+        """
+        ts_ms = time.time() * 1000
+        # Align to freq boundary (same logic as ClockDriver).
+        freq_ms = getattr(self, "_freq_ms", 0)
+        if freq_ms > 0:
+            ts_ms = ts_ms - (ts_ms % freq_ms)
+        ts_ms = int(ts_ms)
+
+        round_bars: dict[str, np.ndarray] = {}
+        round_trades: dict[str, dict] = {}
+
+        for sym in self.symbols:
+            acc = self._accumulators.get(sym)
+            if acc is None:
+                continue
+            snap = acc.snapshot_and_reset()
+            round_trades[sym] = snap
+
+            # Build BarPoint from trades-derived OHLCV.
+            bar = np.array([
+                ts_ms,
+                snap.get("open", _NAN),
+                snap.get("high", _NAN),
+                snap.get("low", _NAN),
+                snap.get("close", _NAN),
+                snap.get("volume", 0.0),
+                _NAN,  # vol_ccy — not available from trades
+                _NAN,  # vol_ccy_quote
+            ], dtype=np.float64)
+            round_bars[sym] = bar
+
+        payload = (round_bars, round_trades)
+        if self._bar_queue is not None:
+            try:
+                self._bar_queue.put(payload, block=False)
+            except queue.Full:
+                logger.warning(
+                    "TradesWorker.flush: bar_queue full, dropping round "
+                    "(ts=%d, symbols=%d)", ts_ms, len(round_bars),
+                )
+
+        self._flush_count += 1
+
+    def set_freq(self, freq_seconds: float) -> None:
+        """Set the bar frequency for timestamp alignment in flush()."""
+        self._freq_ms = freq_seconds * 1000
 
     # ── lifecycle ──────────────────────────────────────────────
 
@@ -75,8 +150,8 @@ class TradesWorker:
         if self._thread is not None:
             self._thread.join(timeout=5)
         logger.info(
-            "TradesWorker stopped (trades=%d, ws_msgs=%d)",
-            self._trade_count,
+            "TradesWorker stopped (trades=%d, flushes=%d, ws_msgs=%d)",
+            self._trade_count, self._flush_count,
             self._collector.msg_count if self._collector else 0,
         )
 
@@ -86,9 +161,14 @@ class TradesWorker:
     def trade_count(self) -> int:
         return self._trade_count
 
+    @property
+    def flush_count(self) -> int:
+        return self._flush_count
+
     def stats(self) -> dict[str, int]:
         return {
             "trade_count": self._trade_count,
+            "flush_count": self._flush_count,
             "ws_msg_count": self._collector.msg_count if self._collector else 0,
             "symbols": len(self.symbols),
         }

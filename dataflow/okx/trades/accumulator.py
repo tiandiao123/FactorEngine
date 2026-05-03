@@ -9,6 +9,17 @@ aggregated values and reset for the next bucket.
 Thread safety is guaranteed by a ``threading.Lock`` — contention is
 negligible because ``update()`` holds the lock for a few additions and
 ``snapshot_and_reset()`` is called at most once per bar interval.
+
+Phase 2 addition: OHLCV tracking
+---------------------------------
+In ``trades``-only mode there is no kline WS feed, so the accumulator
+derives OHLCV directly from the trades stream:
+
+* **open**  — price of the first trade in the bucket
+* **high**  — max price seen
+* **low**   — min price seen
+* **close** — price of the most recent trade
+* **volume** — Σ(sz)  (same as ``buy_vol + sell_vol``)
 """
 
 from __future__ import annotations
@@ -26,6 +37,7 @@ class TradesAccumulator:
     * **buy_vol** — total size where ``side == "buy"``
     * **sell_vol** — total size where ``side == "sell"``
     * **trade_count** — number of ``update()`` calls in the current bucket
+    * **open / high / low / close / volume** — OHLCV derived from trades
     """
 
     __slots__ = (
@@ -35,6 +47,10 @@ class TradesAccumulator:
         "_buy_vol",
         "_sell_vol",
         "_count",
+        "_open",
+        "_high",
+        "_low",
+        "_close",
     )
 
     def __init__(self) -> None:
@@ -44,6 +60,10 @@ class TradesAccumulator:
         self._buy_vol: float = 0.0
         self._sell_vol: float = 0.0
         self._count: int = 0
+        self._open: float = math.nan
+        self._high: float = -math.inf
+        self._low: float = math.inf
+        self._close: float = math.nan
 
     # ── hot path (trades WS thread) ─────────────────────────────
 
@@ -66,6 +86,13 @@ class TradesAccumulator:
                 self._buy_vol += sz
             elif side == "sell":
                 self._sell_vol += sz
+            if self._count == 0:
+                self._open = px
+            if px > self._high:
+                self._high = px
+            if px < self._low:
+                self._low = px
+            self._close = px
             self._count += 1
 
     # ── cold path (flush thread) ────────────────────────────────
@@ -76,25 +103,35 @@ class TradesAccumulator:
         Returns
         -------
         dict
-            ``{"vwap": float, "buy_vol": float, "sell_vol": float,
-               "trade_count": int}``
+            Keys: ``vwap``, ``buy_vol``, ``sell_vol``, ``trade_count``,
+            ``open``, ``high``, ``low``, ``close``, ``volume``.
 
-            If no trades arrived in the bucket, *vwap* is ``NaN`` and
-            volumes / count are ``0``.
+            If no trades arrived in the bucket, price fields are ``NaN``
+            and volumes / count are ``0``.
         """
         with self._lock:
             vwap = self._sum_pv / self._sum_v if self._sum_v > 0 else math.nan
+            no_trades = self._count == 0
             result = {
                 "vwap": vwap,
                 "buy_vol": self._buy_vol,
                 "sell_vol": self._sell_vol,
                 "trade_count": self._count,
+                "open": math.nan if no_trades else self._open,
+                "high": math.nan if no_trades else self._high,
+                "low": math.nan if no_trades else self._low,
+                "close": math.nan if no_trades else self._close,
+                "volume": self._sum_v,
             }
             self._sum_pv = 0.0
             self._sum_v = 0.0
             self._buy_vol = 0.0
             self._sell_vol = 0.0
             self._count = 0
+            self._open = math.nan
+            self._high = -math.inf
+            self._low = math.inf
+            self._close = math.nan
             return result
 
     # ── introspection (no lock — advisory only) ─────────────────
@@ -108,5 +145,6 @@ class TradesAccumulator:
         return (
             f"TradesAccumulator(count={self._count}, "
             f"sum_v={self._sum_v:.4f}, buy={self._buy_vol:.4f}, "
-            f"sell={self._sell_vol:.4f})"
+            f"sell={self._sell_vol:.4f}, "
+            f"O={self._open} H={self._high} L={self._low} C={self._close})"
         )

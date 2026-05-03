@@ -79,7 +79,7 @@ class Engine:
         mode: str = "live",
         sim_bar_interval: float | None = None,
         sim_seed: int | None = None,
-        factor_group: str | None = None,
+        factor_group: str | list[str] | None = None,
         num_threads: int = 4,
         signal_buffer_size: int = 3,
         bar_queue_size: int = 16,
@@ -103,9 +103,17 @@ class Engine:
         self.data_freq_seconds = parse_freq(data_freq)
         self.pull_interval_seconds = parse_freq(pull_interval)
 
+        # Normalize factor_group to list.
+        if isinstance(factor_group, str):
+            self._factor_groups: list[str] = [factor_group]
+        elif isinstance(factor_group, list):
+            self._factor_groups = list(factor_group)
+        else:
+            self._factor_groups = []
+        self._factor_group = factor_group  # original value for logging
+
         # C++ factor inference engine (optional).
         self._inference = None
-        self._factor_group = factor_group
         self._num_threads = num_threads
         self._factor_ids: list[str] = []
         self._signal_deque: deque[dict] = deque(maxlen=signal_buffer_size)
@@ -118,14 +126,15 @@ class Engine:
         self._runtime_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
-        if factor_group:
-            self._init_inference(factor_group, num_threads)
+        if self._factor_groups:
+            self._init_inference(self._factor_groups, num_threads)
             self._bar_queue = queue.Queue(maxsize=bar_queue_size)
 
         # Debug bar cache (optional, not on the main compute path).
         self._debug_cache = None
         self._kline_worker = None
         self._trades_worker = None
+        self._clock_driver = None
         self._dataflow = None
 
         if mode == "live":
@@ -146,7 +155,12 @@ class Engine:
             if data_source in ("trades", "kline_trades"):
                 from dataflow.okx.trades.worker import TradesWorker
 
-                self._trades_worker = TradesWorker(symbols=symbols)
+                trades_queue = self._bar_queue if data_source == "trades" else None
+                self._trades_worker = TradesWorker(
+                    symbols=symbols,
+                    bar_queue=trades_queue,
+                )
+                self._trades_worker.set_freq(self.data_freq_seconds)
                 accumulators = self._trades_worker.accumulators
 
             # Start KlineWorker if data_source includes kline.
@@ -163,25 +177,15 @@ class Engine:
             elif self._bar_queue is None:
                 logger.info(
                     "Live mode without factor_group: KlineWorker not started "
-                    "(no bar_queue consumer). Use get_data() is unavailable "
-                    "without a streaming data source.",
+                    "(no bar_queue consumer).",
                 )
 
-            if data_source == "trades":
-                if self._bar_queue is not None:
-                    logger.warning(
-                        "data_source='trades' with factor_group='%s' in live mode: "
-                        "no component pushes bars to the queue "
-                        "(ClockDriver not yet implemented — Phase 2). "
-                        "Accumulators will collect but never flush. "
-                        "Use data_source='kline_trades' to get inference results now.",
-                        factor_group,
-                    )
-                else:
-                    logger.warning(
-                        "trades-only mode: KlineWorker not started. "
-                        "ClockDriver required for flush (Phase 2)."
-                    )
+            # trades-only mode: ClockDriver drives periodic flush.
+            if data_source == "trades" and self._trades_worker is not None:
+                from dataflow.clock_driver import ClockDriver
+
+                self._clock_driver = ClockDriver(freq_seconds=self.data_freq_seconds)
+                self._clock_driver.register(self._trades_worker.flush)
 
         elif mode == "simulation":
             from dataflow.simulation.manager import SimDataflowManager
@@ -203,26 +207,32 @@ class Engine:
 
     # ── Factor inference ──────────────────────────────────────
 
-    def _init_inference(self, group: str, num_threads: int):
+    def _init_inference(self, groups: list[str], num_threads: int):
         import fe_runtime as rt
         from factorengine.factors import FactorRegistry
 
         reg = FactorRegistry()
-        reg.load_group(group)
+        for group in groups:
+            reg.load_group(group)
 
         self._inference = rt.InferenceEngine(num_threads=num_threads)
         for sym in self.symbols:
             self._inference.add_symbol(sym)
-            graphs = reg.build_group(group)
-            for fid, graph in graphs.items():
-                self._inference.add_factor(sym, fid, graph)
+            for group in groups:
+                graphs = reg.build_group(group)
+                for fid, graph in graphs.items():
+                    self._inference.add_factor(sym, fid, graph)
 
         # Set factor ID list once after all symbols are wired up.
-        self._factor_ids = reg.factor_ids_by_group(group)
+        self._factor_ids = []
+        for group in groups:
+            self._factor_ids.extend(reg.factor_ids_by_group(group))
+        self._factor_ids.sort()
 
         logger.info(
-            "InferenceEngine initialized: %d symbols × %d factors, %d threads",
-            len(self.symbols), len(self._factor_ids), num_threads,
+            "InferenceEngine initialized: %d symbols × %d factors (%s), %d threads",
+            len(self.symbols), len(self._factor_ids),
+            "+".join(groups), num_threads,
         )
 
     def _runtime_loop(self):
@@ -321,25 +331,19 @@ class Engine:
     def start(self):
         """Start the dataflow collection and (optionally) the inference thread."""
         if self._bar_queue is not None and self._inference is not None:
-            # In trades-only mode, bar_queue will never receive data
-            # (ClockDriver not yet implemented), so skip runtime thread.
-            if self._data_source == "trades":
-                logger.warning(
-                    "Skipping runtime thread: trades-only mode has no flush "
-                    "driver yet (Phase 2 — ClockDriver)."
-                )
-            else:
-                self._stop_event.clear()
-                self._runtime_thread = threading.Thread(
-                    target=self._runtime_loop, daemon=True, name="factor-infer"
-                )
-                self._runtime_thread.start()
+            self._stop_event.clear()
+            self._runtime_thread = threading.Thread(
+                target=self._runtime_loop, daemon=True, name="factor-infer"
+            )
+            self._runtime_thread.start()
 
         if self.mode == "live":
             if self._trades_worker is not None:
                 self._trades_worker.start()
             if self._kline_worker is not None:
                 self._kline_worker.start()
+            if self._clock_driver is not None:
+                self._clock_driver.start()
         elif self._dataflow is not None:
             self._dataflow.start()
 
@@ -348,12 +352,15 @@ class Engine:
             "bar_window=%d, factors=%s, data_source=%s",
             self.mode, len(self.symbols), self.data_freq,
             self.data_freq_seconds, self.bar_window_length,
-            self._factor_group or "none", self._data_source,
+            "+".join(self._factor_groups) if self._factor_groups else "none",
+            self._data_source,
         )
 
     def stop(self):
         """Stop the dataflow collection and inference thread."""
         if self.mode == "live":
+            if self._clock_driver is not None:
+                self._clock_driver.stop()
             if self._kline_worker is not None:
                 self._kline_worker.stop()
             if self._trades_worker is not None:
@@ -410,5 +417,8 @@ class Engine:
     def trades_stats(self) -> dict[str, int]:
         """Live trades worker statistics (empty dict if not active)."""
         if self._trades_worker is not None:
-            return self._trades_worker.stats()
+            stats = self._trades_worker.stats()
+            if self._clock_driver is not None:
+                stats["clock_ticks"] = self._clock_driver.tick_count
+            return stats
         return {}
