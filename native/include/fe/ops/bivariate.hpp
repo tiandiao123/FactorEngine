@@ -142,6 +142,70 @@ inline void rolling_cov(const FeFloat* x, const FeFloat* y,
 }
 
 /**
+ * Rolling OLS beta (slope) of y regressed on x:
+ *   beta = Cov(x,y) / Var(x) = (n*sxy - sx*sy) / (n*sxx - sx^2)
+ *
+ * Aligned with: pandas Series(y).rolling(t).cov(x) / Series(x).rolling(t).var()
+ * Requires window >= 2.
+ */
+inline void rolling_beta(const FeFloat* y, const FeFloat* x,
+                         FeFloat* out, int n, int window) {
+  if (window < 2 || n <= 0) {
+    for (int i = 0; i < n; ++i)
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+    return;
+  }
+  const auto t = static_cast<std::uint32_t>(window);
+
+  std::vector<FeFloat> rx(t), ry(t);
+  double sx = 0, sy = 0, sxx = 0, sxy = 0;
+  std::uint32_t pos = 0, count = 0, nan_count = 0;
+
+  for (int i = 0; i < n; ++i) {
+    FeFloat xv = x[i], yv = y[i];
+    bool cur_nan = fe_is_nan(xv) || fe_is_nan(yv);
+
+    if (count >= t) {
+      FeFloat ox = rx[pos % t], oy = ry[pos % t];
+      bool old_nan = fe_is_nan(ox) || fe_is_nan(oy);
+      if (old_nan) {
+        --nan_count;
+      } else {
+        double dx = static_cast<double>(ox), dy = static_cast<double>(oy);
+        sx -= dx; sy -= dy; sxx -= dx * dx; sxy -= dx * dy;
+      }
+    }
+
+    rx[pos % t] = xv;
+    ry[pos % t] = yv;
+
+    if (cur_nan) {
+      ++nan_count;
+    } else {
+      double dx = static_cast<double>(xv), dy = static_cast<double>(yv);
+      sx += dx; sy += dy; sxx += dx * dx; sxy += dx * dy;
+    }
+
+    ++pos;
+    if (count < t) ++count;
+
+    if (count < t || nan_count > 0) {
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+      continue;
+    }
+
+    double dn = static_cast<double>(t);
+    double var_x = dn * sxx - sx * sx;
+    if (var_x <= 0.0) {
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+      continue;
+    }
+    double cov_xy = dn * sxy - sx * sy;
+    out[i] = static_cast<FeFloat>(cov_xy / var_x);
+  }
+}
+
+/**
  * Rolling autocorrelation: corr(x, x.shift(lag), window).
  *
  * Exact replication of Autocorr(x, t, n) in ts_ops.py:

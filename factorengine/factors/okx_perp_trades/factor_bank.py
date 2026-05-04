@@ -151,3 +151,44 @@ def build_buy_vol_kurtosis() -> rt.FactorGraph:
     g.add_unary(Op.NEG, ranked)
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0009: Volume-Price Beta — sensitivity of returns to volume
+#    High beta = price driven by volume surges (liquidity events)
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0009")
+def build_volume_price_beta() -> rt.FactorGraph:
+    """TsZscore(TsBeta(SLog1p(volume), ret, 60), 120)"""
+    g = rt.FactorGraph()
+    vol = g.add_input("volume")
+    ret = g.add_input("ret")
+    svol = g.add_unary(Op.SLOG1P, vol)
+    beta = g.add_bivariate(Op.TS_BETA, svol, ret, 60)
+    g.add_rolling(Op.TS_ZSCORE, beta, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0010: Buy-Sell Imbalance Beta on Close — how close reacts
+#    to trade imbalance shifts (informed flow → price impact)
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0010")
+def build_imbalance_close_beta() -> rt.FactorGraph:
+    """Neg(TsRank(TsBeta(Div(Sub(buy_vol,sell_vol),Add(buy_vol,sell_vol)), TsPct(close,1), 30), 120))"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    close = g.add_input("close")
+    diff = g.add_binary(Op.SUB, bv, sv)
+    total = g.add_binary(Op.ADD, bv, sv)
+    imbalance = g.add_binary(Op.DIV, diff, total)
+    pct = g.add_rolling(Op.TS_PCT, close, 1)
+    beta = g.add_bivariate(Op.TS_BETA, imbalance, pct, 30)
+    ranked = g.add_rolling(Op.TS_RANK, beta, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
