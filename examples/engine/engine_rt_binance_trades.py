@@ -49,7 +49,7 @@ print(f"Data source: {engine.data_source}")
 engine.start()
 
 try:
-    for cycle in range(1, 200):
+    for cycle in range(1, 300):
         time.sleep(1)
 
         factors = engine.get_factor_outputs()
