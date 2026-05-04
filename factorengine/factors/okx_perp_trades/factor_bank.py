@@ -856,3 +856,136 @@ def build_fmax_ret_vol() -> rt.FactorGraph:
     g.add_rolling(Op.TS_ZSCORE, mx, 120)
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0047: Imbalance Skewness — tail asymmetry of trade flow
+#    Persistent positive skew = buy bursts; negative = sell bursts
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0047")
+def build_imbalance_skew() -> rt.FactorGraph:
+    """Neg(TsRank(TsSkew(Div(Sub(buy_vol, sell_vol), Add(buy_vol, sell_vol)), 30), 120))"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    diff = g.add_binary(Op.SUB, bv, sv)
+    total = g.add_binary(Op.ADD, bv, sv)
+    imbalance = g.add_binary(Op.DIV, diff, total)
+    skew = g.add_rolling(Op.TS_SKEW, imbalance, 30)
+    ranked = g.add_rolling(Op.TS_RANK, skew, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0048: VWAP Median Reversion — VWAP vs rolling median
+#    Robust alternative to MA-based VWAP momentum
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0048")
+def build_vwap_median_dev() -> rt.FactorGraph:
+    """TsZscore(Div(Sub(vwap, TsMed(vwap, 60)), TsMad(vwap, 60)), 120)"""
+    g = rt.FactorGraph()
+    vw = g.add_input("vwap")
+    med = g.add_rolling(Op.TS_MED, vw, 60)
+    mad = g.add_rolling(Op.TS_MAD, vw, 60)
+    dev = g.add_binary(Op.SUB, vw, med)
+    norm = g.add_binary(Op.DIV, dev, mad)
+    g.add_rolling(Op.TS_ZSCORE, norm, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0049: WMA Volume Trend — linearly-weighted volume trend
+#    Recent volume bars weighted more; captures acceleration
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0049")
+def build_wma_vol_trend() -> rt.FactorGraph:
+    """Neg(TsRank(Div(Sub(SLog1p(volume), TsWma(SLog1p(volume), 30)), TsStd(SLog1p(volume), 30)), 120))"""
+    g = rt.FactorGraph()
+    vol = g.add_input("volume")
+    svol = g.add_unary(Op.SLOG1P, vol)
+    wma = g.add_rolling(Op.TS_WMA, svol, 30)
+    dev = g.add_binary(Op.SUB, svol, wma)
+    std = g.add_rolling(Op.TS_STD, svol, 30)
+    norm = g.add_binary(Op.DIV, dev, std)
+    ranked = g.add_rolling(Op.TS_RANK, norm, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0050: Close Drawdown — how far close is from its recent peak
+#    TsMaxDiff = close - max(close, w) ≤ 0
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0050")
+def build_close_drawdown() -> rt.FactorGraph:
+    """TsRank(TsMaxDiff(close, 30), 120)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    dd = g.add_rolling(Op.TS_MAX_DIFF, c, 30)
+    g.add_rolling(Op.TS_RANK, dd, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0051: VWAP Breakout — how far VWAP is from its recent trough
+#    TsMinDiff = vwap - min(vwap, w) ≥ 0
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0051")
+def build_vwap_breakout() -> rt.FactorGraph:
+    """Neg(TsRank(TsMinDiff(vwap, 30), 120))"""
+    g = rt.FactorGraph()
+    vw = g.add_input("vwap")
+    bu = g.add_rolling(Op.TS_MIN_DIFF, vw, 30)
+    ranked = g.add_rolling(Op.TS_RANK, bu, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0052: Close Range Oscillator — normalized range width
+#    TsMinmaxDiff / MA captures relative spread
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0052")
+def build_range_oscillator() -> rt.FactorGraph:
+    """TsZscore(Div(TsMinmaxDiff(close, 30), Ma(close, 30)), 120)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    rng = g.add_rolling(Op.TS_MINMAX_DIFF, c, 30)
+    ma = g.add_rolling(Op.MA, c, 30)
+    norm = g.add_binary(Op.DIV, rng, ma)
+    g.add_rolling(Op.TS_ZSCORE, norm, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0053: Imbalance Variance Regime — high variance = unstable flow
+#    TsVari on buy-sell imbalance as regime indicator
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0053")
+def build_imbalance_vari() -> rt.FactorGraph:
+    """Neg(TsRank(TsVari(Div(Sub(buy_vol, sell_vol), Add(buy_vol, sell_vol)), 30), 120))"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    diff = g.add_binary(Op.SUB, bv, sv)
+    total = g.add_binary(Op.ADD, bv, sv)
+    imbalance = g.add_binary(Op.DIV, diff, total)
+    var = g.add_rolling(Op.TS_VARI, imbalance, 30)
+    ranked = g.add_rolling(Op.TS_RANK, var, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g

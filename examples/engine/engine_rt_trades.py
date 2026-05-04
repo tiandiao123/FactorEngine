@@ -17,7 +17,15 @@ logging.basicConfig(
 )
 
 engine = Engine(
-    symbols=["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
+    symbols=[
+        "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
+        "DOGE-USDT-SWAP", "XRP-USDT-SWAP", "ADA-USDT-SWAP",
+        "AVAX-USDT-SWAP", "LINK-USDT-SWAP", "DOT-USDT-SWAP",
+        "POL-USDT-SWAP", "UNI-USDT-SWAP", "ATOM-USDT-SWAP",
+        "FIL-USDT-SWAP", "LTC-USDT-SWAP", "NEAR-USDT-SWAP",
+        "APT-USDT-SWAP", "ARB-USDT-SWAP", "OP-USDT-SWAP",
+        "SUI-USDT-SWAP", "PEPE-USDT-SWAP",
+    ],
     mode="live",
     data_freq="1s",
     factor_group=["okx_perp_trades"],

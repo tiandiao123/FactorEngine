@@ -172,21 +172,22 @@ BarData → C++ InferenceEngine:
 
 ## 4. 实施计划
 
-### Phase 1: 补齐未使用的 C++ 算子覆盖 (0.5 天)
+### Phase 1: 补齐未使用的 C++ 算子覆盖 (0.5 天) ✅ 已完成
 
-为 10 个已有但从未使用的 C++ Op 编写因子，确保 kernel 被实际压测：
+为 9 个已有但从未使用的 C++ Op 编写因子（TS_PCT 已在 Phase 2 trades 因子中使用）：
 
-| 步骤 | 工作 |
-|------|------|
-| 1-1 | 为 TS_SKEW 写 2 个因子（return skew、volume skew） |
-| 1-2 | 为 TS_MED 写 1 个因子（median deviation） |
-| 1-3 | 为 TS_MAD 写 1 个因子（robust volatility） |
-| 1-4 | 为 TS_WMA 写 1 个因子（decay-weighted momentum） |
-| 1-5 | 为 TS_MAX_DIFF / TS_MIN_DIFF 写 2 个因子（drawdown/breakout） |
-| 1-6 | 为 TS_MINMAX_DIFF 写 1 个因子（range oscillator） |
-| 1-7 | 为 TS_VARI / TS_PCT 各写 1 个因子 |
+| 步骤 | 工作 | 状态 |
+|------|------|------|
+| 1-1 | 为 TS_SKEW 写 3 个因子（0066 return skew、0067 volume skew、T0047 imbalance skew） | ✅ |
+| 1-2 | 为 TS_MED 写 2 个因子（0068 median deviation、T0048 VWAP median） | ✅ |
+| 1-3 | 为 TS_MAD 写 2 个因子（0069 robust volatility、T0048 VWAP MAD） | ✅ |
+| 1-4 | 为 TS_WMA 写 2 个因子（0070 decay-weighted momentum、T0049 WMA volume） | ✅ |
+| 1-5 | 为 TS_MAX_DIFF / TS_MIN_DIFF 写 4 个因子（0071/0072 kline、T0050/T0051 trades） | ✅ |
+| 1-6 | 为 TS_MINMAX_DIFF 写 2 个因子（0073 kline、T0052 trades） | ✅ |
+| 1-7 | 为 TS_VARI 写 2 个因子（0074 variance ratio、T0053 imbalance variance） | ✅ |
+| 1-8 | 为 TREAP_TS_RANK 写 1 个因子（0075 large-window optimized rank） | ✅ |
 
-**产出**：~10 个新因子，覆盖 10 个空白 kernel
+**产出**：17 个新因子（kline 0066-0075 + trades T0047-T0053），100% kernel 覆盖达成
 
 ### Phase 2: 新增 C++ 算子 (1-2 天)
 

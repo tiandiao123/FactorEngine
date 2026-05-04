@@ -15,8 +15,8 @@ from factorengine.factors import FactorRegistry
 
 N = 500
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
-NUM_FACTORS = 106  # total: 60 kline (okx_perp) + 46 trades (okx_perp_trades)
-NUM_KLINE_FACTORS = 60
+NUM_FACTORS = 123  # total: 70 kline (okx_perp) + 53 trades (okx_perp_trades)
+NUM_KLINE_FACTORS = 70
 
 
 def make_ohlcv(seed: int, n: int = N):
@@ -72,9 +72,9 @@ class TestFactorRegistry:
         g = reg.build("0001", group="okx_perp")
         assert g.num_nodes() == 5
 
-    @pytest.mark.parametrize("fid", [f"T{i:04d}" for i in range(29, 47)])
+    @pytest.mark.parametrize("fid", [f"T{i:04d}" for i in range(29, 54)])
     def test_trades_factor_registration_and_output(self, fid):
-        """Each new trades factor (T0029-T0038) must register, build, and produce output."""
+        """Each new trades factor (T0029-T0053) must register, build, and produce output."""
         reg = FactorRegistry()
         reg.load_group("okx_perp_trades")
         g = reg.build(fid, group="okx_perp_trades")

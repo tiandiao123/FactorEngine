@@ -23,7 +23,7 @@ from factorengine.engine import Engine
 from factorengine.factors import FactorRegistry
 from dataflow.simulation.symbols import DEFAULT_SYMBOLS
 
-NUM_FACTORS = 60
+NUM_FACTORS = 70
 SYMBOLS = DEFAULT_SYMBOLS[:3]  # BTC, ETH, SOL
 
 
