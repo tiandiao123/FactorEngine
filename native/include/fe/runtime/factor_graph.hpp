@@ -62,6 +62,9 @@ enum class Op {
     // P2c momentum / technical
     TS_RSI, TS_CCI,
 
+    // P2d conditional rolling
+    TS_SUM_POS, TS_POS_RATIO,
+
     // Optimized variants
     TREAP_TS_RANK,  // O(log t) TsRank via Treap order-statistic tree
 
@@ -100,6 +103,8 @@ using KernelVar = std::variant<
     TsNormComposite,                        // composite: (x-min)/(max-min)
     RsiPush,                                // Wilder's RSI
     CciPush,                                // Lambert's CCI
+    SumPosPush,                             // rolling sum of positives
+    PosRatioPush,                           // rolling positive ratio
     TsSkewPush,                             // new: brute-force O(t)
     TsKurtPush,                             // new: brute-force O(t)
     TsMedPush,                              // new: sorted buffer
@@ -318,6 +323,8 @@ public:
             case Op::TS_NORM:  { auto& k = std::get<TsNormComposite>(nd.kernel);     k.push(a); values_[i] = k.output(); break; }
             case Op::TS_RSI:   { auto& k = std::get<RsiPush>(nd.kernel);             k.push(a); values_[i] = k.output(); break; }
             case Op::TS_CCI:   { auto& k = std::get<CciPush>(nd.kernel);             k.push(a); values_[i] = k.output(); break; }
+            case Op::TS_SUM_POS:   { auto& k = std::get<SumPosPush>(nd.kernel);       k.push(a); values_[i] = k.output(); break; }
+            case Op::TS_POS_RATIO: { auto& k = std::get<PosRatioPush>(nd.kernel);     k.push(a); values_[i] = k.output(); break; }
             case Op::TS_GROWTH: { auto& k = std::get<TsPctComposite>(nd.kernel);     k.push(a); values_[i] = k.output(); break; }
 
             // ── P3 complex ──
@@ -430,6 +437,8 @@ private:
         case Op::TS_NORM:      return "TS_NORM";
         case Op::TS_RSI:       return "TS_RSI";
         case Op::TS_CCI:       return "TS_CCI";
+        case Op::TS_SUM_POS:   return "TS_SUM_POS";
+        case Op::TS_POS_RATIO: return "TS_POS_RATIO";
         case Op::TS_GROWTH:    return "TS_GROWTH";
         case Op::AUTOCORR:     return "AUTOCORR";
         case Op::TS_MINMAX_DIFF: return "TS_MINMAX_DIFF";
@@ -458,6 +467,7 @@ private:
         case Op::TS_RANK: case Op::TREAP_TS_RANK: case Op::TS_ZSCORE:
         case Op::CORR: case Op::TS_COV: case Op::TS_BETA: case Op::TS_INTERCEPT: case Op::TS_COS:
         case Op::TS_CV: case Op::TS_NORM: case Op::TS_RSI: case Op::TS_CCI:
+        case Op::TS_SUM_POS: case Op::TS_POS_RATIO:
         case Op::TS_MINMAX_DIFF: case Op::TS_SKEW: case Op::TS_KURT:
         case Op::TS_MED: case Op::TS_MAD: case Op::TS_WMA:
         case Op::TS_MAX_DIFF: case Op::TS_MIN_DIFF:
@@ -497,6 +507,8 @@ private:
         case Op::TS_NORM:      return TsNormComposite(nd.window);
         case Op::TS_RSI:       return RsiPush(nd.window);
         case Op::TS_CCI:       return CciPush(nd.window);
+        case Op::TS_SUM_POS:   return SumPosPush(nd.window);
+        case Op::TS_POS_RATIO: return PosRatioPush(nd.window);
         case Op::TS_GROWTH:    return TsPctComposite(nd.window);
         case Op::AUTOCORR:     return AutocorrPush(nd.window, static_cast<int>(nd.scalar));
         case Op::TS_MINMAX_DIFF: return TsMinMaxDiffPush(nd.window);

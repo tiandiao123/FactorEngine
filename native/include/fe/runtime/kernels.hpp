@@ -29,6 +29,7 @@
 #include "fe/ops/bivariate.hpp"
 #include "fe/ops/rolling_rsi.hpp"
 #include "fe/ops/rolling_cci.hpp"
+#include "fe/ops/rolling_sumpos.hpp"
 
 namespace fe::runtime {
 
@@ -165,6 +166,10 @@ using RsiPush = fe::ops::RsiKernel;
 
 // --------------- TsCci: alias to shared CciKernel in rolling_cci.hpp --------
 using CciPush = fe::ops::CciKernel;
+
+// --------------- TsSumPos / TsPosRatio: aliases to rolling_sumpos.hpp -------
+using SumPosPush = fe::ops::SumPosKernel;
+using PosRatioPush = fe::ops::PosRatioKernel;
 
 // ═══════════════════════════════════════════════════════════════
 //  New push-level kernels (no class equivalent in ops/)

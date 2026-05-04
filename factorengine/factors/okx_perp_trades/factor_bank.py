@@ -600,3 +600,71 @@ def build_cci_divergence() -> rt.FactorGraph:
     g.add_rolling(Op.TS_ZSCORE, div, 120)
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0033: Upside Return Sum — sum of positive returns over 30 bars
+#    Measures accumulated upside momentum
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0033")
+def build_sumpos_ret_30() -> rt.FactorGraph:
+    """TsZscore(TsSumPos(ret, 30), 120)"""
+    g = rt.FactorGraph()
+    r = g.add_input("ret")
+    sp = g.add_rolling(Op.TS_SUM_POS, r, 30)
+    g.add_rolling(Op.TS_ZSCORE, sp, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0034: Upside Volume Sum — sum of positive net-volume changes
+#    Positive buy-sell imbalance accumulation
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0034")
+def build_sumpos_netvol_30() -> rt.FactorGraph:
+    """TsZscore(TsSumPos(Sub(buy_vol, sell_vol), 30), 120)"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    net = g.add_binary(Op.SUB, bv, sv)
+    sp = g.add_rolling(Op.TS_SUM_POS, net, 30)
+    g.add_rolling(Op.TS_ZSCORE, sp, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0035: Positive Return Ratio — fraction of positive returns
+#    High ratio = consistent uptrend; low ratio = downtrend
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0035")
+def build_posratio_ret_30() -> rt.FactorGraph:
+    """TsZscore(TsPosRatio(ret, 30), 120)"""
+    g = rt.FactorGraph()
+    r = g.add_input("ret")
+    pr = g.add_rolling(Op.TS_POS_RATIO, r, 30)
+    g.add_rolling(Op.TS_ZSCORE, pr, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0036: Buy Dominance Ratio — fraction of bars where buy_vol > sell_vol
+#    Measures consistency of buy-side pressure
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0036")
+def build_posratio_netvol_60() -> rt.FactorGraph:
+    """TsZscore(TsPosRatio(Sub(buy_vol, sell_vol), 60), 120)"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    net = g.add_binary(Op.SUB, bv, sv)
+    pr = g.add_rolling(Op.TS_POS_RATIO, net, 60)
+    g.add_rolling(Op.TS_ZSCORE, pr, 120)
+    g.compile()
+    return g
