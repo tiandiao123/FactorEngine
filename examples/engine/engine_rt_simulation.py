@@ -73,7 +73,7 @@ try:
         print(f"  sample(10): {sample}")
 
         if n_valid > 0 and cycle % 5 == 0:
-            print(f"  ── all 60 factors for {sym} ──")
+            print(f"  ── all {len(fvals)} factors for {sym} ──")
             for i, (fid, val) in enumerate(sorted(fvals.items())):
                 tag = f"{val:.6f}" if val == val else "NaN"
                 end = "\n" if (i + 1) % 6 == 0 else ""

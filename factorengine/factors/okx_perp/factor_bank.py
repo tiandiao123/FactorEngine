@@ -1334,3 +1334,186 @@ def build_factor_0065() -> rt.FactorGraph:
     g.add_unary(Op.NEG, g.add_rolling(Op.TS_ZSCORE, weighted, 60))
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  0066: Return Skewness — tail asymmetry of returns
+#    Negative skew = left tail heavier (crash risk)
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp", "0066")
+def build_factor_0066() -> rt.FactorGraph:
+    """Neg(TsRank(TsSkew(TsDiff(Log(close), 1), 60), 240))"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    logc = g.add_unary(Op.LOG, c)
+    ret1 = g.add_rolling(Op.TS_DIFF, logc, 1)
+    skew = g.add_rolling(Op.TS_SKEW, ret1, 60)
+    ranked = g.add_rolling(Op.TS_RANK, skew, 240)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  0067: Volume Skewness — asymmetry in volume distribution
+#    High positive skew = occasional volume spikes (event-driven)
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp", "0067")
+def build_factor_0067() -> rt.FactorGraph:
+    """Neg(TsZscore(TsSkew(SLog1p(volume), 30), 120))"""
+    g = rt.FactorGraph()
+    v = g.add_input("volume")
+    sv = g.add_unary(Op.SLOG1P, v)
+    skew = g.add_rolling(Op.TS_SKEW, sv, 30)
+    g.add_unary(Op.NEG, g.add_rolling(Op.TS_ZSCORE, skew, 120))
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  0068: Median Deviation — close deviation from rolling median
+#    More robust to outliers than MA-based deviation
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp", "0068")
+def build_factor_0068() -> rt.FactorGraph:
+    """Div(Sub(close, TsMed(close, 60)), TsStd(close, 60))"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    med = g.add_rolling(Op.TS_MED, c, 60)
+    dev = g.add_binary(Op.SUB, c, med)
+    vol = g.add_rolling(Op.TS_STD, c, 60)
+    g.add_binary(Op.DIV, dev, vol)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  0069: Robust Volatility — MAD-based volatility estimate
+#    TsMad is resistant to outliers unlike TsStd
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp", "0069")
+def build_factor_0069() -> rt.FactorGraph:
+    """Neg(TsZscore(TsMad(TsDiff(Log(close), 1), 30), 120))"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    logc = g.add_unary(Op.LOG, c)
+    ret1 = g.add_rolling(Op.TS_DIFF, logc, 1)
+    mad = g.add_rolling(Op.TS_MAD, ret1, 30)
+    g.add_unary(Op.NEG, g.add_rolling(Op.TS_ZSCORE, mad, 120))
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  0070: Decay-Weighted Momentum — recent prices weighted more
+#    WMA emphasizes latest bars, smoother than EMA
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp", "0070")
+def build_factor_0070() -> rt.FactorGraph:
+    """TsZscore(Div(Sub(close, TsWma(close, 30)), TsStd(close, 30)), 120)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    wma = g.add_rolling(Op.TS_WMA, c, 30)
+    dev = g.add_binary(Op.SUB, c, wma)
+    vol = g.add_rolling(Op.TS_STD, c, 30)
+    norm = g.add_binary(Op.DIV, dev, vol)
+    g.add_rolling(Op.TS_ZSCORE, norm, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  0071: Drawdown Intensity — distance from rolling high
+#    TsMaxDiff(close, w) = close - max(close, w) ≤ 0
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp", "0071")
+def build_factor_0071() -> rt.FactorGraph:
+    """TsZscore(TsMaxDiff(close, 60), 120)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    dd = g.add_rolling(Op.TS_MAX_DIFF, c, 60)
+    g.add_rolling(Op.TS_ZSCORE, dd, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  0072: Breakout Intensity — distance from rolling low
+#    TsMinDiff(close, w) = close - min(close, w) ≥ 0
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp", "0072")
+def build_factor_0072() -> rt.FactorGraph:
+    """Neg(TsRank(TsMinDiff(close, 60), 240))"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    bu = g.add_rolling(Op.TS_MIN_DIFF, c, 60)
+    ranked = g.add_rolling(Op.TS_RANK, bu, 240)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  0073: Range Oscillator — normalized range width
+#    TsMinmaxDiff(close, w) = max - min; wide range = volatile
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp", "0073")
+def build_factor_0073() -> rt.FactorGraph:
+    """Neg(TsZscore(Div(TsMinmaxDiff(close, 30), Ma(close, 30)), 120))"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    rng = g.add_rolling(Op.TS_MINMAX_DIFF, c, 30)
+    ma = g.add_rolling(Op.MA, c, 30)
+    norm_rng = g.add_binary(Op.DIV, rng, ma)
+    g.add_unary(Op.NEG, g.add_rolling(Op.TS_ZSCORE, norm_rng, 120))
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  0074: Variance Ratio — short vs long variance for mean-reversion
+#    Ratio < 1 hints at mean-reverting regime (Hurst < 0.5)
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp", "0074")
+def build_factor_0074() -> rt.FactorGraph:
+    """Sub(Div(TsVari(TsDiff(Log(close), 1), 10), TsVari(TsDiff(Log(close), 1), 60)), 1.0)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    logc = g.add_unary(Op.LOG, c)
+    ret1 = g.add_rolling(Op.TS_DIFF, logc, 1)
+    var_short = g.add_rolling(Op.TS_VARI, ret1, 10)
+    var_long = g.add_rolling(Op.TS_VARI, ret1, 60)
+    ratio = g.add_binary(Op.DIV, var_short, var_long)
+    g.add_scalar_op(Op.SUB_SCALAR, ratio, 1.0)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  0075: Treap-Optimized Volume Rank — O(log w) rank for large window
+#    Uses TREAP_TS_RANK for efficiency with w=720
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp", "0075")
+def build_factor_0075() -> rt.FactorGraph:
+    """Neg(TreapTsRank(Mul(TsDiff(Log(close), 1), SLog1p(volume)), 720))"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    v = g.add_input("volume")
+    logc = g.add_unary(Op.LOG, c)
+    ret1 = g.add_rolling(Op.TS_DIFF, logc, 1)
+    sv = g.add_unary(Op.SLOG1P, v)
+    vret = g.add_binary(Op.MUL, ret1, sv)
+    ranked = g.add_rolling(Op.TREAP_TS_RANK, vret, 720)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
