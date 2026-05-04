@@ -3,7 +3,7 @@ Benchmark: rolling_cov — C++ batch vs pandas, FactorGraph TS_COV push.
 
 Usage:
     cd FactorEngine
-    python tests/custom_kernels/ts_conv/bench_ts_cov.py
+    python tests/custom_kernels/ts_cov/bench_ts_cov.py
 """
 from __future__ import annotations
 

@@ -6,7 +6,7 @@ Layer B: FactorGraph TS_COV push streaming vs fe_ops.rolling_cov batch
 
 Usage:
     cd FactorEngine
-    pytest tests/custom_kernels/ts_conv/test_ts_cov_alignment.py -v
+    pytest tests/custom_kernels/ts_cov/test_ts_cov_alignment.py -v
 """
 from __future__ import annotations
 
