@@ -150,6 +150,10 @@ public:
     }
 
     int add_rolling(Op op, int src, int window) {
+        if (op == Op::TS_KURT && window < 4)
+            throw std::invalid_argument("TS_KURT requires window >= 4, got " + std::to_string(window));
+        if (op == Op::TS_SKEW && window < 3)
+            throw std::invalid_argument("TS_SKEW requires window >= 3, got " + std::to_string(window));
         FactorNode node;
         node.op = op;
         node.input_a = src;

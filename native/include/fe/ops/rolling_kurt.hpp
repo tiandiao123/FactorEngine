@@ -31,12 +31,12 @@ namespace fe::ops {
  * Requires window >= 4.
  */
 inline void rolling_kurt(const FeFloat* x, FeFloat* out, int n, int window) {
-  const auto t = static_cast<std::uint32_t>(window);
-  if (t < 4 || n <= 0) {
+  if (window < 4 || n <= 0) {
     for (int i = 0; i < n; ++i)
       out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
     return;
   }
+  const auto t = static_cast<std::uint32_t>(window);
 
   std::vector<FeFloat> ring(t);
   std::uint32_t pos = 0, count = 0, nan_count = 0;

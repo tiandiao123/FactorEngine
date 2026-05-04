@@ -130,6 +130,40 @@ class TestKurtBatchAlignment:
             _assert_aligned(py_out, cpp_out, BATCH_ATOL,
                             f"kurt(mono_{'up' if up else 'down'},w={w})")
 
+    @pytest.mark.parametrize("nan_ratio", [0.01, 0.05, 0.1])
+    @pytest.mark.parametrize("w", [10, 30, 60])
+    @pytest.mark.parametrize("seed", SEEDS)
+    def test_with_nans(self, seed, w, nan_ratio):
+        """NaN-injected series: C++ and pandas NaN positions must match."""
+        x = _random_series(n=2000, seed=seed, nan_ratio=nan_ratio)
+        py_out = _pandas_kurt(x, w)
+        cpp_out = np.asarray(fe_ops.rolling_kurt(x, w), dtype=np.float32)
+        py_nan = np.isnan(py_out)
+        cpp_nan = np.isnan(cpp_out)
+        assert np.array_equal(py_nan, cpp_nan), (
+            f"NaN position mismatch (w={w}, seed={seed}, nan_ratio={nan_ratio}): "
+            f"{int((py_nan != cpp_nan).sum())} positions differ"
+        )
+        valid = ~py_nan
+        if valid.sum() > 0:
+            max_diff = float(np.max(np.abs(py_out[valid] - cpp_out[valid])))
+            assert max_diff <= BATCH_ATOL, (
+                f"max_diff={max_diff:.2e} (w={w}, seed={seed}, nan_ratio={nan_ratio})"
+            )
+
+    def test_negative_window(self):
+        """Negative window → all NaN, no crash."""
+        x = _random_series(n=100, seed=42)
+        cpp_out = np.asarray(fe_ops.rolling_kurt(x, -5), dtype=np.float32)
+        assert np.all(np.isnan(cpp_out))
+
+    def test_graph_rejects_small_window(self):
+        """FactorGraph should reject TS_KURT with window < 4."""
+        g = rt.FactorGraph()
+        c = g.add_input("close")
+        with pytest.raises(Exception):
+            g.add_rolling(Op.TS_KURT, c, 2)
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Layer B: push streaming vs batch

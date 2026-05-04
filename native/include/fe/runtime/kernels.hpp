@@ -384,7 +384,7 @@ private:
 class TsKurtPush {
 public:
     explicit TsKurtPush(int window)
-        : t_(window >= 4 ? window : 4), ring_(t_), pos_(0), count_(0),
+        : t_(window), ring_(t_), pos_(0), count_(0),
           sum_(0.0), nan_count_(0) {}
 
     void push(FeFloat v) {
