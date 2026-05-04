@@ -6,7 +6,7 @@ runs.  OHLCV is derived from the aggTrade stream via TradesAccumulator.
 Binance Futures does NOT support 1s klines, so trades-only is the
 primary mode for high-frequency Binance data.
 
-Set testnet=True if the production Binance endpoint is blocked.
+Set testnet=True to use the Binance Futures testnet instead of production.
 """
 import logging
 import time
@@ -18,7 +18,7 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 
-TESTNET = True
+TESTNET = False
 
 engine = Engine(
     symbols=[

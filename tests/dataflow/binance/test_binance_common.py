@@ -49,9 +49,9 @@ class TestBuildCombinedStreamUrl:
 
     def test_single_stream(self):
         url = build_combined_stream_url(["btcusdt@aggTrade"])
-        assert url == "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade"
+        assert url == "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade"
 
     def test_multiple_streams(self):
         url = build_combined_stream_url(["btcusdt@aggTrade", "ethusdt@aggTrade"])
         assert "btcusdt@aggTrade/ethusdt@aggTrade" in url
-        assert url.startswith("wss://fstream.binance.com/stream?streams=")
+        assert url.startswith("wss://fstream.binance.com/market/stream?streams=")

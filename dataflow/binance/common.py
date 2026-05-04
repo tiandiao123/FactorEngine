@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import time
 
-BINANCE_FSTREAM_WS = "wss://fstream.binance.com/stream"
-BINANCE_FSTREAM_WS_SINGLE = "wss://fstream.binance.com/ws"
+# Production: /market prefix required since 2026 routing upgrade.
+# aggTrade, kline, markPrice etc. are "market streams" that only flow
+# through the /market route on production fstream.
+BINANCE_FSTREAM_WS = "wss://fstream.binance.com/market/stream"
+BINANCE_FSTREAM_WS_SINGLE = "wss://fstream.binance.com/market/ws"
 BINANCE_FSTREAM_REST = "https://fapi.binance.com"
 
+# Testnet: no /market prefix needed.
 BINANCE_TESTNET_WS = "wss://stream.binancefuture.com/stream"
 BINANCE_TESTNET_WS_SINGLE = "wss://stream.binancefuture.com/ws"
 BINANCE_TESTNET_REST = "https://testnet.binancefuture.com"
@@ -59,7 +63,7 @@ def build_combined_stream_url(
     """Build a Binance combined stream URL.
 
     ``["btcusdt@aggTrade", "ethusdt@aggTrade"]``
-    → ``"wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/ethusdt@aggTrade"``
+    → ``"wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/ethusdt@aggTrade"``
     """
     base = BINANCE_TESTNET_WS if testnet else BINANCE_FSTREAM_WS
     return f"{base}?streams={'/'.join(stream_names)}"
