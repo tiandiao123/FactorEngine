@@ -23,7 +23,7 @@ import fe_runtime as rt
 Op = rt.Op
 
 SEEDS = [42, 123, 999]
-WINDOWS = [5, 10, 30, 60, 120]
+WINDOWS = [2, 5, 10, 30, 60, 120]
 N = 5000
 BATCH_ATOL = 1e-3
 PUSH_ATOL = 1e-5

@@ -320,10 +320,10 @@ private:
     double sx_, sy_, sxy_;
 };
 
-// --------------- Beta (rolling OLS slope, push-level) ---------------
-class BetaPush {
+// --------------- Shared OLS statistics (sx, sy, sxx, sxy) ---------------
+class OlsStatsPush {
 public:
-    explicit BetaPush(int window)
+    explicit OlsStatsPush(int window)
         : t_(window), rx_(t_), ry_(t_),
           pos_(0), count_(0), nan_count_(0),
           sx_(0), sy_(0), sxx_(0), sxy_(0) {}
@@ -351,6 +351,23 @@ public:
     }
 
     [[nodiscard]] bool ready() const { return count_ >= t_ && nan_count_ == 0; }
+    void reset() {
+        pos_ = 0; count_ = 0; nan_count_ = 0;
+        sx_ = sy_ = sxx_ = sxy_ = 0.0;
+    }
+
+protected:
+    int t_;
+    std::vector<FeFloat> rx_, ry_;
+    int pos_, count_, nan_count_;
+    double sx_, sy_, sxx_, sxy_;
+};
+
+// --------------- Beta (rolling OLS slope, push-level) ---------------
+class BetaPush : public OlsStatsPush {
+public:
+    explicit BetaPush(int window) : OlsStatsPush(window) {}
+
     [[nodiscard]] FeFloat output() const {
         if (!ready()) return kNaN;
         double dn = static_cast<double>(t_);
@@ -359,49 +376,13 @@ public:
         double cov_xy = dn * sxy_ - sx_ * sy_;
         return static_cast<FeFloat>(cov_xy / var_x);
     }
-    void reset() {
-        pos_ = 0; count_ = 0; nan_count_ = 0;
-        sx_ = sy_ = sxx_ = sxy_ = 0.0;
-    }
-
-private:
-    int t_;
-    std::vector<FeFloat> rx_, ry_;
-    int pos_, count_, nan_count_;
-    double sx_, sy_, sxx_, sxy_;
 };
 
 // --------------- Intercept (rolling OLS intercept, push-level) ---------------
-class InterceptPush {
+class InterceptPush : public OlsStatsPush {
 public:
-    explicit InterceptPush(int window)
-        : t_(window), rx_(t_), ry_(t_),
-          pos_(0), count_(0), nan_count_(0),
-          sx_(0), sy_(0), sxx_(0), sxy_(0) {}
+    explicit InterceptPush(int window) : OlsStatsPush(window) {}
 
-    void push(FeFloat xv, FeFloat yv) {
-        bool cur_nan = fe_is_nan(xv) || fe_is_nan(yv);
-        if (count_ >= t_) {
-            FeFloat ox = rx_[pos_ % t_], oy = ry_[pos_ % t_];
-            bool old_nan = fe_is_nan(ox) || fe_is_nan(oy);
-            if (old_nan) { --nan_count_; }
-            else {
-                double dx = static_cast<double>(ox), dy = static_cast<double>(oy);
-                sx_ -= dx; sy_ -= dy; sxx_ -= dx * dx; sxy_ -= dx * dy;
-            }
-        }
-        rx_[pos_ % t_] = xv;
-        ry_[pos_ % t_] = yv;
-        if (cur_nan) { ++nan_count_; }
-        else {
-            double dx = static_cast<double>(xv), dy = static_cast<double>(yv);
-            sx_ += dx; sy_ += dy; sxx_ += dx * dx; sxy_ += dx * dy;
-        }
-        ++pos_;
-        if (count_ < t_) ++count_;
-    }
-
-    [[nodiscard]] bool ready() const { return count_ >= t_ && nan_count_ == 0; }
     [[nodiscard]] FeFloat output() const {
         if (!ready()) return kNaN;
         double dn = static_cast<double>(t_);
@@ -411,16 +392,6 @@ public:
         double beta = cov_xy / var_x;
         return static_cast<FeFloat>((sy_ - beta * sx_) / dn);
     }
-    void reset() {
-        pos_ = 0; count_ = 0; nan_count_ = 0;
-        sx_ = sy_ = sxx_ = sxy_ = 0.0;
-    }
-
-private:
-    int t_;
-    std::vector<FeFloat> rx_, ry_;
-    int pos_, count_, nan_count_;
-    double sx_, sy_, sxx_, sxy_;
 };
 
 // --------------- Autocorr (composite: Delay + Corr) ---------------
