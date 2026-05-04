@@ -87,7 +87,7 @@ class TradesAccumulator:
         sz : float
             Trade size (contracts / coins).
         side : str
-            ``"buy"`` or ``"sell"`` — the aggressor side provided by OKX.
+            ``"buy"`` or ``"sell"`` — the aggressor side.
         """
         with self._lock:
             self._sum_pv += px * sz

@@ -70,10 +70,5 @@ def get_ws_single_url(*, testnet: bool = False) -> str:
     return BINANCE_TESTNET_WS_SINGLE if testnet else BINANCE_FSTREAM_WS_SINGLE
 
 
-def chunk(lst: list, size: int):
-    for idx in range(0, len(lst), size):
-        yield lst[idx : idx + size]
-
-
 def now_ms() -> int:
     return int(time.time() * 1000)

@@ -86,11 +86,11 @@ class BinanceTradesCollector(BaseCollector):
             )
 
             streams = [f"{s}@aggTrade" for s in symbols]
-            for batch in self._chunk(streams, SUBS_BATCH_SIZE):
+            for batch_id, batch in enumerate(self._chunk(streams, SUBS_BATCH_SIZE), start=1):
                 await ws.send_json({
                     "method": "SUBSCRIBE",
                     "params": list(batch),
-                    "id": 1,
+                    "id": batch_id,
                 })
 
             async for msg in ws:

@@ -154,7 +154,7 @@ class BinanceKlineWorker:
 
     async def _run(self):
         collector = BinanceKlineCollector(
-            symbols=self._unified_symbols,
+            symbols=self.symbols,
             on_candle=self._on_candle,
             interval=self._interval,
             testnet=self._testnet,
@@ -164,7 +164,3 @@ class BinanceKlineWorker:
             await collector.run()
         except asyncio.CancelledError:
             pass
-
-    @property
-    def _unified_symbols(self) -> list[str]:
-        return self.symbols

@@ -67,10 +67,10 @@ class BinanceTradesWorker:
         from the accumulator's OHLCV fields so ``Engine._runtime_loop`` can
         process them identically to kline-sourced bars.
         """
-        ts_ms = time.time() * 1000
+        ts_ms = int(time.time() * 1000)
         if self._freq_ms > 0:
-            ts_ms = ts_ms - (ts_ms % self._freq_ms)
-        ts_ms = int(ts_ms)
+            freq_ms = int(self._freq_ms)
+            ts_ms = ts_ms - (ts_ms % freq_ms)
 
         round_bars: dict[str, np.ndarray] = {}
         round_trades: dict[str, dict] = {}
