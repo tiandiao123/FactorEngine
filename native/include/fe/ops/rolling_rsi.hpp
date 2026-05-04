@@ -68,8 +68,8 @@ class RsiKernel {
 
   [[nodiscard]] FeFloat output() const {
     if (!initialized_) return std::numeric_limits<FeFloat>::quiet_NaN();
-    if (avg_loss_ < 1e-15) {
-      return (avg_gain_ < 1e-15) ? 50.0f : 100.0f;
+    if (avg_loss_ < kRsiLossEps) {
+      return (avg_gain_ < kRsiLossEps) ? 50.0f : 100.0f;
     }
     double rs = avg_gain_ / avg_loss_;
     return static_cast<FeFloat>(100.0 - 100.0 / (1.0 + rs));

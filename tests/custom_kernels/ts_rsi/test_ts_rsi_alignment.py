@@ -102,10 +102,22 @@ class TestRsiEdgeCases:
         result = fe_ops.rolling_rsi(x, -1)
         assert np.isnan(result).all()
 
+    def test_window_0_returns_nan(self):
+        x = np.arange(20, dtype=np.float32) + 1.0
+        result = fe_ops.rolling_rsi(x, 0)
+        assert np.isnan(result).all()
+
     def test_window_1_returns_nan(self):
         x = np.arange(20, dtype=np.float32)
         result = fe_ops.rolling_rsi(x, 1)
         assert np.isnan(result).all()
+
+    def test_short_series_all_nan(self):
+        """When len(x) <= window, entire result should be NaN."""
+        for w in [5, 14, 30]:
+            x = np.arange(w, dtype=np.float32) + 1.0
+            result = fe_ops.rolling_rsi(x, w)
+            assert np.isnan(result).all(), f"w={w}: expected all NaN for len(x)==w"
 
     def test_graph_rejects_window_lt_2(self):
         g = rt.FactorGraph()
