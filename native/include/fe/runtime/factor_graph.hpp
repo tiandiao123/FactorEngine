@@ -51,7 +51,7 @@ enum class Op {
     DELAY, TS_DIFF, TS_PCT,
 
     // P2 bivariate / special
-    CORR, TS_COV, AUTOCORR, TS_MINMAX_DIFF, TS_SKEW, TS_KURT,
+    CORR, TS_COV, TS_BETA, AUTOCORR, TS_MINMAX_DIFF, TS_SKEW, TS_KURT,
 
     // P3 complex
     TS_MED, TS_MAD, TS_WMA, TS_MAX_DIFF, TS_MIN_DIFF,
@@ -84,6 +84,7 @@ using KernelVar = std::variant<
     TsPctComposite,                         // composite: Delay
     CorrPush,                               // new: push-level Pearson
     CovPush,                                // push-level sample covariance
+    BetaPush,                               // push-level OLS slope
     AutocorrPush,                           // composite: Delay + Corr
     TsMinMaxDiffPush,                       // new: dual monotonic deque
     TsSkewPush,                             // new: brute-force O(t)
@@ -164,9 +165,9 @@ public:
     }
 
     int add_bivariate(Op op, int src_a, int src_b, int window) {
-        if ((op == Op::TS_COV || op == Op::CORR) && window < 2)
+        if ((op == Op::TS_COV || op == Op::CORR || op == Op::TS_BETA) && window < 2)
             throw std::invalid_argument(
-                std::string(op == Op::TS_COV ? "TS_COV" : "CORR") +
+                std::string(op_name(op)) +
                 " requires window >= 2, got " + std::to_string(window));
         FactorNode node;
         node.op = op;
@@ -290,6 +291,7 @@ public:
             // ── P2 bivariate / special ──
             case Op::CORR:     { auto& k = std::get<CorrPush>(nd.kernel);            k.push(a, b); values_[i] = k.output(); break; }
             case Op::TS_COV:   { auto& k = std::get<CovPush>(nd.kernel);             k.push(a, b); values_[i] = k.output(); break; }
+            case Op::TS_BETA:  { auto& k = std::get<BetaPush>(nd.kernel);            k.push(a, b); values_[i] = k.output(); break; }
             case Op::AUTOCORR: { auto& k = std::get<AutocorrPush>(nd.kernel);        k.push(a);    values_[i] = k.output(); break; }
             case Op::TS_MINMAX_DIFF: { auto& k = std::get<TsMinMaxDiffPush>(nd.kernel); k.push(a); values_[i] = k.output(); break; }
             case Op::TS_SKEW:  { auto& k = std::get<TsSkewPush>(nd.kernel);          k.push(a); values_[i] = k.output(); break; }
@@ -398,6 +400,7 @@ private:
         case Op::PCT_CHANGE: return "PCT_CHANGE";
         case Op::CORR:     return "CORR";
         case Op::TS_COV:   return "TS_COV";
+        case Op::TS_BETA:  return "TS_BETA";
         case Op::AUTOCORR: return "AUTOCORR";
         case Op::TS_MINMAX_DIFF: return "TS_MINMAX_DIFF";
         case Op::TS_SKEW:  return "TS_SKEW";
@@ -423,7 +426,7 @@ private:
         case Op::MA: case Op::TS_SUM: case Op::TS_STD: case Op::TS_VARI:
         case Op::EMA: case Op::TS_MIN: case Op::TS_MAX:
         case Op::TS_RANK: case Op::TREAP_TS_RANK: case Op::TS_ZSCORE:
-        case Op::CORR: case Op::TS_COV: case Op::TS_MINMAX_DIFF: case Op::TS_SKEW: case Op::TS_KURT:
+        case Op::CORR: case Op::TS_COV: case Op::TS_BETA: case Op::TS_MINMAX_DIFF: case Op::TS_SKEW: case Op::TS_KURT:
         case Op::TS_MED: case Op::TS_MAD: case Op::TS_WMA:
         case Op::TS_MAX_DIFF: case Op::TS_MIN_DIFF:
             return nd.window;
@@ -455,6 +458,7 @@ private:
         case Op::PCT_CHANGE: return TsPctComposite(nd.window);
         case Op::CORR:     return CorrPush(nd.window);
         case Op::TS_COV:   return CovPush(nd.window);
+        case Op::TS_BETA:  return BetaPush(nd.window);
         case Op::AUTOCORR: return AutocorrPush(nd.window, static_cast<int>(nd.scalar));
         case Op::TS_MINMAX_DIFF: return TsMinMaxDiffPush(nd.window);
         case Op::TS_SKEW:  return TsSkewPush(nd.window);
