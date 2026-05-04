@@ -178,6 +178,9 @@ public:
         if ((op == Op::TS_CV || op == Op::TS_NORM || op == Op::TS_RSI || op == Op::TS_CCI) && window < 2)
             throw std::invalid_argument(
                 std::string(op_name(op)) + " requires window >= 2, got " + std::to_string(window));
+        if ((op == Op::TS_SUM_POS || op == Op::TS_POS_RATIO || op == Op::TS_UP_DOWN_RATIO) && window < 1)
+            throw std::invalid_argument(
+                std::string(op_name(op)) + " requires window >= 1, got " + std::to_string(window));
         FactorNode node;
         node.op = op;
         node.input_a = src;
