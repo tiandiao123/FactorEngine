@@ -71,6 +71,7 @@ PYBIND11_MODULE(fe_runtime, m) {
         .value("TS_NORM",        Op::TS_NORM)
         // P2c momentum / technical
         .value("TS_RSI",         Op::TS_RSI)
+        .value("TS_CCI",         Op::TS_CCI)
         // P3
         .value("TS_MED",      Op::TS_MED)
         .value("TS_MAD",      Op::TS_MAD)

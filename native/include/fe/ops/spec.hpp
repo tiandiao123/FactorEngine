@@ -9,6 +9,8 @@ namespace fe::ops {
 inline constexpr float kEps = 1e-8f;
 inline constexpr double kCvMeanEps = 1e-12;
 inline constexpr double kRsiLossEps = 1e-15;
+inline constexpr double kCciLambert = 0.015;
+inline constexpr double kCciMadEps = 1e-12;
 
 using FeFloat = float;
 

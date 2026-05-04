@@ -28,6 +28,7 @@
 #include "fe/ops/shift.hpp"
 #include "fe/ops/bivariate.hpp"
 #include "fe/ops/rolling_rsi.hpp"
+#include "fe/ops/rolling_cci.hpp"
 
 namespace fe::runtime {
 
@@ -161,6 +162,9 @@ using CosPush = fe::ops::RollingCosKernel;
 
 // --------------- TsRsi: alias to shared RsiKernel in rolling_rsi.hpp --------
 using RsiPush = fe::ops::RsiKernel;
+
+// --------------- TsCci: alias to shared CciKernel in rolling_cci.hpp --------
+using CciPush = fe::ops::CciKernel;
 
 // ═══════════════════════════════════════════════════════════════
 //  New push-level kernels (no class equivalent in ops/)

@@ -532,3 +532,71 @@ def build_net_vol_macd() -> rt.FactorGraph:
     g.add_rolling(Op.TS_ZSCORE, hist, 60)
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0029: Close CCI-14 — classic overbought/oversold indicator
+#    CCI > +100 → overbought; CCI < -100 → oversold
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0029")
+def build_close_cci_14() -> rt.FactorGraph:
+    """TsZscore(TsCci(close, 14), 120)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    cci = g.add_rolling(Op.TS_CCI, c, 14)
+    g.add_rolling(Op.TS_ZSCORE, cci, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0030: VWAP CCI-14 — CCI on execution price captures
+#    institutional-driven overbought/oversold
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0030")
+def build_vwap_cci_14() -> rt.FactorGraph:
+    """Neg(TsRank(TsCci(vwap, 14), 120))"""
+    g = rt.FactorGraph()
+    vw = g.add_input("vwap")
+    cci = g.add_rolling(Op.TS_CCI, vw, 14)
+    ranked = g.add_rolling(Op.TS_RANK, cci, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0031: Short CCI-5 — fast mean-reversion signal
+#    Short window captures rapid price deviations from recent mean
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0031")
+def build_close_cci_5() -> rt.FactorGraph:
+    """TsZscore(TsCci(close, 5), 60)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    cci = g.add_rolling(Op.TS_CCI, c, 5)
+    g.add_rolling(Op.TS_ZSCORE, cci, 60)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0032: CCI Divergence — spread between close CCI and VWAP CCI
+#    Divergence signals institutional vs retail positioning
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0032")
+def build_cci_divergence() -> rt.FactorGraph:
+    """TsZscore(Sub(TsCci(close, 14), TsCci(vwap, 14)), 120)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    vw = g.add_input("vwap")
+    cci_close = g.add_rolling(Op.TS_CCI, c, 14)
+    cci_vwap = g.add_rolling(Op.TS_CCI, vw, 14)
+    div = g.add_binary(Op.SUB, cci_close, cci_vwap)
+    g.add_rolling(Op.TS_ZSCORE, div, 120)
+    g.compile()
+    return g

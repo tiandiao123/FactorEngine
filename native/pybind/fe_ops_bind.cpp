@@ -21,6 +21,7 @@
 #include "fe/ops/rolling_cv.hpp"
 #include "fe/ops/rolling_norm.hpp"
 #include "fe/ops/rolling_rsi.hpp"
+#include "fe/ops/rolling_cci.hpp"
 
 namespace py = pybind11;
 using fe::ops::FeFloat;
@@ -177,6 +178,7 @@ PYBIND11_MODULE(fe_ops, m) {
     // P2c momentum / technical
     m.def("rolling_rsi",   [](NpArray x, int w) { return py_rolling(fe::ops::rolling_rsi, x, w); },   py::arg("x"), py::arg("window"));
     m.def("rolling_growth",[](NpArray x, int w) { return py_rolling(fe::ops::ts_growth, x, w); },     py::arg("x"), py::arg("window"));
+    m.def("rolling_cci",   [](NpArray x, int w) { return py_rolling(fe::ops::rolling_cci, x, w); },   py::arg("x"), py::arg("window"));
 
     // P3 rolling median / MAD
     m.def("rolling_median", [](NpArray x, int w) { return py_rolling(fe::ops::rolling_median, x, w); }, py::arg("x"), py::arg("window"));
