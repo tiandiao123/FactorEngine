@@ -67,7 +67,7 @@ setup(
     name="factorengine",
     version="0.1.0",
     description="Real-time factor computation engine with C++ kernels",
-    author="tiandiao123",
+    author="lcq_dev (tiandiao123)",
     url="https://github.com/tiandiao123/FactorEngine",
     packages=find_packages(),
     python_requires=">=3.11",

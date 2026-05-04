@@ -4,10 +4,18 @@ Engine is the single entry point: it owns the Dataflow thread, optionally
 runs a separate factor inference thread, and exposes get_data() /
 get_factor_outputs() for pulling snapshots.
 
-Architecture (v3 — streaming, 3 threads):
+Architecture (v4 — ClockDriver unified flush):
 
-    [dataflow thread]  okx-kline / sim-bars
-        WS candle / synthetic bar → bar_queue.put()
+    [dataflow thread(s)]  — each worker collects data independently
+        okx-kline  → KlineWorker   (WS → adapter → publisher buffer)
+        okx-trades → TradesWorker  (WS → per-symbol accumulators)
+
+    [clock-driver thread]  — unified flush & aggregation
+        ClockDriver(freq=5s)
+          every tick:
+            kline_data  = kline_worker.flush()
+            trades_data = trades_worker.flush()
+            → aggregate → bar_queue.put((merged_bars, merged_trades))
 
     [runtime thread]  factor-infer
         bar_queue.get() → push_bars (C++ parallel) → signal_deque.append()
@@ -16,9 +24,18 @@ Architecture (v3 — streaming, 3 threads):
         get_factor_outputs() → signal_deque[-1]   (O(1), no compute)
         get_data()           → debug BarCache.snapshot() (copy, optional)
 
-Usage (live with factors):
+data_source modes:
+    "kline"        — kline WS only (default, backward compatible)
+    "trades"       — trades WS only; ClockDriver flushes trades
+    "kline_trades" — both kline + trades WS, ClockDriver flushes both
+
+In all live modes with factor_group, ClockDriver is the single component
+that pushes aggregated data to bar_queue.  Workers never touch bar_queue.
+
+Usage (live with kline + trades factors):
     engine = Engine(symbols=["BTC-USDT-SWAP"], mode="live", data_freq="5s",
-                    factor_group="okx_perp", num_threads=4)
+                    factor_group=["okx_perp", "okx_perp_trades"],
+                    num_threads=4, data_source="kline_trades")
     engine.start()
     time.sleep(30)
     factors = engine.get_factor_outputs()
@@ -61,6 +78,8 @@ def parse_freq(freq: str) -> int:
 class Engine:
     """Top-level entry point. Owns the dataflow manager and shared bar cache."""
 
+    _VALID_DATA_SOURCES = ("kline", "trades", "kline_trades")
+
     def __init__(
         self,
         symbols: list[str],
@@ -70,75 +89,67 @@ class Engine:
         mode: str = "live",
         sim_bar_interval: float | None = None,
         sim_seed: int | None = None,
-        factor_group: str | None = None,
+        factor_group: str | list[str] | None = None,
         num_threads: int = 4,
         signal_buffer_size: int = 3,
         bar_queue_size: int = 16,
         bar_queue_timeout: float = 0.5,
         enable_debug_cache: bool = True,
+        data_source: str = "kline",
     ):
+        if data_source not in self._VALID_DATA_SOURCES:
+            raise ValueError(
+                f"Invalid data_source: {data_source!r}. "
+                f"Use one of {self._VALID_DATA_SOURCES}"
+            )
+
         self.symbols = symbols
         self.data_freq = data_freq
         self.pull_interval = pull_interval
         self.bar_window_length = bar_window_length
         self.mode = mode
+        self._data_source = data_source
 
         self.data_freq_seconds = parse_freq(data_freq)
         self.pull_interval_seconds = parse_freq(pull_interval)
 
+        # Normalize factor_group to list.
+        if isinstance(factor_group, str):
+            self._factor_groups: list[str] = [factor_group]
+        elif isinstance(factor_group, list):
+            self._factor_groups = list(factor_group)
+        else:
+            self._factor_groups = []
+        self._factor_group = factor_group
+
         # C++ factor inference engine (optional).
         self._inference = None
-        self._factor_group = factor_group
         self._num_threads = num_threads
         self._factor_ids: list[str] = []
         self._signal_deque: deque[dict] = deque(maxlen=signal_buffer_size)
         self._prev_closes: dict[str, float] = {}
         self._bars_pushed = 0
+        self._last_bar_debug: dict | None = None
 
-        # Inter-thread communication: dataflow → runtime.
+        # Inter-thread communication: ClockDriver → runtime.
         self._bar_queue: queue.Queue | None = None
         self._bar_queue_timeout = bar_queue_timeout
         self._runtime_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
-        if factor_group:
-            self._init_inference(factor_group, num_threads)
+        if self._factor_groups:
+            self._init_inference(self._factor_groups, num_threads)
             self._bar_queue = queue.Queue(maxsize=bar_queue_size)
 
         # Debug bar cache (optional, not on the main compute path).
         self._debug_cache = None
         self._kline_worker = None
+        self._trades_worker = None
+        self._clock_driver = None
         self._dataflow = None
 
         if mode == "live":
-            from dataflow.cache import BarCache
-
-            bar_channel, _ = resolve_bar_channel(self.data_freq_seconds)
-            logger.info(
-                "Live mode: data_freq=%s (%ds) → channel=%s, factors=%s",
-                data_freq, self.data_freq_seconds, bar_channel,
-                factor_group or "none",
-            )
-
-            if enable_debug_cache:
-                self._debug_cache = BarCache(window_length=bar_window_length)
-
-            if self._bar_queue is not None:
-                from dataflow.okx.kline.worker import KlineWorker
-
-                self._kline_worker = KlineWorker(
-                    symbols=symbols,
-                    bar_queue=self._bar_queue,
-                    freq_seconds=self.data_freq_seconds,
-                    debug_cache=self._debug_cache,
-                )
-            else:
-                logger.info(
-                    "Live mode without factor_group: KlineWorker not started "
-                    "(no bar_queue consumer). Use get_data() is unavailable "
-                    "without a streaming data source.",
-                )
-
+            self._init_live(data_source, symbols, enable_debug_cache)
         elif mode == "simulation":
             from dataflow.simulation.manager import SimDataflowManager
             self._dataflow = SimDataflowManager(
@@ -157,37 +168,101 @@ class Engine:
         else:
             raise ValueError(f"Unknown mode: {mode!r}. Use 'live' or 'simulation'.")
 
+    def _init_live(self, data_source: str, symbols: list[str], enable_debug_cache: bool):
+        """Wire up live mode workers and ClockDriver."""
+        from dataflow.cache import BarCache
+
+        bar_channel, _ = resolve_bar_channel(self.data_freq_seconds)
+        logger.info(
+            "Live mode: data_freq=%s (%ds) → channel=%s, factors=%s, data_source=%s",
+            self.data_freq, self.data_freq_seconds, bar_channel,
+            self._factor_group or "none", data_source,
+        )
+
+        if enable_debug_cache:
+            self._debug_cache = BarCache(window_length=self.bar_window_length)
+
+        # ── Create workers based on data_source ──
+        if data_source in ("kline", "kline_trades"):
+            from dataflow.okx.kline.worker import KlineWorker
+
+            self._kline_worker = KlineWorker(
+                symbols=symbols,
+                freq_seconds=self.data_freq_seconds,
+                debug_cache=self._debug_cache,
+            )
+
+        if data_source in ("trades", "kline_trades"):
+            from dataflow.okx.trades.worker import TradesWorker
+
+            self._trades_worker = TradesWorker(symbols=symbols)
+            self._trades_worker.set_freq(self.data_freq_seconds)
+
+        # ── ClockDriver: unified flush & aggregation ──
+        if self._bar_queue is not None:
+            from dataflow.clock_driver import ClockDriver
+
+            self._clock_driver = ClockDriver(
+                freq_seconds=self.data_freq_seconds,
+                bar_queue=self._bar_queue,
+            )
+
+            if self._kline_worker is not None:
+                self._clock_driver.register("kline", self._kline_worker)
+            if self._trades_worker is not None:
+                self._clock_driver.register("trades", self._trades_worker)
+        else:
+            logger.info(
+                "Live mode without factor_group: ClockDriver not created "
+                "(no bar_queue consumer).",
+            )
+
     # ── Factor inference ──────────────────────────────────────
 
-    def _init_inference(self, group: str, num_threads: int):
+    def _init_inference(self, groups: list[str], num_threads: int):
         import fe_runtime as rt
         from factorengine.factors import FactorRegistry
 
         reg = FactorRegistry()
-        reg.load_group(group)
-        self._factor_ids = reg.factor_ids_by_group(group)
+        for group in groups:
+            reg.load_group(group)
 
         self._inference = rt.InferenceEngine(num_threads=num_threads)
         for sym in self.symbols:
             self._inference.add_symbol(sym)
-            for fid, graph in reg.build_group(group).items():
-                self._inference.add_factor(sym, fid, graph)
+            for group in groups:
+                graphs = reg.build_group(group)
+                for fid, graph in graphs.items():
+                    self._inference.add_factor(sym, fid, graph)
+
+        self._factor_ids = []
+        for group in groups:
+            self._factor_ids.extend(reg.factor_ids_by_group(group))
+        self._factor_ids.sort()
 
         logger.info(
-            "InferenceEngine initialized: %d symbols × %d factors, %d threads",
-            len(self.symbols), len(self._factor_ids), num_threads,
+            "InferenceEngine initialized: %d symbols × %d factors (%s), %d threads",
+            len(self.symbols), len(self._factor_ids),
+            "+".join(groups), num_threads,
         )
 
     def _runtime_loop(self):
         """Runtime thread main loop: pull bars from queue, infer, write deque."""
         import fe_runtime as rt
 
+        nan = float("nan")
         logger.info("factor-infer thread started")
         while not self._stop_event.is_set():
             try:
-                round_bars = self._bar_queue.get(timeout=self._bar_queue_timeout)
+                payload = self._bar_queue.get(timeout=self._bar_queue_timeout)
             except queue.Empty:
                 continue
+
+            # Unpack: ClockDriver sends (round_bars, round_trades | None).
+            if isinstance(payload, tuple):
+                round_bars, round_trades = payload
+            else:
+                round_bars, round_trades = payload, None
 
             ts_ms = 0
             batch: dict[str, rt.BarData] = {}
@@ -199,12 +274,45 @@ class Engine:
                 high = float(bar[2])
                 low = float(bar[3])
                 prev_close = self._prev_closes.get(sym, close)
-                ret = (close / prev_close - 1.0) if prev_close != 0 else 0.0
-                batch[sym] = rt.BarData(close, volume, open_, high, low, ret)
-                self._prev_closes[sym] = close
+                if close != close or prev_close != prev_close:
+                    ret = 0.0
+                elif prev_close != 0:
+                    ret = close / prev_close - 1.0
+                else:
+                    ret = 0.0
+                if close == close:
+                    self._prev_closes[sym] = close
+
+                vwap = nan
+                buy_vol = nan
+                sell_vol = nan
+                if round_trades:
+                    trades = round_trades.get(sym)
+                    if trades:
+                        vwap = trades.get("vwap", nan)
+                        buy_vol = trades.get("buy_vol", nan)
+                        sell_vol = trades.get("sell_vol", nan)
+
+                batch[sym] = rt.BarData(
+                    close, volume, open_, high, low, ret,
+                    vwap, buy_vol, sell_vol,
+                )
 
             self._inference.push_bars(batch)
             self._bars_pushed += 1
+
+            self._last_bar_debug = {
+                "ts": ts_ms,
+                "bar_index": self._bars_pushed,
+                "bars": {
+                    sym: {
+                        "open": bd.open, "high": bd.high, "low": bd.low,
+                        "close": bd.close, "volume": bd.volume, "ret": bd.ret,
+                        "vwap": bd.vwap, "buy_vol": bd.buy_vol, "sell_vol": bd.sell_vol,
+                    }
+                    for sym, bd in batch.items()
+                },
+            }
 
             result = self._inference.get_all_outputs()
             self._signal_deque.append({
@@ -247,6 +355,15 @@ class Engine:
         """Access the signal buffer (for advanced use / debugging)."""
         return self._signal_deque
 
+    @property
+    def last_bar_debug(self) -> dict | None:
+        """Last BarData batch sent to C++ InferenceEngine (for debugging).
+
+        Returns dict with keys: ts, bar_index, bars.
+        ``bars`` maps symbol → {open, high, low, close, volume, ret, vwap, buy_vol, sell_vol}.
+        """
+        return self._last_bar_debug
+
     # ── Dataflow API ──────────────────────────────────────────
 
     def start(self):
@@ -258,23 +375,34 @@ class Engine:
             )
             self._runtime_thread.start()
 
-        if self.mode == "live" and self._kline_worker is not None:
-            self._kline_worker.start()
+        if self.mode == "live":
+            if self._trades_worker is not None:
+                self._trades_worker.start()
+            if self._kline_worker is not None:
+                self._kline_worker.start()
+            if self._clock_driver is not None:
+                self._clock_driver.start()
         elif self._dataflow is not None:
             self._dataflow.start()
 
         logger.info(
             "Engine started: mode=%s, %d symbols, data_freq=%s (%ds), "
-            "bar_window=%d, factors=%s",
+            "bar_window=%d, factors=%s, data_source=%s",
             self.mode, len(self.symbols), self.data_freq,
             self.data_freq_seconds, self.bar_window_length,
-            self._factor_group or "none",
+            "+".join(self._factor_groups) if self._factor_groups else "none",
+            self._data_source,
         )
 
     def stop(self):
         """Stop the dataflow collection and inference thread."""
-        if self.mode == "live" and self._kline_worker is not None:
-            self._kline_worker.stop()
+        if self.mode == "live":
+            if self._clock_driver is not None:
+                self._clock_driver.stop()
+            if self._kline_worker is not None:
+                self._kline_worker.stop()
+            if self._trades_worker is not None:
+                self._trades_worker.stop()
         elif self._dataflow is not None:
             self._dataflow.stop()
 
@@ -312,8 +440,30 @@ class Engine:
         return 0
 
     @property
+    def data_source(self) -> str:
+        """Active data source mode."""
+        return self._data_source
+
+    @property
     def kline_stats(self) -> dict[str, int]:
         """Live kline worker statistics (empty dict in simulation mode)."""
         if self._kline_worker is not None:
             return self._kline_worker.stats()
+        return {}
+
+    @property
+    def trades_stats(self) -> dict[str, int]:
+        """Live trades worker statistics (empty dict if not active)."""
+        if self._trades_worker is not None:
+            return self._trades_worker.stats()
+        return {}
+
+    @property
+    def clock_stats(self) -> dict[str, int]:
+        """ClockDriver statistics (empty dict if not active)."""
+        if self._clock_driver is not None:
+            return {
+                "clock_ticks": self._clock_driver.tick_count,
+                "clock_drops": self._clock_driver.drop_count,
+            }
         return {}

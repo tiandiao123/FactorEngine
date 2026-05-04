@@ -13,12 +13,15 @@ PYBIND11_MODULE(fe_runtime, m) {
 
     py::enum_<Op>(m, "Op")
         // Inputs
-        .value("INPUT_CLOSE",  Op::INPUT_CLOSE)
-        .value("INPUT_VOLUME", Op::INPUT_VOLUME)
-        .value("INPUT_OPEN",   Op::INPUT_OPEN)
-        .value("INPUT_HIGH",   Op::INPUT_HIGH)
-        .value("INPUT_LOW",    Op::INPUT_LOW)
-        .value("INPUT_RET",    Op::INPUT_RET)
+        .value("INPUT_CLOSE",    Op::INPUT_CLOSE)
+        .value("INPUT_VOLUME",  Op::INPUT_VOLUME)
+        .value("INPUT_OPEN",    Op::INPUT_OPEN)
+        .value("INPUT_HIGH",    Op::INPUT_HIGH)
+        .value("INPUT_LOW",     Op::INPUT_LOW)
+        .value("INPUT_RET",     Op::INPUT_RET)
+        .value("INPUT_VWAP",    Op::INPUT_VWAP)
+        .value("INPUT_BUY_VOL", Op::INPUT_BUY_VOL)
+        .value("INPUT_SELL_VOL",Op::INPUT_SELL_VOL)
         // P0 unary
         .value("NEG",    Op::NEG)
         .value("ABS",    Op::ABS)
@@ -91,11 +94,14 @@ PYBIND11_MODULE(fe_runtime, m) {
         .def("compile",       &FactorGraph::compile)
         .def("push_bar",      &FactorGraph::push_bar,
              py::arg("close"),
-             py::arg("volume") = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("open")   = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("high")   = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("low")    = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("ret")    = std::numeric_limits<float>::quiet_NaN())
+             py::arg("volume")   = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("open")     = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("high")     = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("low")      = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("ret")      = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("vwap")     = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("buy_vol")  = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("sell_vol") = std::numeric_limits<float>::quiet_NaN())
         .def("ready",         &FactorGraph::ready)
         .def("output",        &FactorGraph::output)
         .def("raw_output",    &FactorGraph::raw_output)
@@ -111,11 +117,14 @@ PYBIND11_MODULE(fe_runtime, m) {
              py::arg("factor_id"), py::arg("graph"))
         .def("push_bar",     &SymbolRunner::push_bar,
              py::arg("close"),
-             py::arg("volume") = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("open")   = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("high")   = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("low")    = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("ret")    = std::numeric_limits<float>::quiet_NaN())
+             py::arg("volume")   = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("open")     = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("high")     = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("low")      = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("ret")      = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("vwap")     = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("buy_vol")  = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("sell_vol") = std::numeric_limits<float>::quiet_NaN())
         .def("symbol",       &SymbolRunner::symbol)
         .def("num_factors",  &SymbolRunner::num_factors)
         .def("bars_pushed",  &SymbolRunner::bars_pushed)
@@ -127,20 +136,27 @@ PYBIND11_MODULE(fe_runtime, m) {
 
     py::class_<BarData>(m, "BarData")
         .def(py::init<>())
-        .def(py::init([](float c, float v, float o, float h, float l, float r) {
-            return BarData{c, v, o, h, l, r};
+        .def(py::init([](float c, float v, float o, float h, float l, float r,
+                         float vw, float bv, float sv) {
+            return BarData{c, v, o, h, l, r, vw, bv, sv};
         }), py::arg("close"),
-            py::arg("volume") = std::numeric_limits<float>::quiet_NaN(),
-            py::arg("open")   = std::numeric_limits<float>::quiet_NaN(),
-            py::arg("high")   = std::numeric_limits<float>::quiet_NaN(),
-            py::arg("low")    = std::numeric_limits<float>::quiet_NaN(),
-            py::arg("ret")    = std::numeric_limits<float>::quiet_NaN())
-        .def_readwrite("close",  &BarData::close)
-        .def_readwrite("volume", &BarData::volume)
-        .def_readwrite("open",   &BarData::open)
-        .def_readwrite("high",   &BarData::high)
-        .def_readwrite("low",    &BarData::low)
-        .def_readwrite("ret",    &BarData::ret);
+            py::arg("volume")   = std::numeric_limits<float>::quiet_NaN(),
+            py::arg("open")     = std::numeric_limits<float>::quiet_NaN(),
+            py::arg("high")     = std::numeric_limits<float>::quiet_NaN(),
+            py::arg("low")      = std::numeric_limits<float>::quiet_NaN(),
+            py::arg("ret")      = std::numeric_limits<float>::quiet_NaN(),
+            py::arg("vwap")     = std::numeric_limits<float>::quiet_NaN(),
+            py::arg("buy_vol")  = std::numeric_limits<float>::quiet_NaN(),
+            py::arg("sell_vol") = std::numeric_limits<float>::quiet_NaN())
+        .def_readwrite("close",    &BarData::close)
+        .def_readwrite("volume",   &BarData::volume)
+        .def_readwrite("open",     &BarData::open)
+        .def_readwrite("high",     &BarData::high)
+        .def_readwrite("low",      &BarData::low)
+        .def_readwrite("ret",      &BarData::ret)
+        .def_readwrite("vwap",     &BarData::vwap)
+        .def_readwrite("buy_vol",  &BarData::buy_vol)
+        .def_readwrite("sell_vol", &BarData::sell_vol);
 
     py::class_<InferenceEngine>(m, "InferenceEngine")
         .def(py::init<int>(), py::arg("num_threads") = 0)
@@ -149,11 +165,14 @@ PYBIND11_MODULE(fe_runtime, m) {
              py::arg("symbol"), py::arg("factor_id"), py::arg("graph"))
         .def("push_bar",       &InferenceEngine::push_bar,
              py::arg("symbol"), py::arg("close"),
-             py::arg("volume") = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("open")   = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("high")   = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("low")    = std::numeric_limits<float>::quiet_NaN(),
-             py::arg("ret")    = std::numeric_limits<float>::quiet_NaN())
+             py::arg("volume")   = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("open")     = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("high")     = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("low")      = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("ret")      = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("vwap")     = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("buy_vol")  = std::numeric_limits<float>::quiet_NaN(),
+             py::arg("sell_vol") = std::numeric_limits<float>::quiet_NaN())
         .def("push_bars", [](InferenceEngine& self,
                              const std::unordered_map<std::string, BarData>& bars) {
             py::gil_scoped_release release;

@@ -5,13 +5,16 @@ daemon thread that can be started / stopped by Engine.
 
 The thread runs an asyncio event loop for the WebSocket collector; the
 adapter and publisher are invoked synchronously inside the WS callback.
+
+KlineWorker exposes ``flush()`` for ClockDriver to retrieve the latest
+complete round of kline bars.  It does **not** know about trades,
+orderbook, or any other data source.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import queue
 import threading
 
 import numpy as np
@@ -25,14 +28,12 @@ logger = logging.getLogger(__name__)
 
 
 class KlineWorker:
-    """Daemon thread: OKX kline WS → adapter → publisher → bar_queue.
+    """Daemon thread: OKX kline WS → adapter → publisher.
 
     Parameters
     ----------
     symbols : list[str]
         Instruments to subscribe.
-    bar_queue : queue.Queue
-        Destination queue consumed by the Engine runtime thread.
     freq_seconds : int
         Target bar frequency in seconds (e.g. 5 for 5s bars).
     debug_cache : object, optional
@@ -43,7 +44,6 @@ class KlineWorker:
     def __init__(
         self,
         symbols: list[str],
-        bar_queue: queue.Queue,
         freq_seconds: int = 5,
         debug_cache=None,
     ):
@@ -55,7 +55,6 @@ class KlineWorker:
 
         self._adapter = KlineAdapter(freq_seconds=freq_seconds)
         self._publisher = KlinePublisher(
-            bar_queue=bar_queue,
             symbols=self.symbols,
             debug_cache=debug_cache,
             expected_interval_ms=freq_seconds * 1000,
@@ -66,6 +65,16 @@ class KlineWorker:
         self._thread: threading.Thread | None = None
         self._collector: OKXKlineCollector | None = None
         self._bar_count = 0
+
+    # ── flush interface (called by ClockDriver) ────────────────
+
+    def flush(self) -> dict[str, np.ndarray] | None:
+        """Return the latest complete round of kline bars.
+
+        Delegates to ``KlinePublisher.flush_for_clock()``.
+        Returns ``None`` if no data is available yet.
+        """
+        return self._publisher.flush_for_clock()
 
     # ── lifecycle ─────────────────────────────────────────────
 
@@ -88,17 +97,14 @@ class KlineWorker:
             self._loop.call_soon_threadsafe(self._cancel_loop)
         if self._thread is not None:
             self._thread.join(timeout=5)
-        self._publisher.flush()
         logger.info(
-            "KlineWorker stopped (bars=%d, rounds=%d, published=%d, "
-            "ffill=%d, dups=%d, gaps=%d, drops=%d)",
+            "KlineWorker stopped (bars=%d, rounds=%d, "
+            "ffill=%d, dups=%d, gaps=%d)",
             self._bar_count,
-            self._publisher.rounds_flushed,
-            self._publisher.bars_published,
+            self._publisher.rounds_completed,
             self._publisher.forward_fill_count,
             self._publisher.dup_count,
             self._publisher.gap_count,
-            self._publisher.drop_count,
         )
 
     # ── stats ─────────────────────────────────────────────────
@@ -137,9 +143,6 @@ class KlineWorker:
         try:
             self._loop.run_until_complete(self._run())
         except RuntimeError as exc:
-            # A RuntimeError is raised when the loop is stopped from outside
-            # (e.g. via call_soon_threadsafe during stop()); log at DEBUG so
-            # normal shutdown is not noisy, but unexpected errors are visible.
             logger.debug("KlineWorker event loop exited with RuntimeError: %s", exc)
         finally:
             pending = asyncio.all_tasks(self._loop)
