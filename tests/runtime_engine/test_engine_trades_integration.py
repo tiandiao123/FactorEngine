@@ -331,6 +331,21 @@ class TestTradesWorkerFlush:
         # vwap forward-filled from last known close (100.0)
         assert round_trades2["BTC"]["vwap"] == 100.0
 
+    def test_flush_no_prior_close_returns_nan(self):
+        """First flush with no trades ever → vwap and OHLC should be NaN."""
+        from dataflow.okx.trades.worker import TradesWorker
+
+        worker = TradesWorker(symbols=["BTC", "ETH"])
+        round_bars, round_trades = worker.flush()
+        for sym in ("BTC", "ETH"):
+            assert round_trades[sym]["trade_count"] == 0
+            assert math.isnan(round_trades[sym]["vwap"])
+            assert math.isnan(round_trades[sym]["open"])
+            assert math.isnan(round_trades[sym]["close"])
+            bar = round_bars[sym]
+            assert math.isnan(float(bar[1]))  # open
+            assert math.isnan(float(bar[4]))  # close
+
     def test_flush_count_increments(self):
         from dataflow.okx.trades.worker import TradesWorker
 
