@@ -15,7 +15,7 @@ from factorengine.factors import FactorRegistry
 
 N = 500
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
-NUM_FACTORS = 83  # total: 60 kline (okx_perp) + 23 trades (okx_perp_trades)
+NUM_FACTORS = 88  # total: 60 kline (okx_perp) + 28 trades (okx_perp_trades)
 NUM_KLINE_FACTORS = 60
 
 

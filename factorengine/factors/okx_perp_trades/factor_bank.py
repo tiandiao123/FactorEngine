@@ -429,3 +429,105 @@ def build_vwap_growth() -> rt.FactorGraph:
     g.add_unary(Op.NEG, ranked)
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0024: Close MACD Histogram — classic MACD(12,26,9) on close
+#    DIF = EMA(close,12) - EMA(close,26)
+#    DEA = EMA(DIF, 9)
+#    Histogram = DIF - DEA
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0024")
+def build_close_macd_hist() -> rt.FactorGraph:
+    """TsZscore(Sub(Sub(Ema(close,12),Ema(close,26)), Ema(Sub(Ema(close,12),Ema(close,26)),9)), 120)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    ema_fast = g.add_rolling(Op.EMA, c, 12)
+    ema_slow = g.add_rolling(Op.EMA, c, 26)
+    dif = g.add_binary(Op.SUB, ema_fast, ema_slow)
+    dea = g.add_rolling(Op.EMA, dif, 9)
+    hist = g.add_binary(Op.SUB, dif, dea)
+    g.add_rolling(Op.TS_ZSCORE, hist, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0025: Close MACD DIF — trend direction signal
+#    DIF > 0 = bullish, DIF < 0 = bearish
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0025")
+def build_close_macd_dif() -> rt.FactorGraph:
+    """TsRank(Sub(Ema(close,12), Ema(close,26)), 120)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    ema_fast = g.add_rolling(Op.EMA, c, 12)
+    ema_slow = g.add_rolling(Op.EMA, c, 26)
+    dif = g.add_binary(Op.SUB, ema_fast, ema_slow)
+    g.add_rolling(Op.TS_RANK, dif, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0026: Close MACD DEA — smoothed signal line
+#    DEA crossing zero = major trend reversal
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0026")
+def build_close_macd_dea() -> rt.FactorGraph:
+    """Neg(TsRank(Ema(Sub(Ema(close,12), Ema(close,26)), 9), 120))"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    ema_fast = g.add_rolling(Op.EMA, c, 12)
+    ema_slow = g.add_rolling(Op.EMA, c, 26)
+    dif = g.add_binary(Op.SUB, ema_fast, ema_slow)
+    dea = g.add_rolling(Op.EMA, dif, 9)
+    ranked = g.add_rolling(Op.TS_RANK, dea, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0027: VWAP MACD Histogram — MACD on execution price
+#    VWAP MACD captures institutional flow momentum
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0027")
+def build_vwap_macd_hist() -> rt.FactorGraph:
+    """TsZscore(Sub(Sub(Ema(vwap,12),Ema(vwap,26)), Ema(Sub(Ema(vwap,12),Ema(vwap,26)),9)), 120)"""
+    g = rt.FactorGraph()
+    v = g.add_input("vwap")
+    ema_fast = g.add_rolling(Op.EMA, v, 12)
+    ema_slow = g.add_rolling(Op.EMA, v, 26)
+    dif = g.add_binary(Op.SUB, ema_fast, ema_slow)
+    dea = g.add_rolling(Op.EMA, dif, 9)
+    hist = g.add_binary(Op.SUB, dif, dea)
+    g.add_rolling(Op.TS_ZSCORE, hist, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0028: Net Volume MACD — MACD on (buy_vol - sell_vol) flow
+#    Captures shifts in directional order flow momentum
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0028")
+def build_net_vol_macd() -> rt.FactorGraph:
+    """TsZscore(Sub(Sub(Ema(Sub(bv,sv),12),Ema(Sub(bv,sv),26)), Ema(Sub(Ema(Sub(bv,sv),12),Ema(Sub(bv,sv),26)),9)), 60)"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    net = g.add_binary(Op.SUB, bv, sv)
+    ema_fast = g.add_rolling(Op.EMA, net, 12)
+    ema_slow = g.add_rolling(Op.EMA, net, 26)
+    dif = g.add_binary(Op.SUB, ema_fast, ema_slow)
+    dea = g.add_rolling(Op.EMA, dif, 9)
+    hist = g.add_binary(Op.SUB, dif, dea)
+    g.add_rolling(Op.TS_ZSCORE, hist, 60)
+    g.compile()
+    return g
