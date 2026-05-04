@@ -328,7 +328,8 @@ class TestTradesWorkerFlush:
 
         _, round_trades2 = worker.flush()
         assert round_trades2["BTC"]["trade_count"] == 0
-        assert math.isnan(round_trades2["BTC"]["vwap"])
+        # vwap forward-filled from last known close (100.0)
+        assert round_trades2["BTC"]["vwap"] == 100.0
 
     def test_flush_count_increments(self):
         from dataflow.okx.trades.worker import TradesWorker

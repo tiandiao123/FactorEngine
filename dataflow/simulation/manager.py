@@ -7,7 +7,6 @@ live and simulation mode transparently.
 from __future__ import annotations
 
 import queue
-import threading
 
 import numpy as np
 
@@ -74,32 +73,8 @@ class SimDataflowManager:
     def get_bar_snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
         return self.bar_cache.snapshot(symbols)
 
-    def get_trade_snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
-        return {}
-
-    def get_book_snapshot(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
-        return {}
-
     # ---- counters ----
 
     @property
     def bar_count(self) -> int:
         return self._bar_worker.bar_count
-
-    @property
-    def trade_count(self) -> int:
-        return 0
-
-    @property
-    def book_count(self) -> int:
-        return 0
-
-    # ---- backward-compatible accessors ----
-
-    @property
-    def data_cache(self) -> dict[str, np.ndarray]:
-        return self.bar_cache.storage
-
-    @property
-    def lock(self) -> threading.Lock:
-        return self.bar_cache.lock
