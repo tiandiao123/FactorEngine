@@ -31,11 +31,15 @@ PYBIND11_MODULE(fe_runtime, m) {
         .value("SIGN",   Op::SIGN)
         .value("TANH",   Op::TANH)
         .value("SLOG1P", Op::SLOG1P)
+        .value("SQRT",      Op::SQRT)
+        .value("SIGN_SQRT", Op::SIGN_SQRT)
         // P0 binary
         .value("ADD", Op::ADD)
         .value("SUB", Op::SUB)
         .value("MUL", Op::MUL)
         .value("DIV", Op::DIV)
+        .value("FMAX", Op::FMAX)
+        .value("FMIN", Op::FMIN)
         // P0 scalar
         .value("ADD_SCALAR", Op::ADD_SCALAR)
         .value("SUB_SCALAR", Op::SUB_SCALAR)
@@ -71,6 +75,11 @@ PYBIND11_MODULE(fe_runtime, m) {
         .value("TS_NORM",        Op::TS_NORM)
         // P2c momentum / technical
         .value("TS_RSI",         Op::TS_RSI)
+        .value("TS_CCI",         Op::TS_CCI)
+        // P2d conditional rolling
+        .value("TS_SUM_POS",     Op::TS_SUM_POS)
+        .value("TS_POS_RATIO",       Op::TS_POS_RATIO)
+        .value("TS_UP_DOWN_RATIO", Op::TS_UP_DOWN_RATIO)
         // P3
         .value("TS_MED",      Op::TS_MED)
         .value("TS_MAD",      Op::TS_MAD)

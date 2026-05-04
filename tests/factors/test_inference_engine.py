@@ -15,7 +15,7 @@ from factorengine.factors import FactorRegistry
 
 N = 500
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
-NUM_FACTORS = 88  # total: 60 kline (okx_perp) + 28 trades (okx_perp_trades)
+NUM_FACTORS = 106  # total: 60 kline (okx_perp) + 46 trades (okx_perp_trades)
 NUM_KLINE_FACTORS = 60
 
 
@@ -71,6 +71,36 @@ class TestFactorRegistry:
         reg.load_all()
         g = reg.build("0001", group="okx_perp")
         assert g.num_nodes() == 5
+
+    @pytest.mark.parametrize("fid", [f"T{i:04d}" for i in range(29, 47)])
+    def test_trades_factor_registration_and_output(self, fid):
+        """Each new trades factor (T0029-T0038) must register, build, and produce output."""
+        reg = FactorRegistry()
+        reg.load_group("okx_perp_trades")
+        g = reg.build(fid, group="okx_perp_trades")
+        assert g.num_nodes() > 0
+        assert g.warmup_bars() > 0
+
+        rng = np.random.RandomState(7)
+        n = 300
+        close = 100.0 + np.cumsum(rng.randn(n) * 0.5).astype(np.float32)
+        ret = np.zeros(n, dtype=np.float32)
+        ret[1:] = close[1:] / close[:-1] - 1.0
+        volume = (1000 + rng.rand(n) * 5000).astype(np.float32)
+        vwap = close + rng.randn(n).astype(np.float32) * 0.1
+        buy_vol = volume * (0.4 + rng.rand(n) * 0.2).astype(np.float32)
+        sell_vol = volume - buy_vol
+
+        for i in range(n):
+            g.push_bar(
+                float(close[i]), float(volume[i]),
+                float(close[i]), float(close[i]), float(close[i]),
+                float(ret[i]), float(vwap[i]),
+                float(buy_vol[i]), float(sell_vol[i]),
+            )
+        out = g.output()
+        assert isinstance(out, float)
+        assert not np.isinf(out)
 
 
 class TestSymbolRunner:

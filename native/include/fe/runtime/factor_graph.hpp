@@ -36,10 +36,10 @@ enum class Op {
     INPUT_VWAP, INPUT_BUY_VOL, INPUT_SELL_VOL,
 
     // P0 unary (stateless)
-    NEG, ABS, LOG, SQR, INV, SIGN, TANH, SLOG1P,
+    NEG, ABS, LOG, SQR, INV, SIGN, TANH, SLOG1P, SQRT, SIGN_SQRT,
 
     // P0 binary (stateless)
-    ADD, SUB, MUL, DIV,
+    ADD, SUB, MUL, DIV, FMAX, FMIN,
 
     // P0 scalar ops: op(node, scalar) or op(scalar, node)
     ADD_SCALAR, SUB_SCALAR, MUL_SCALAR, DIV_SCALAR,
@@ -60,7 +60,10 @@ enum class Op {
     TS_MED, TS_MAD, TS_WMA, TS_MAX_DIFF, TS_MIN_DIFF,
 
     // P2c momentum / technical
-    TS_RSI,
+    TS_RSI, TS_CCI,
+
+    // P2d conditional rolling
+    TS_SUM_POS, TS_POS_RATIO, TS_UP_DOWN_RATIO,
 
     // Optimized variants
     TREAP_TS_RANK,  // O(log t) TsRank via Treap order-statistic tree
@@ -99,6 +102,10 @@ using KernelVar = std::variant<
     TsCvComposite,                          // composite: std/|mean|
     TsNormComposite,                        // composite: (x-min)/(max-min)
     RsiPush,                                // Wilder's RSI
+    CciPush,                                // Lambert's CCI
+    SumPosPush,                             // rolling sum of positives
+    PosRatioPush,                           // rolling positive ratio
+    UpDownRatioPush,                        // rolling up/down ratio
     TsSkewPush,                             // new: brute-force O(t)
     TsKurtPush,                             // new: brute-force O(t)
     TsMedPush,                              // new: sorted buffer
@@ -168,9 +175,12 @@ public:
             throw std::invalid_argument("TS_KURT requires window >= 4, got " + std::to_string(window));
         if (op == Op::TS_SKEW && window < 3)
             throw std::invalid_argument("TS_SKEW requires window >= 3, got " + std::to_string(window));
-        if ((op == Op::TS_CV || op == Op::TS_NORM || op == Op::TS_RSI) && window < 2)
+        if ((op == Op::TS_CV || op == Op::TS_NORM || op == Op::TS_RSI || op == Op::TS_CCI) && window < 2)
             throw std::invalid_argument(
                 std::string(op_name(op)) + " requires window >= 2, got " + std::to_string(window));
+        if ((op == Op::TS_SUM_POS || op == Op::TS_POS_RATIO || op == Op::TS_UP_DOWN_RATIO) && window < 1)
+            throw std::invalid_argument(
+                std::string(op_name(op)) + " requires window >= 1, got " + std::to_string(window));
         FactorNode node;
         node.op = op;
         node.input_a = src;
@@ -272,12 +282,16 @@ public:
             case Op::SIGN:   values_[i] = fe::ops::sign(a);    break;
             case Op::TANH:   values_[i] = fe::ops::tanh_op(a); break;
             case Op::SLOG1P: values_[i] = fe::ops::slog1p(a);  break;
+            case Op::SQRT:      values_[i] = fe::ops::sqrt_op(a);   break;
+            case Op::SIGN_SQRT: values_[i] = fe::ops::sign_sqrt(a); break;
 
             // ── P0 binary — direct calls to fe::ops scalar functions ──
             case Op::ADD: values_[i] = fe::ops::add(a, b);    break;
             case Op::SUB: values_[i] = fe::ops::sub(a, b);    break;
             case Op::MUL: values_[i] = fe::ops::mul(a, b);    break;
-            case Op::DIV: values_[i] = fe::ops::div_op(a, b); break;
+            case Op::DIV:  values_[i] = fe::ops::div_op(a, b);  break;
+            case Op::FMAX: values_[i] = fe::ops::fmax_op(a, b); break;
+            case Op::FMIN: values_[i] = fe::ops::fmin_op(a, b); break;
 
             // ── P0 scalar ──
             case Op::ADD_SCALAR: values_[i] = fe::ops::add(a, nd.scalar); break;
@@ -316,6 +330,10 @@ public:
             case Op::TS_CV:    { auto& k = std::get<TsCvComposite>(nd.kernel);       k.push(a); values_[i] = k.output(); break; }
             case Op::TS_NORM:  { auto& k = std::get<TsNormComposite>(nd.kernel);     k.push(a); values_[i] = k.output(); break; }
             case Op::TS_RSI:   { auto& k = std::get<RsiPush>(nd.kernel);             k.push(a); values_[i] = k.output(); break; }
+            case Op::TS_CCI:   { auto& k = std::get<CciPush>(nd.kernel);             k.push(a); values_[i] = k.output(); break; }
+            case Op::TS_SUM_POS:   { auto& k = std::get<SumPosPush>(nd.kernel);       k.push(a); values_[i] = k.output(); break; }
+            case Op::TS_POS_RATIO: { auto& k = std::get<PosRatioPush>(nd.kernel);     k.push(a); values_[i] = k.output(); break; }
+            case Op::TS_UP_DOWN_RATIO: { auto& k = std::get<UpDownRatioPush>(nd.kernel); k.push(a); values_[i] = k.output(); break; }
             case Op::TS_GROWTH: { auto& k = std::get<TsPctComposite>(nd.kernel);     k.push(a); values_[i] = k.output(); break; }
 
             // ── P3 complex ──
@@ -395,10 +413,14 @@ private:
         case Op::SIGN:    return "SIGN";
         case Op::TANH:    return "TANH";
         case Op::SLOG1P:  return "SLOG1P";
+        case Op::SQRT:      return "SQRT";
+        case Op::SIGN_SQRT: return "SIGN_SQRT";
         case Op::ADD:     return "ADD";
         case Op::SUB:     return "SUB";
         case Op::MUL:     return "MUL";
         case Op::DIV:     return "DIV";
+        case Op::FMAX:    return "FMAX";
+        case Op::FMIN:    return "FMIN";
         case Op::ADD_SCALAR: return "ADD_SCALAR";
         case Op::SUB_SCALAR: return "SUB_SCALAR";
         case Op::MUL_SCALAR: return "MUL_SCALAR";
@@ -427,6 +449,10 @@ private:
         case Op::TS_CV:        return "TS_CV";
         case Op::TS_NORM:      return "TS_NORM";
         case Op::TS_RSI:       return "TS_RSI";
+        case Op::TS_CCI:       return "TS_CCI";
+        case Op::TS_SUM_POS:       return "TS_SUM_POS";
+        case Op::TS_POS_RATIO:     return "TS_POS_RATIO";
+        case Op::TS_UP_DOWN_RATIO: return "TS_UP_DOWN_RATIO";
         case Op::TS_GROWTH:    return "TS_GROWTH";
         case Op::AUTOCORR:     return "AUTOCORR";
         case Op::TS_MINMAX_DIFF: return "TS_MINMAX_DIFF";
@@ -454,7 +480,8 @@ private:
         case Op::EMA: case Op::TS_MIN: case Op::TS_MAX:
         case Op::TS_RANK: case Op::TREAP_TS_RANK: case Op::TS_ZSCORE:
         case Op::CORR: case Op::TS_COV: case Op::TS_BETA: case Op::TS_INTERCEPT: case Op::TS_COS:
-        case Op::TS_CV: case Op::TS_NORM: case Op::TS_RSI:
+        case Op::TS_CV: case Op::TS_NORM: case Op::TS_RSI: case Op::TS_CCI:
+        case Op::TS_SUM_POS: case Op::TS_POS_RATIO: case Op::TS_UP_DOWN_RATIO:
         case Op::TS_MINMAX_DIFF: case Op::TS_SKEW: case Op::TS_KURT:
         case Op::TS_MED: case Op::TS_MAD: case Op::TS_WMA:
         case Op::TS_MAX_DIFF: case Op::TS_MIN_DIFF:
@@ -493,6 +520,10 @@ private:
         case Op::TS_CV:        return TsCvComposite(nd.window);
         case Op::TS_NORM:      return TsNormComposite(nd.window);
         case Op::TS_RSI:       return RsiPush(nd.window);
+        case Op::TS_CCI:       return CciPush(nd.window);
+        case Op::TS_SUM_POS:   return SumPosPush(nd.window);
+        case Op::TS_POS_RATIO:     return PosRatioPush(nd.window);
+        case Op::TS_UP_DOWN_RATIO: return UpDownRatioPush(nd.window);
         case Op::TS_GROWTH:    return TsPctComposite(nd.window);
         case Op::AUTOCORR:     return AutocorrPush(nd.window, static_cast<int>(nd.scalar));
         case Op::TS_MINMAX_DIFF: return TsMinMaxDiffPush(nd.window);

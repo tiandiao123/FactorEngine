@@ -21,6 +21,8 @@
 #include "fe/ops/rolling_cv.hpp"
 #include "fe/ops/rolling_norm.hpp"
 #include "fe/ops/rolling_rsi.hpp"
+#include "fe/ops/rolling_cci.hpp"
+#include "fe/ops/rolling_sumpos.hpp"
 
 namespace py = pybind11;
 using fe::ops::FeFloat;
@@ -115,7 +117,9 @@ PYBIND11_MODULE(fe_ops, m) {
     m.def("inv",     [](NpArray x) { return py_unary(fe::ops::inv_array, x); });
     m.def("sign",    [](NpArray x) { return py_unary(fe::ops::sign_array, x); });
     m.def("tanh_op", [](NpArray x) { return py_unary(fe::ops::tanh_array, x); });
-    m.def("slog1p",  [](NpArray x) { return py_unary(fe::ops::slog1p_array, x); });
+    m.def("slog1p",    [](NpArray x) { return py_unary(fe::ops::slog1p_array, x); });
+    m.def("sqrt_op",   [](NpArray x) { return py_unary(fe::ops::sqrt_array, x); });
+    m.def("sign_sqrt", [](NpArray x) { return py_unary(fe::ops::sign_sqrt_array, x); });
 
     // P0 binary: 3 overloads each (aa, as, sa)
     m.def("add", [](NpArray x, NpArray y) { return py_binary_aa(fe::ops::add_aa, x, y); });
@@ -133,6 +137,9 @@ PYBIND11_MODULE(fe_ops, m) {
     m.def("div_op", [](NpArray x, NpArray y) { return py_binary_aa(fe::ops::div_aa, x, y); });
     m.def("div_op", [](NpArray x, float s)   { return py_binary_as(fe::ops::div_as, x, s); });
     m.def("div_op", [](float s, NpArray y)   { return py_binary_sa(fe::ops::div_sa, s, y); });
+
+    m.def("fmax", [](NpArray x, NpArray y) { return py_binary_aa(fe::ops::fmax_aa, x, y); });
+    m.def("fmin", [](NpArray x, NpArray y) { return py_binary_aa(fe::ops::fmin_aa, x, y); });
 
     // P1 rolling
     m.def("rolling_mean",  [](NpArray x, int w) { return py_rolling(fe::ops::rolling_mean, x, w); },  py::arg("x"), py::arg("window"));
@@ -177,6 +184,10 @@ PYBIND11_MODULE(fe_ops, m) {
     // P2c momentum / technical
     m.def("rolling_rsi",   [](NpArray x, int w) { return py_rolling(fe::ops::rolling_rsi, x, w); },   py::arg("x"), py::arg("window"));
     m.def("rolling_growth",[](NpArray x, int w) { return py_rolling(fe::ops::ts_growth, x, w); },     py::arg("x"), py::arg("window"));
+    m.def("rolling_cci",      [](NpArray x, int w) { return py_rolling(fe::ops::rolling_cci, x, w); },      py::arg("x"), py::arg("window"));
+    m.def("rolling_sumpos",   [](NpArray x, int w) { return py_rolling(fe::ops::rolling_sumpos, x, w); },   py::arg("x"), py::arg("window"));
+    m.def("rolling_posratio",     [](NpArray x, int w) { return py_rolling(fe::ops::rolling_posratio, x, w); },     py::arg("x"), py::arg("window"));
+    m.def("rolling_updown_ratio", [](NpArray x, int w) { return py_rolling(fe::ops::rolling_updown_ratio, x, w); }, py::arg("x"), py::arg("window"));
 
     // P3 rolling median / MAD
     m.def("rolling_median", [](NpArray x, int w) { return py_rolling(fe::ops::rolling_median, x, w); }, py::arg("x"), py::arg("window"));
