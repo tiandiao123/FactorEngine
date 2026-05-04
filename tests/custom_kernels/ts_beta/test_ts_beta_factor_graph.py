@@ -1,5 +1,8 @@
 """
-Single-factor sanity: Beta(ret, volume, 60) as a compiled FactorGraph vs pandas.
+Single-factor sanity: Beta(close, volume, 60) as a compiled FactorGraph vs pandas.
+
+TS_BETA(close, volume, 60) = Cov(close, volume) / Var(close),
+i.e. volume regressed on close (close is the independent variable).
 
 Usage:
     cd FactorEngine

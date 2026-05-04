@@ -47,7 +47,7 @@ def _fmt(sec: float) -> str:
     return f"{sec:8.3f}  s"
 
 
-def _pandas_beta(y, x, w):
+def _pandas_beta(x, y, w):
     xs = pd.Series(x.astype(np.float64))
     ys = pd.Series(y.astype(np.float64))
     return (ys.rolling(w, min_periods=w).cov(xs) /
@@ -64,8 +64,8 @@ def bench_batch():
         for w in WINDOWS:
             if w >= n:
                 continue
-            py_t = _bench(lambda: _pandas_beta(y, x, w))
-            cpp_t = _bench(lambda: fe_ops.rolling_beta(y, x, w))
+            py_t = _bench(lambda: _pandas_beta(x, y, w))
+            cpp_t = _bench(lambda: fe_ops.rolling_beta(x, y, w))
             sp = py_t / cpp_t if cpp_t > 0 else float("inf")
             print(f"  Beta(w={w:>4})  pandas={_fmt(py_t)}  cpp={_fmt(cpp_t)}  speedup={sp:5.1f}x")
 

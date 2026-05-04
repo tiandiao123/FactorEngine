@@ -167,7 +167,7 @@ public:
     int add_bivariate(Op op, int src_a, int src_b, int window) {
         if ((op == Op::TS_COV || op == Op::CORR || op == Op::TS_BETA) && window < 2)
             throw std::invalid_argument(
-                std::string(op == Op::TS_COV ? "TS_COV" : op == Op::TS_BETA ? "TS_BETA" : "CORR") +
+                std::string(op_name(op)) +
                 " requires window >= 2, got " + std::to_string(window));
         FactorNode node;
         node.op = op;
