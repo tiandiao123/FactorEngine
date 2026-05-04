@@ -275,7 +275,7 @@ private:
 class CovPush {
 public:
     explicit CovPush(int window)
-        : t_(window), rx_(t_), ry_(t_),
+        : t_(window > 1 ? window : 2), rx_(t_), ry_(t_),
           pos_(0), count_(0), nan_count_(0),
           sx_(0), sy_(0), sxy_(0) {}
 
