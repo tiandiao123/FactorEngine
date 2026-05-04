@@ -108,6 +108,11 @@ Collector 不做任何聚合运算，这些都交给 Accumulator。
 - 立即重置所有字段为初始值（NaN / 0 / ±inf）
 - 一次操作同时完成"读取"和"清零"，**没有数据丢失窗口**
 
+**空桶 forward-fill**（见下方专题说明）：
+- 如果本桶内没有任何成交（`trade_count == 0`），但之前有过成交，
+  OHLC 和 vwap 全部 forward-fill 为 `_last_close`，volume / buy_vol / sell_vol = 0
+- 如果从未有过成交（首次 snapshot），所有价格字段返回 NaN
+
 **线程安全**：`threading.Lock` 保护所有状态修改。`update()` 和 `snapshot_and_reset()` 互斥访问，但锁的持有时间极短（几个 float 加法），对 WS 线程的延迟影响可忽略。
 
 ### `worker.py` — TradesWorker
@@ -185,6 +190,67 @@ if self._freq_ms > 0:
 ```
 
 例如 `freq=5s` 时，flush 在 `12:00:05.023` 发生，时间戳对齐为 `12:00:05.000`。这保证 trades 和 kline 的 bar 有一致的时间基准。
+
+## 空桶 Forward-Fill 机制
+
+### 问题
+
+在高频场景（如 `data_freq="1s"`），流动性较低的 symbol（如 SOL）可能在某些秒内**没有任何成交**。
+如果 `snapshot_and_reset()` 直接返回 NaN，会导致：
+
+1. **NaN 进入 C++ 推理引擎** — OHLCV 全是 NaN，因子的滚动窗口被污染
+2. **ret 计算毒化** — `Engine._runtime_loop` 中 `prev_close = NaN` → 后续 bar 的 `ret` 也是 NaN
+3. **因子长期为零** — `TS_ZSCORE`/`MA`/`TS_STD` 等 rolling 算子遇到 NaN 后输出异常，表现为因子值全为 0
+
+实际观测：1s 粒度下 SOL 的 T0002/T0004/T0006（基于 vwap）长期为 0.0000，就是因为 vwap = NaN 污染了 60 窗口的滚动统计。
+
+### 解决方案
+
+`TradesAccumulator` 维护一个 `_last_close` 字段，记录最近一次有成交的 close 价格。
+当 `trade_count == 0` 且 `_last_close` 已知时，forward-fill 所有价格字段：
+
+```
+有成交的桶:
+  snapshot_and_reset() → 正常返回实际的 OHLCV + vwap
+  _last_close ← close  (记住这个价格)
+
+空桶 (trade_count == 0, 有历史):
+  open  = _last_close   (价格不变)
+  high  = _last_close
+  low   = _last_close
+  close = _last_close
+  vwap  = _last_close   (无成交 = 价格不变 = VWAP 不变)
+  volume   = 0
+  buy_vol  = 0
+  sell_vol = 0
+
+首次空桶 (从未有过成交):
+  所有价格字段 = NaN    (无法 forward-fill)
+```
+
+### 语义正确性
+
+| 字段 | Forward-fill 值 | 为什么合理 |
+|------|-----------------|-----------|
+| OHLC | last_close | 没成交 = 价格不变，O=H=L=C=上次收盘价 |
+| vwap | last_close | 没有新成交，volume-weighted 价格维持上次水平 |
+| volume | 0 | 确实没有成交量 |
+| buy/sell_vol | 0 | 确实没有买卖量 |
+| trade_count | 0 | 下游可以用此字段区分"真实数据"和"forward-fill" |
+
+### 对下游因子的影响
+
+| 因子类型 | 空桶时的表现 |
+|----------|------------|
+| vwap 因子 (T0002/T0004/T0006) | vwap = last_close → rolling 窗口正常，不被 NaN 污染 |
+| buy/sell 因子 (T0001/T0003/T0005) | buy_vol=0, sell_vol=0 → T0001 imbalance=0/0 → C++ 保护返回 0；T0003 slog1p(0)=0 正常 |
+| ret (收益率) | close 不变 → ret=0，符合"无成交=无价格变动"语义 |
+
+### Engine 侧的防御
+
+除了 Accumulator 的 forward-fill，`Engine._runtime_loop` 也做了 NaN 守护：
+- `close` 或 `prev_close` 为 NaN 时，`ret` 强制为 0.0
+- 只在 `close` 非 NaN 时更新 `_prev_closes`，防止 NaN 毒化后续 bar
 
 ## 监控指标
 

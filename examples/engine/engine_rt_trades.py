@@ -1,16 +1,10 @@
-"""Real-time factor inference demo using OKX kline + trades streams.
+"""Real-time factor inference demo — trades-only data stream.
 
-Shows the v4 ClockDriver architecture:
-  - KlineWorker collects OKX WebSocket candles → internal buffer
-  - TradesWorker collects OKX trades → per-symbol TradesAccumulators
-  - ClockDriver flushes both workers on wall-clock boundaries,
-    aggregates data, and pushes (merged_bars, merged_trades) to bar_queue
-  - Runtime thread: bar_queue → push_bars (C++ parallel) → signal_deque
-  - Main thread polls get_factor_outputs() at its own pace
+Uses data_source="trades" so only TradesWorker runs (no kline WS).
+OHLCV is derived from the trades stream via TradesAccumulator.
 
-factor_group accepts a single group string or a list of groups:
-  - "okx_perp_trades"                   → trades-only factors (T0001–T0006)
-  - ["okx_perp", "okx_perp_trades"]     → kline + trades factors combined
+Prints the raw BarData pushed to C++ InferenceEngine each cycle
+so you can visually verify open/high/low/close/volume/vwap/buy_vol/sell_vol.
 """
 import logging
 import time
@@ -25,10 +19,10 @@ logging.basicConfig(
 engine = Engine(
     symbols=["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
     mode="live",
-    data_freq="5s",
-    factor_group=["okx_perp", "okx_perp_trades"],
+    data_freq="1s",
+    factor_group=["okx_perp_trades"],
     num_threads=4,
-    data_source="kline_trades",
+    data_source="trades",
 )
 
 print(f"Symbols:     {len(engine.symbols)}")
@@ -41,7 +35,7 @@ engine.start()
 
 try:
     for cycle in range(1, 200):
-        time.sleep(5)
+        time.sleep(1)
 
         factors = engine.get_factor_outputs()
 
@@ -54,10 +48,28 @@ try:
 
         print(
             f"\n═══ Cycle {cycle:3d}  bars_pushed={engine.bars_pushed:4d}  "
-            f"kline={engine.kline_stats}  "
             f"trades={engine.trades_stats}  "
             f"clock={engine.clock_stats}"
         )
+
+        # ── BarData debug: show what was pushed to C++ InferenceEngine ──
+        debug = engine.last_bar_debug
+        if debug:
+            print(f"  ── BarData pushed (bar_index={debug['bar_index']}, ts={debug['ts']}) ──")
+            for sym, bd in debug["bars"].items():
+                print(
+                    f"    {sym:<16s}  "
+                    f"O={bd['open']:<10.2f} H={bd['high']:<10.2f} "
+                    f"L={bd['low']:<10.2f} C={bd['close']:<10.2f} "
+                    f"V={bd['volume']:<10.4f} ret={bd['ret']:+.6f}"
+                )
+                print(
+                    f"    {'':16s}  "
+                    f"vwap={bd['vwap']:<12.4f} "
+                    f"buy_vol={bd['buy_vol']:<10.4f} "
+                    f"sell_vol={bd['sell_vol']:<10.4f}"
+                )
+
         for ln in lines:
             print(ln)
 
@@ -70,15 +82,6 @@ try:
                 for fid, v in sorted(fvals.items())
             )
             print(f"  {sym:<16s}  {items}")
-
-        if cycle % 10 == 0:
-            sym0 = engine.symbols[0]
-            fvals = factors.get(sym0, {})
-            if fvals:
-                print(f"\n  ── all {len(fvals)} factors for {sym0} ──")
-                for fid, val in sorted(fvals.items()):
-                    tag = f"{val:+.6f}" if val == val else "     NaN"
-                    print(f"    {fid:<8s} {tag}")
 
 finally:
     engine.stop()

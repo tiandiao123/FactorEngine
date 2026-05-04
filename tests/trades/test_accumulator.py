@@ -102,15 +102,40 @@ class TestReset:
         acc.update(50.0, 10.0, "buy")
         _ = acc.snapshot_and_reset()
         snap2 = acc.snapshot_and_reset()
-        assert math.isnan(snap2["vwap"])
         assert snap2["buy_vol"] == 0.0
         assert snap2["sell_vol"] == 0.0
         assert snap2["trade_count"] == 0
-        assert math.isnan(snap2["open"])
-        assert math.isnan(snap2["high"])
-        assert math.isnan(snap2["low"])
-        assert math.isnan(snap2["close"])
+        # OHLC + vwap forward-filled from last known close (50.0)
+        assert snap2["open"] == 50.0
+        assert snap2["high"] == 50.0
+        assert snap2["low"] == 50.0
+        assert snap2["close"] == 50.0
+        assert snap2["vwap"] == 50.0
         assert snap2["volume"] == 0.0
+
+    def test_forward_fill_no_prior_trades(self):
+        """First-ever snapshot with no trades returns NaN (no last_close)."""
+        acc = TradesAccumulator()
+        snap = acc.snapshot_and_reset()
+        assert math.isnan(snap["open"])
+        assert math.isnan(snap["close"])
+        assert math.isnan(snap["vwap"])
+        assert snap["trade_count"] == 0
+
+    def test_forward_fill_multiple_empty_buckets(self):
+        """Consecutive empty buckets keep forward-filling the same close."""
+        acc = TradesAccumulator()
+        acc.update(100.0, 1.0, "buy")
+        _ = acc.snapshot_and_reset()
+        # Two consecutive empty buckets
+        snap2 = acc.snapshot_and_reset()
+        snap3 = acc.snapshot_and_reset()
+        assert snap2["close"] == 100.0
+        assert snap3["close"] == 100.0
+        assert snap2["vwap"] == 100.0
+        assert snap3["vwap"] == 100.0
+        assert snap2["trade_count"] == 0
+        assert snap3["trade_count"] == 0
 
     def test_accumulate_after_reset(self):
         acc = TradesAccumulator()

@@ -20,6 +20,14 @@ derives OHLCV directly from the trades stream:
 * **low**   — min price seen
 * **close** — price of the most recent trade
 * **volume** — Σ(sz)  (same as ``buy_vol + sell_vol``)
+
+Forward-fill on empty buckets
+-----------------------------
+At high frequencies (e.g. 1s), less liquid symbols may have no trades
+in a given bucket.  To prevent NaN propagation into downstream
+rolling-window factors, ``snapshot_and_reset()`` forward-fills OHLC
+with the **last known close** price when ``trade_count == 0``.
+Volume stays 0 and vwap stays NaN (no trades = no VWAP).
 """
 
 from __future__ import annotations
@@ -51,6 +59,7 @@ class TradesAccumulator:
         "_high",
         "_low",
         "_close",
+        "_last_close",
     )
 
     def __init__(self) -> None:
@@ -64,6 +73,7 @@ class TradesAccumulator:
         self._high: float = -math.inf
         self._low: float = math.inf
         self._close: float = math.nan
+        self._last_close: float = math.nan
 
     # ── hot path (trades WS thread) ─────────────────────────────
 
@@ -106,21 +116,39 @@ class TradesAccumulator:
             Keys: ``vwap``, ``buy_vol``, ``sell_vol``, ``trade_count``,
             ``open``, ``high``, ``low``, ``close``, ``volume``.
 
-            If no trades arrived in the bucket, price fields are ``NaN``
-            and volumes / count are ``0``.
+            If no trades arrived in the bucket but a previous close is
+            known, OHLC **and vwap** are forward-filled with that close
+            (volume = 0).  This prevents NaN propagation into downstream
+            rolling-window factors that depend on vwap.
+
+            If no trades have *ever* been seen, price fields are ``NaN``.
         """
         with self._lock:
             vwap = self._sum_pv / self._sum_v if self._sum_v > 0 else math.nan
             no_trades = self._count == 0
+
+            if not no_trades:
+                self._last_close = self._close
+
+            # Forward-fill OHLC + vwap from last known close when bucket empty.
+            if no_trades and not math.isnan(self._last_close):
+                fill = self._last_close
+                ohlc = (fill, fill, fill, fill)
+                vwap = fill
+            elif no_trades:
+                ohlc = (math.nan, math.nan, math.nan, math.nan)
+            else:
+                ohlc = (self._open, self._high, self._low, self._close)
+
             result = {
                 "vwap": vwap,
                 "buy_vol": self._buy_vol,
                 "sell_vol": self._sell_vol,
                 "trade_count": self._count,
-                "open": math.nan if no_trades else self._open,
-                "high": math.nan if no_trades else self._high,
-                "low": math.nan if no_trades else self._low,
-                "close": math.nan if no_trades else self._close,
+                "open": ohlc[0],
+                "high": ohlc[1],
+                "low": ohlc[2],
+                "close": ohlc[3],
                 "volume": self._sum_v,
             }
             self._sum_pv = 0.0
@@ -146,5 +174,6 @@ class TradesAccumulator:
             f"TradesAccumulator(count={self._count}, "
             f"sum_v={self._sum_v:.4f}, buy={self._buy_vol:.4f}, "
             f"sell={self._sell_vol:.4f}, "
-            f"O={self._open} H={self._high} L={self._low} C={self._close})"
+            f"O={self._open} H={self._high} L={self._low} C={self._close}, "
+            f"last_close={self._last_close})"
         )

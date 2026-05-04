@@ -129,6 +129,7 @@ class Engine:
         self._signal_deque: deque[dict] = deque(maxlen=signal_buffer_size)
         self._prev_closes: dict[str, float] = {}
         self._bars_pushed = 0
+        self._last_bar_debug: dict | None = None
 
         # Inter-thread communication: ClockDriver → runtime.
         self._bar_queue: queue.Queue | None = None
@@ -273,8 +274,14 @@ class Engine:
                 high = float(bar[2])
                 low = float(bar[3])
                 prev_close = self._prev_closes.get(sym, close)
-                ret = (close / prev_close - 1.0) if prev_close != 0 else 0.0
-                self._prev_closes[sym] = close
+                if close != close or prev_close != prev_close:
+                    ret = 0.0
+                elif prev_close != 0:
+                    ret = close / prev_close - 1.0
+                else:
+                    ret = 0.0
+                if close == close:
+                    self._prev_closes[sym] = close
 
                 vwap = nan
                 buy_vol = nan
@@ -293,6 +300,19 @@ class Engine:
 
             self._inference.push_bars(batch)
             self._bars_pushed += 1
+
+            self._last_bar_debug = {
+                "ts": ts_ms,
+                "bar_index": self._bars_pushed,
+                "bars": {
+                    sym: {
+                        "open": bd.open, "high": bd.high, "low": bd.low,
+                        "close": bd.close, "volume": bd.volume, "ret": bd.ret,
+                        "vwap": bd.vwap, "buy_vol": bd.buy_vol, "sell_vol": bd.sell_vol,
+                    }
+                    for sym, bd in batch.items()
+                },
+            }
 
             result = self._inference.get_all_outputs()
             self._signal_deque.append({
@@ -334,6 +354,15 @@ class Engine:
     def signal_deque(self) -> deque:
         """Access the signal buffer (for advanced use / debugging)."""
         return self._signal_deque
+
+    @property
+    def last_bar_debug(self) -> dict | None:
+        """Last BarData batch sent to C++ InferenceEngine (for debugging).
+
+        Returns dict with keys: ts, bar_index, bars.
+        ``bars`` maps symbol → {open, high, low, close, volume, ret, vwap, buy_vol, sell_vol}.
+        """
+        return self._last_bar_debug
 
     # ── Dataflow API ──────────────────────────────────────────
 
