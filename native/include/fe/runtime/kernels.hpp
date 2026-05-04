@@ -26,6 +26,7 @@
 #include "fe/ops/rolling_ema.hpp"
 #include "fe/ops/rolling_minmax.hpp"
 #include "fe/ops/shift.hpp"
+#include "fe/ops/bivariate.hpp"
 
 namespace fe::runtime {
 
@@ -108,6 +109,54 @@ private:
     fe::ops::RollingStdKernel std_k_;
     FeFloat cur_ = kNaN;
 };
+
+// --------------- TsCv (composite: std/|mean|, ddof=0) ---------------
+class TsCvComposite {
+public:
+    explicit TsCvComposite(int window)
+        : mean_k_(static_cast<std::uint32_t>(window)),
+          std_k_(static_cast<std::uint32_t>(window)) {}
+    void push(FeFloat x) { mean_k_.push(x); std_k_.push(x); }
+    [[nodiscard]] bool ready() const { return mean_k_.ready(); }
+    [[nodiscard]] FeFloat output() const {
+        FeFloat m = mean_k_.output();
+        FeFloat s = std_k_.output();
+        if (fe_is_nan(m) || fe_is_nan(s)) return kNaN;
+        double abs_m = std::fabs(static_cast<double>(m));
+        if (abs_m < fe::ops::kCvMeanEps) return kNaN;
+        return static_cast<FeFloat>(static_cast<double>(s) / abs_m);
+    }
+    void reset() { mean_k_.reset(); std_k_.reset(); }
+private:
+    fe::ops::RollingMeanKernel mean_k_;
+    fe::ops::RollingStdKernel std_k_;
+};
+
+// --------------- TsNorm (composite: (x - min) / (max - min)) ---------------
+class TsNormComposite {
+public:
+    explicit TsNormComposite(int window)
+        : max_k_(static_cast<std::uint32_t>(window)),
+          min_k_(static_cast<std::uint32_t>(window)) {}
+    void push(FeFloat x) { cur_ = x; max_k_.push(x); min_k_.push(x); }
+    [[nodiscard]] bool ready() const { return max_k_.ready(); }
+    [[nodiscard]] FeFloat output() const {
+        FeFloat mx = max_k_.output();
+        FeFloat mn = min_k_.output();
+        if (fe_is_nan(mx) || fe_is_nan(mn) || fe_is_nan(cur_)) return kNaN;
+        double range = static_cast<double>(mx) - static_cast<double>(mn);
+        if (range <= 0.0) return kNaN;
+        return static_cast<FeFloat>((static_cast<double>(cur_) - static_cast<double>(mn)) / range);
+    }
+    void reset() { max_k_.reset(); min_k_.reset(); cur_ = kNaN; }
+private:
+    fe::ops::RollingMaxKernel max_k_;
+    fe::ops::RollingMinKernel min_k_;
+    FeFloat cur_ = kNaN;
+};
+
+// --------------- TsCos: alias to shared RollingCosKernel in bivariate.hpp ----
+using CosPush = fe::ops::RollingCosKernel;
 
 // ═══════════════════════════════════════════════════════════════
 //  New push-level kernels (no class equivalent in ops/)

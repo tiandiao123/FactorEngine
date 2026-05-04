@@ -18,6 +18,8 @@
 #include "fe/ops/rolling_kurt.hpp"
 #include "fe/ops/rolling_median.hpp"
 #include "fe/ops/rolling_wma.hpp"
+#include "fe/ops/rolling_cv.hpp"
+#include "fe/ops/rolling_norm.hpp"
 
 namespace py = pybind11;
 using fe::ops::FeFloat;
@@ -150,6 +152,7 @@ PYBIND11_MODULE(fe_ops, m) {
     m.def("rolling_cov",   [](NpArray x, NpArray y, int w) { return py_bivariate(fe::ops::rolling_cov, x, y, w); }, py::arg("x"), py::arg("y"), py::arg("window"));
     m.def("rolling_beta",      [](NpArray x, NpArray y, int w) { return py_bivariate(fe::ops::rolling_beta, y, x, w); },      py::arg("x"), py::arg("y"), py::arg("window"));
     m.def("rolling_intercept", [](NpArray x, NpArray y, int w) { return py_bivariate(fe::ops::rolling_intercept, y, x, w); }, py::arg("x"), py::arg("y"), py::arg("window"));
+    m.def("rolling_cos",       [](NpArray x, NpArray y, int w) { return py_bivariate(fe::ops::rolling_cos, x, y, w); },       py::arg("x"), py::arg("y"), py::arg("window"));
     m.def("autocorr", [](NpArray x, int w, int lag) {
         auto buf = x.request();
         auto n = static_cast<int>(buf.size);
@@ -165,6 +168,10 @@ PYBIND11_MODULE(fe_ops, m) {
     // P2 rolling skew / kurt
     m.def("rolling_skew",  [](NpArray x, int w) { return py_rolling(fe::ops::rolling_skew, x, w); },  py::arg("x"), py::arg("window"));
     m.def("rolling_kurt",  [](NpArray x, int w) { return py_rolling(fe::ops::rolling_kurt, x, w); },  py::arg("x"), py::arg("window"));
+
+    // P2b rolling normalized
+    m.def("rolling_cv",    [](NpArray x, int w) { return py_rolling(fe::ops::rolling_cv, x, w); },    py::arg("x"), py::arg("window"));
+    m.def("rolling_norm",  [](NpArray x, int w) { return py_rolling(fe::ops::rolling_norm, x, w); },  py::arg("x"), py::arg("window"));
 
     // P3 rolling median / MAD
     m.def("rolling_median", [](NpArray x, int w) { return py_rolling(fe::ops::rolling_median, x, w); }, py::arg("x"), py::arg("window"));

@@ -233,3 +233,116 @@ def build_imbalance_return_residual() -> rt.FactorGraph:
     g.add_unary(Op.NEG, ranked)
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0013: Volume CV — stability of trading volume over time
+#    High CV = erratic volume (potential manipulation or events)
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0013")
+def build_volume_cv() -> rt.FactorGraph:
+    """Neg(TsRank(TsCv(SLog1p(volume), 60), 120))"""
+    g = rt.FactorGraph()
+    vol = g.add_input("volume")
+    svol = g.add_unary(Op.SLOG1P, vol)
+    cv = g.add_rolling(Op.TS_CV, svol, 60)
+    ranked = g.add_rolling(Op.TS_RANK, cv, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0014: Imbalance CV — variability of buy-sell imbalance
+#    Stable imbalance = persistent pressure; variable = noise
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0014")
+def build_imbalance_cv() -> rt.FactorGraph:
+    """TsZscore(TsCv(Div(Sub(buy_vol, sell_vol), Add(buy_vol, sell_vol)), 30), 120)"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    diff = g.add_binary(Op.SUB, bv, sv)
+    total = g.add_binary(Op.ADD, bv, sv)
+    imbalance = g.add_binary(Op.DIV, diff, total)
+    cv = g.add_rolling(Op.TS_CV, imbalance, 30)
+    g.add_rolling(Op.TS_ZSCORE, cv, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0015: Volume-Return Cosine — directional alignment between
+#    volume and returns (without mean-centering)
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0015")
+def build_vol_return_cos() -> rt.FactorGraph:
+    """TsZscore(TsCos(SLog1p(volume), ret, 60), 120)"""
+    g = rt.FactorGraph()
+    vol = g.add_input("volume")
+    ret = g.add_input("ret")
+    svol = g.add_unary(Op.SLOG1P, vol)
+    cos = g.add_bivariate(Op.TS_COS, svol, ret, 60)
+    g.add_rolling(Op.TS_ZSCORE, cos, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0016: Imbalance-Return Cosine — raw directional coherence
+#    between trade flow imbalance and price returns
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0016")
+def build_imbalance_return_cos() -> rt.FactorGraph:
+    """Neg(TsRank(TsCos(Div(Sub(buy_vol,sell_vol),Add(buy_vol,sell_vol)), TsPct(close,1), 30), 120))"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    close = g.add_input("close")
+    diff = g.add_binary(Op.SUB, bv, sv)
+    total = g.add_binary(Op.ADD, bv, sv)
+    imbalance = g.add_binary(Op.DIV, diff, total)
+    pct = g.add_rolling(Op.TS_PCT, close, 1)
+    cos = g.add_bivariate(Op.TS_COS, imbalance, pct, 30)
+    ranked = g.add_rolling(Op.TS_RANK, cos, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0017: Normalized Close Position — where close sits in recent
+#    range [0=at min, 1=at max], captures relative price level
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0017")
+def build_close_norm_position() -> rt.FactorGraph:
+    """TsZscore(TsNorm(close, 60), 120)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    norm = g.add_rolling(Op.TS_NORM, c, 60)
+    g.add_rolling(Op.TS_ZSCORE, norm, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0018: Normalized Volume — volume position in recent range
+#    Low norm = quiet; high norm = active, potential reversal signal
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0018")
+def build_volume_norm() -> rt.FactorGraph:
+    """Neg(TsRank(TsNorm(SLog1p(volume), 30), 120))"""
+    g = rt.FactorGraph()
+    vol = g.add_input("volume")
+    svol = g.add_unary(Op.SLOG1P, vol)
+    norm = g.add_rolling(Op.TS_NORM, svol, 30)
+    ranked = g.add_rolling(Op.TS_RANK, norm, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g

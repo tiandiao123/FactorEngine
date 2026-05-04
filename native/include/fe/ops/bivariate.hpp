@@ -272,6 +272,71 @@ inline void rolling_intercept(const FeFloat* y, const FeFloat* x,
 }
 
 /**
+ * Rolling cosine similarity kernel (no mean-centering):
+ *   cos(x,y) = sum(xi*yi) / (sqrt(sum(xi^2)) * sqrt(sum(yi^2)))
+ *
+ * Shared by both batch rolling_cos() and push-level CosPush.
+ */
+class RollingCosKernel {
+ public:
+  explicit RollingCosKernel(int window)
+      : t_(window), rx_(t_), ry_(t_),
+        pos_(0), count_(0), nan_count_(0),
+        sxx_(0), syy_(0), sxy_(0) {}
+
+  void push(FeFloat xv, FeFloat yv) {
+    bool cur_nan = fe_is_nan(xv) || fe_is_nan(yv);
+    if (count_ >= t_) {
+      FeFloat ox = rx_[pos_ % t_], oy = ry_[pos_ % t_];
+      bool old_nan = fe_is_nan(ox) || fe_is_nan(oy);
+      if (old_nan) { --nan_count_; }
+      else {
+        double dx = static_cast<double>(ox), dy = static_cast<double>(oy);
+        sxx_ -= dx * dx; syy_ -= dy * dy; sxy_ -= dx * dy;
+      }
+    }
+    rx_[pos_ % t_] = xv;
+    ry_[pos_ % t_] = yv;
+    if (cur_nan) { ++nan_count_; }
+    else {
+      double dx = static_cast<double>(xv), dy = static_cast<double>(yv);
+      sxx_ += dx * dx; syy_ += dy * dy; sxy_ += dx * dy;
+    }
+    ++pos_;
+    if (count_ < t_) ++count_;
+  }
+
+  [[nodiscard]] bool ready() const { return count_ >= t_ && nan_count_ == 0; }
+  [[nodiscard]] FeFloat output() const {
+    if (!ready()) return std::numeric_limits<FeFloat>::quiet_NaN();
+    double denom = std::sqrt(sxx_ * syy_);
+    if (denom <= 0.0) return std::numeric_limits<FeFloat>::quiet_NaN();
+    return static_cast<FeFloat>(sxy_ / denom);
+  }
+  void reset() {
+    pos_ = 0; count_ = 0; nan_count_ = 0;
+    sxx_ = syy_ = sxy_ = 0.0;
+  }
+
+ private:
+  int t_;
+  std::vector<FeFloat> rx_, ry_;
+  int pos_, count_, nan_count_;
+  double sxx_, syy_, sxy_;
+};
+
+inline void rolling_cos(const FeFloat* x, const FeFloat* y,
+                        FeFloat* out, int n, int window) {
+  if (window < 2 || n <= 0) {
+    for (int i = 0; i < n; ++i)
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+    return;
+  }
+  RollingCosKernel k(window);
+  for (int i = 0; i < n; ++i) { k.push(x[i], y[i]); out[i] = k.output(); }
+}
+
+/**
  * Rolling autocorrelation: corr(x, x.shift(lag), window).
  *
  * Exact replication of Autocorr(x, t, n) in ts_ops.py:

@@ -51,7 +51,10 @@ enum class Op {
     DELAY, TS_DIFF, TS_PCT,
 
     // P2 bivariate / special
-    CORR, TS_COV, TS_BETA, TS_INTERCEPT, AUTOCORR, TS_MINMAX_DIFF, TS_SKEW, TS_KURT,
+    CORR, TS_COV, TS_BETA, TS_INTERCEPT, TS_COS, AUTOCORR, TS_MINMAX_DIFF, TS_SKEW, TS_KURT,
+
+    // P2b rolling normalized
+    TS_CV, TS_NORM,
 
     // P3 complex
     TS_MED, TS_MAD, TS_WMA, TS_MAX_DIFF, TS_MIN_DIFF,
@@ -86,8 +89,11 @@ using KernelVar = std::variant<
     CovPush,                                // push-level sample covariance
     BetaPush,                               // push-level OLS slope
     InterceptPush,                          // push-level OLS intercept
+    CosPush,                                // push-level cosine similarity
     AutocorrPush,                           // composite: Delay + Corr
     TsMinMaxDiffPush,                       // new: dual monotonic deque
+    TsCvComposite,                          // composite: std/|mean|
+    TsNormComposite,                        // composite: (x-min)/(max-min)
     TsSkewPush,                             // new: brute-force O(t)
     TsKurtPush,                             // new: brute-force O(t)
     TsMedPush,                              // new: sorted buffer
@@ -157,6 +163,9 @@ public:
             throw std::invalid_argument("TS_KURT requires window >= 4, got " + std::to_string(window));
         if (op == Op::TS_SKEW && window < 3)
             throw std::invalid_argument("TS_SKEW requires window >= 3, got " + std::to_string(window));
+        if ((op == Op::TS_CV || op == Op::TS_NORM) && window < 2)
+            throw std::invalid_argument(
+                std::string(op_name(op)) + " requires window >= 2, got " + std::to_string(window));
         FactorNode node;
         node.op = op;
         node.input_a = src;
@@ -166,7 +175,7 @@ public:
     }
 
     int add_bivariate(Op op, int src_a, int src_b, int window) {
-        if ((op == Op::TS_COV || op == Op::CORR || op == Op::TS_BETA || op == Op::TS_INTERCEPT) && window < 2)
+        if ((op == Op::TS_COV || op == Op::CORR || op == Op::TS_BETA || op == Op::TS_INTERCEPT || op == Op::TS_COS) && window < 2)
             throw std::invalid_argument(
                 std::string(op_name(op)) +
                 " requires window >= 2, got " + std::to_string(window));
@@ -294,10 +303,13 @@ public:
             case Op::TS_COV:   { auto& k = std::get<CovPush>(nd.kernel);             k.push(a, b); values_[i] = k.output(); break; }
             case Op::TS_BETA:      { auto& k = std::get<BetaPush>(nd.kernel);            k.push(a, b); values_[i] = k.output(); break; }
             case Op::TS_INTERCEPT: { auto& k = std::get<InterceptPush>(nd.kernel);    k.push(a, b); values_[i] = k.output(); break; }
+            case Op::TS_COS:       { auto& k = std::get<CosPush>(nd.kernel);          k.push(a, b); values_[i] = k.output(); break; }
             case Op::AUTOCORR:     { auto& k = std::get<AutocorrPush>(nd.kernel);     k.push(a);    values_[i] = k.output(); break; }
             case Op::TS_MINMAX_DIFF: { auto& k = std::get<TsMinMaxDiffPush>(nd.kernel); k.push(a); values_[i] = k.output(); break; }
             case Op::TS_SKEW:  { auto& k = std::get<TsSkewPush>(nd.kernel);          k.push(a); values_[i] = k.output(); break; }
             case Op::TS_KURT:  { auto& k = std::get<TsKurtPush>(nd.kernel);          k.push(a); values_[i] = k.output(); break; }
+            case Op::TS_CV:    { auto& k = std::get<TsCvComposite>(nd.kernel);       k.push(a); values_[i] = k.output(); break; }
+            case Op::TS_NORM:  { auto& k = std::get<TsNormComposite>(nd.kernel);     k.push(a); values_[i] = k.output(); break; }
 
             // ── P3 complex ──
             case Op::TS_MED:      { auto& k = std::get<TsMedPush>(nd.kernel);        k.push(a); values_[i] = k.output(); break; }
@@ -404,6 +416,9 @@ private:
         case Op::TS_COV:   return "TS_COV";
         case Op::TS_BETA:      return "TS_BETA";
         case Op::TS_INTERCEPT: return "TS_INTERCEPT";
+        case Op::TS_COS:       return "TS_COS";
+        case Op::TS_CV:        return "TS_CV";
+        case Op::TS_NORM:      return "TS_NORM";
         case Op::AUTOCORR:     return "AUTOCORR";
         case Op::TS_MINMAX_DIFF: return "TS_MINMAX_DIFF";
         case Op::TS_SKEW:  return "TS_SKEW";
@@ -429,7 +444,8 @@ private:
         case Op::MA: case Op::TS_SUM: case Op::TS_STD: case Op::TS_VARI:
         case Op::EMA: case Op::TS_MIN: case Op::TS_MAX:
         case Op::TS_RANK: case Op::TREAP_TS_RANK: case Op::TS_ZSCORE:
-        case Op::CORR: case Op::TS_COV: case Op::TS_BETA: case Op::TS_INTERCEPT: case Op::TS_MINMAX_DIFF: case Op::TS_SKEW: case Op::TS_KURT:
+        case Op::CORR: case Op::TS_COV: case Op::TS_BETA: case Op::TS_INTERCEPT: case Op::TS_COS:
+        case Op::TS_CV: case Op::TS_NORM: case Op::TS_MINMAX_DIFF: case Op::TS_SKEW: case Op::TS_KURT:
         case Op::TS_MED: case Op::TS_MAD: case Op::TS_WMA:
         case Op::TS_MAX_DIFF: case Op::TS_MIN_DIFF:
             return nd.window;
@@ -463,6 +479,9 @@ private:
         case Op::TS_COV:   return CovPush(nd.window);
         case Op::TS_BETA:      return BetaPush(nd.window);
         case Op::TS_INTERCEPT: return InterceptPush(nd.window);
+        case Op::TS_COS:       return CosPush(nd.window);
+        case Op::TS_CV:        return TsCvComposite(nd.window);
+        case Op::TS_NORM:      return TsNormComposite(nd.window);
         case Op::AUTOCORR:     return AutocorrPush(nd.window, static_cast<int>(nd.scalar));
         case Op::TS_MINMAX_DIFF: return TsMinMaxDiffPush(nd.window);
         case Op::TS_SKEW:  return TsSkewPush(nd.window);
