@@ -8,6 +8,7 @@ namespace fe::ops {
 /** Matches `factorlib.ops.ts_ops` (`EPS`, `DTYPE=float32`). */
 inline constexpr float kEps = 1e-8f;
 inline constexpr double kCvMeanEps = 1e-12;
+inline constexpr double kRsiLossEps = 1e-15;
 
 using FeFloat = float;
 

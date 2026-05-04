@@ -27,6 +27,7 @@
 #include "fe/ops/rolling_minmax.hpp"
 #include "fe/ops/shift.hpp"
 #include "fe/ops/bivariate.hpp"
+#include "fe/ops/rolling_rsi.hpp"
 
 namespace fe::runtime {
 
@@ -157,6 +158,9 @@ private:
 
 // --------------- TsCos: alias to shared RollingCosKernel in bivariate.hpp ----
 using CosPush = fe::ops::RollingCosKernel;
+
+// --------------- TsRsi: alias to shared RsiKernel in rolling_rsi.hpp --------
+using RsiPush = fe::ops::RsiKernel;
 
 // ═══════════════════════════════════════════════════════════════
 //  New push-level kernels (no class equivalent in ops/)

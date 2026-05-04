@@ -47,7 +47,7 @@ def bench_push(n=2000, w=60, rounds=5):
         for v in data:
             t0 = time.perf_counter_ns()
             g.push_bar(float(v))
-            _ = g.output()
+            _out = g.output()
             total_ns += time.perf_counter_ns() - t0
 
     avg_ns = total_ns / (n * rounds)
