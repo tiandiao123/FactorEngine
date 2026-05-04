@@ -1,0 +1,128 @@
+"""Tests for BinanceTradesWorker — flush, accumulation, and stats.
+
+These tests exercise the Worker without opening actual WebSocket
+connections by directly calling _on_trade() and flush().
+"""
+
+import math
+
+import numpy as np
+import pytest
+
+from dataflow.binance.trades.worker import BinanceTradesWorker
+
+
+class TestBinanceTradesWorkerFlush:
+    """Test BinanceTradesWorker.flush() returns correct (round_bars, round_trades)."""
+
+    def test_flush_with_trades(self):
+        worker = BinanceTradesWorker(symbols=["BTC-USDT", "ETH-USDT"])
+        worker.set_freq(1.0)
+
+        worker._on_trade("BTC-USDT", 97500.0, 0.5, "buy", 1714838400000)
+        worker._on_trade("BTC-USDT", 97600.0, 0.3, "sell", 1714838400100)
+        worker._on_trade("ETH-USDT", 3800.0, 2.0, "buy", 1714838400050)
+
+        round_bars, round_trades = worker.flush()
+
+        assert "BTC-USDT" in round_bars
+        assert "ETH-USDT" in round_bars
+        assert "BTC-USDT" in round_trades
+        assert "ETH-USDT" in round_trades
+
+        btc_bar = round_bars["BTC-USDT"]
+        assert btc_bar.shape == (8,)
+        assert btc_bar[1] == pytest.approx(97500.0)  # open
+        assert btc_bar[2] == pytest.approx(97600.0)  # high
+        assert btc_bar[3] == pytest.approx(97500.0)  # low
+        assert btc_bar[4] == pytest.approx(97600.0)  # close (last trade)
+        assert btc_bar[5] == pytest.approx(0.8)       # volume (0.5 + 0.3)
+
+        btc_trades = round_trades["BTC-USDT"]
+        assert btc_trades["buy_vol"] == pytest.approx(0.5)
+        assert btc_trades["sell_vol"] == pytest.approx(0.3)
+        assert btc_trades["trade_count"] == 2
+
+    def test_flush_resets(self):
+        worker = BinanceTradesWorker(symbols=["BTC-USDT"])
+        worker.set_freq(1.0)
+
+        worker._on_trade("BTC-USDT", 97500.0, 1.0, "buy", 1714838400000)
+        _, trades1 = worker.flush()
+        assert trades1["BTC-USDT"]["trade_count"] == 1
+
+        _, trades2 = worker.flush()
+        assert trades2["BTC-USDT"]["trade_count"] == 0
+        assert trades2["BTC-USDT"]["vwap"] == pytest.approx(97500.0)
+
+    def test_flush_no_trades_nan(self):
+        worker = BinanceTradesWorker(symbols=["SOL-USDT"])
+        round_bars, round_trades = worker.flush()
+
+        assert round_trades["SOL-USDT"]["trade_count"] == 0
+        assert math.isnan(round_trades["SOL-USDT"]["vwap"])
+        assert math.isnan(round_trades["SOL-USDT"]["open"])
+        assert math.isnan(float(round_bars["SOL-USDT"][1]))
+
+    def test_trade_count_and_flush_count(self):
+        worker = BinanceTradesWorker(symbols=["BTC-USDT"])
+        assert worker.trade_count == 0
+        assert worker.flush_count == 0
+
+        worker._on_trade("BTC-USDT", 97500.0, 1.0, "buy", 0)
+        worker._on_trade("BTC-USDT", 97600.0, 1.0, "sell", 0)
+        assert worker.trade_count == 2
+
+        worker.flush()
+        worker.flush()
+        assert worker.flush_count == 2
+
+    def test_unknown_symbol_ignored(self):
+        worker = BinanceTradesWorker(symbols=["BTC-USDT"])
+        worker._on_trade("UNKNOWN-USDT", 100.0, 1.0, "buy", 0)
+        assert worker.trade_count == 0
+
+    def test_stats(self):
+        worker = BinanceTradesWorker(symbols=["BTC-USDT", "ETH-USDT"])
+        s = worker.stats()
+        assert s["symbols"] == 2
+        assert s["trade_count"] == 0
+        assert s["flush_count"] == 0
+
+    def test_vwap_calculation(self):
+        worker = BinanceTradesWorker(symbols=["BTC-USDT"])
+        worker._on_trade("BTC-USDT", 100.0, 3.0, "buy", 0)
+        worker._on_trade("BTC-USDT", 200.0, 1.0, "sell", 0)
+
+        _, trades = worker.flush()
+        expected_vwap = (100.0 * 3.0 + 200.0 * 1.0) / (3.0 + 1.0)
+        assert trades["BTC-USDT"]["vwap"] == pytest.approx(expected_vwap)
+
+
+class TestBinanceTradesWorkerWithEngine:
+    """Test that BinanceTradesWorker output is compatible with Engine._runtime_loop."""
+
+    def test_flush_compatible_with_runtime_loop(self):
+        """The (round_bars, round_trades) format must be consumable by Engine."""
+        worker = BinanceTradesWorker(symbols=["BTC-USDT", "ETH-USDT"])
+        worker.set_freq(1.0)
+
+        worker._on_trade("BTC-USDT", 97500.0, 0.5, "buy", 1714838400000)
+        worker._on_trade("ETH-USDT", 3800.0, 2.0, "sell", 1714838400050)
+
+        round_bars, round_trades = worker.flush()
+
+        for sym in ("BTC-USDT", "ETH-USDT"):
+            bar = round_bars[sym]
+            assert bar.dtype == np.float64
+            assert bar.shape == (8,)
+            ts = int(bar[0])
+            assert ts > 0
+            close = float(bar[4])
+            assert close > 0
+
+            trades = round_trades[sym]
+            assert "vwap" in trades
+            assert "buy_vol" in trades
+            assert "sell_vol" in trades
+            assert "trade_count" in trades

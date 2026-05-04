@@ -11,19 +11,20 @@ KlinePublisher.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from typing import Callable
 
 import aiohttp
 
-from ..common import MAX_SUBS_PER_CONN, OKX_WS_BUSINESS, SUBS_BATCH_SIZE, chunk
+from dataflow.base_collector import BaseCollector
+
+from ..common import MAX_SUBS_PER_CONN, OKX_WS_BUSINESS, SUBS_BATCH_SIZE
 
 logger = logging.getLogger(__name__)
 
 
-class OKXKlineCollector:
+class OKXKlineCollector(BaseCollector):
     """Connect to OKX and stream candle updates for a symbol set.
 
     Parameters
@@ -44,56 +45,28 @@ class OKXKlineCollector:
         on_candle: Callable[[str, list], None],
         channel: str = "candle1s",
     ):
-        self.symbols = list(symbols)
+        super().__init__(symbols, max_per_conn=MAX_SUBS_PER_CONN)
         self.on_candle = on_candle
         self.channel = channel
-        self._running = True
 
-    async def run(self):
-        """Block forever, streaming candle updates and auto-reconnecting."""
-        async with aiohttp.ClientSession() as session:
-            tasks = [
-                asyncio.create_task(self._ws_loop(session, group))
-                for group in chunk(self.symbols, MAX_SUBS_PER_CONN)
-            ]
-            await asyncio.gather(*tasks)
-
-    def stop(self):
-        self._running = False
-
-    # ── internal ──────────────────────────────────────────────
-
-    async def _ws_loop(self, session: aiohttp.ClientSession, symbols: list[str]):
-        while self._running:
-            try:
-                await self._connect_and_listen(session, symbols)
-            except asyncio.CancelledError:
-                raise
-            except (aiohttp.WSServerHandshakeError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                logger.warning(
-                    "WS %s disconnected: %s — reconnecting in 3s",
-                    self.channel, exc,
-                )
-            except Exception:
-                logger.exception("Unexpected WS error on %s — reconnecting in 5s", self.channel)
-                await asyncio.sleep(5)
-                continue
-            await asyncio.sleep(3)
-
-    async def _connect_and_listen(self, session: aiohttp.ClientSession, symbols: list[str]):
+    async def _connect_and_listen(
+        self, session: aiohttp.ClientSession, symbols: list[str]
+    ) -> None:
         async with session.ws_connect(OKX_WS_BUSINESS, heartbeat=20) as ws:
             logger.info("WS connected for %s (%d symbols)", self.channel, len(symbols))
             args = [{"channel": self.channel, "instId": sym} for sym in symbols]
-            for batch in chunk(args, SUBS_BATCH_SIZE):
-                await ws.send_json({"op": "subscribe", "args": batch})
+            for batch in self._chunk(args, SUBS_BATCH_SIZE):
+                await ws.send_json({"op": "subscribe", "args": list(batch)})
 
             async for msg in ws:
+                if not self._running:
+                    break
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     self._dispatch(msg.data)
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
 
-    def _dispatch(self, raw_text: str):
+    def _dispatch(self, raw_text: str) -> None:
         try:
             payload = json.loads(raw_text)
         except json.JSONDecodeError:

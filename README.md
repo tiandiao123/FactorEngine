@@ -2,25 +2,27 @@
 
 > **This project is under active development. APIs and layout may change.**
 
-Real-time factor stack for **quantitative trading**: Python **market data (OKX kline + trades)**, **33 C++ operator kernels** (`fe_ops`, pybind11), and a **DAG streaming runtime** (`fe_runtime`) that evaluates compiled factor graphs bar-by-bar with minimal Python overhead in the hot path.
+Real-time factor stack for **quantitative trading**: Python **market data collection** (OKX + Binance Futures), **33 C++ operator kernels** (`fe_ops`, pybind11), and a **DAG streaming runtime** (`fe_runtime`) that evaluates compiled factor graphs bar-by-bar with minimal Python overhead in the hot path.
 
-For a reading-order tour, see [`docs/TUTORIAL.md`](docs/TUTORIAL.md) (some paths are historical; live code lives under `dataflow/okx/kline/`, `dataflow/okx/trades/`, and `dataflow/clock_driver.py`).
+**123 factors** across two groups: **70 kline-based** (`okx_perp`) and **53 trades-based** (`okx_perp_trades`).
 
-## Architecture (v4 — ClockDriver unified flush)
+For a reading-order tour, see [`docs/TUTORIAL.md`](docs/TUTORIAL.md). For the dataflow architecture, see [`dataflow/README.md`](dataflow/README.md).
+
+## Architecture (v4 — ClockDriver unified flush, multi-exchange)
 
 Top-level [`factorengine.engine.Engine`](factorengine/engine.py) coordinates:
 
-1. **Dataflow threads** — independent workers, each collecting one data stream:
-   - **Kline** — `KlineWorker`: OKX candle WS → `KlineAdapter` → `KlinePublisher` (internal round buffer).
-   - **Trades** — `TradesWorker`: OKX public trades WS → per-symbol `TradesAccumulator` (incremental `vwap`, `buy_vol`, `sell_vol`, OHLCV per bar bucket).
+1. **Dataflow threads** — independent workers per exchange, each collecting one data stream:
+   - **Kline** — `KlineWorker` (OKX) / `BinanceKlineWorker`: exchange WS → adapter → `KlinePublisher` (shared round buffer).
+   - **Trades** — `TradesWorker` (OKX) / `BinanceTradesWorker`: exchange WS → per-symbol `TradesAccumulator` (shared incremental aggregator).
 2. **ClockDriver thread** — the **single aggregation center**. Fires on wall-clock aligned boundaries (`:00`, `:05`, `:10`, …), calls `flush()` on every registered worker, merges results via `_aggregate()`, and pushes one `(merged_bars, merged_trades)` payload into `bar_queue`. Workers never touch `bar_queue`.
 3. **Runtime thread** — `bar_queue.get()` → builds `fe_runtime.BarData` (OHLCV + `ret` + optional trades fields) → `InferenceEngine.push_bars` → **signal deque**.
 4. **Main thread** — `get_factor_outputs()` (O(1)), optional `get_data()` (bar cache snapshot), `kline_stats` / `trades_stats` / `clock_stats`.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  okx-kline thread:  OKX candle WS → Adapter → Publisher (buffer)   │
-│  okx-trades thread: OKX trades WS → per-symbol Accumulators        │
+┌─ Exchange Workers (OKX or Binance) ─────────────────────────────────┐
+│  kline thread:  Exchange WS → Collector → Adapter → Publisher       │
+│  trades thread: Exchange WS → Collector → per-symbol Accumulators   │
 └─────────────────┬──────────────────────────┬────────────────────────┘
                   │                          │
                   v                          v
@@ -43,6 +45,13 @@ Top-level [`factorengine.engine.Engine`](factorengine/engine.py) coordinates:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+### Supported exchanges
+
+| Exchange | `exchange=` | Kline | Trades | Min kline freq | Notes |
+|----------|-------------|-------|--------|----------------|-------|
+| **OKX** | `"okx"` (default) | `candle1s`+ | `trades` | 1 second | Full kline+trades support |
+| **Binance Futures** | `"binance"` | `kline_1m`+ | `aggTrade` | 1 minute | No sub-minute klines; use `data_source="trades"` for 1s |
+
 ### `data_source` (live)
 
 | Value | Workers started | Who flushes |
@@ -55,17 +64,20 @@ Top-level [`factorengine.engine.Engine`](factorengine/engine.py) coordinates:
 
 | Area | Role |
 |------|------|
-| **`dataflow/okx/kline/`** | Candle WS: `collector` → `adapter` → `publisher`; `worker` exposes `flush()` for ClockDriver. |
-| **`dataflow/okx/trades/`** | Trades WS: `collector` → `accumulator` → `worker`; `flush()` returns `(round_bars, round_trades)`. |
+| **`dataflow/`** | Market data collection & aggregation. See [`dataflow/README.md`](dataflow/README.md) for full architecture. |
+| **`dataflow/base_collector.py`** | `BaseCollector` ABC — shared WS reconnect logic for all collectors. |
+| **`dataflow/kline/publisher.py`** | Exchange-agnostic `KlinePublisher` — round batching, timeout, forward-fill. |
+| **`dataflow/trades/accumulator.py`** | Exchange-agnostic `TradesAccumulator` — per-symbol O(1) streaming aggregation. |
 | **`dataflow/clock_driver.py`** | Unified wall-clock flush & aggregation center; `register(name, worker)` + `_aggregate()` → `bar_queue`. |
+| **`dataflow/okx/`** | OKX exchange: kline `collector` → `adapter` → `publisher` → `worker`; trades `collector` → `accumulator` → `worker`. |
+| **`dataflow/binance/`** | Binance Futures: same pattern as OKX, with `/market` WS route and `aggTrade` stream. |
 | **`dataflow/simulation/`** | Synthetic bars + optional `bar_queue` for tests/demos. |
 | **`dataflow/cache.py`** | Rolling `BarCache` for `get_data()` snapshots. |
-| **`factorengine.Engine`** | `factor_group` as **str or list** of registry groups; **`data_source`**; **`get_factor_outputs`**, **`get_data`**, **`kline_stats`**, **`trades_stats`**, **`clock_stats`**. |
+| **`factorengine.Engine`** | `exchange`, `data_source`, `factor_group` as **str or list**; **`get_factor_outputs`**, **`get_data`**, **`kline_stats`**, **`trades_stats`**, **`clock_stats`**. |
 | **`fe_ops` / `fe_runtime`** | Batch kernels + DAG streaming; **`BarData`** includes **`vwap`, `buy_vol`, `sell_vol`**; `add_input` supports those names. |
-| **`factorengine/factors/`** | `FactorRegistry`, `@register_factor`, visualization — e.g. **`okx_perp`** (60 kbar factors), **`okx_perp_trades`** (6 trades factors). |
-| **`factorengine/scheduler/`** | Older Python-side scheduler experiments (not the main C++ hot path). |
+| **`factorengine/factors/`** | `FactorRegistry`, `@register_factor` — **`okx_perp`** (70 kline factors), **`okx_perp_trades`** (53 trades factors). |
 
-Design references: [`docs/20260503/kline_v2/`](docs/20260503/kline_v2/), [`docs/20260503/trades_v1/trades_integration_design.md`](docs/20260503/trades_v1/trades_integration_design.md), [`docs/20260503/trades_v2/`](docs/20260503/trades_v2/).
+Design references: [`docs/20260503/kline_v2/`](docs/20260503/kline_v2/), [`docs/20260503/trades_v1/`](docs/20260503/trades_v1/), [`docs/20260503/trades_v2/`](docs/20260503/trades_v2/), [`docs/20260504/binance_dataflow_design.md`](docs/20260504/binance_dataflow_design.md).
 
 ## Quick start
 
@@ -111,8 +123,8 @@ print(g.output())
 from factorengine.factors import FactorRegistry
 
 reg = FactorRegistry()
-reg.load_group("okx_perp")
-reg.load_group("okx_perp_trades")
+reg.load_group("okx_perp")          # 70 kline-based factors
+reg.load_group("okx_perp_trades")   # 53 trades-based factors
 graphs_k = reg.build_group("okx_perp")
 graphs_t = reg.build_group("okx_perp_trades")
 ```
@@ -155,14 +167,16 @@ render_graph(g, "factor_0001.png")   # needs graphviz
 
 | Script | Description |
 |--------|-------------|
-| [`examples/engine/engine_rt_live.py`](examples/engine/engine_rt_live.py) | Kline + factors (`factor_group="okx_perp"`, default `data_source="kline"`). |
-| [`examples/engine/engine_rt_trades.py`](examples/engine/engine_rt_trades.py) | Kline + trades + **both** factor groups: `factor_group=["okx_perp", "okx_perp_trades"]`, `data_source="kline_trades"`. |
-| [`examples/engine/engine_rt_simulation.py`](examples/engine/engine_rt_simulation.py) | Simulation bars + factors. |
+| [`engine_rt_live.py`](examples/engine/engine_rt_live.py) | OKX kline + factors (`data_source="kline"`). |
+| [`engine_rt_trades.py`](examples/engine/engine_rt_trades.py) | OKX trades-only with 20 symbols and 53 trades factors. |
+| [`engine_rt_binance_trades.py`](examples/engine/engine_rt_binance_trades.py) | **Binance Futures** trades-only, 20 symbols, production `aggTrade` stream. |
+| [`engine_rt_simulation.py`](examples/engine/engine_rt_simulation.py) | Simulation bars + factors. |
+
+### OKX kline example
 
 ```python
 from factorengine.engine import Engine
 
-# Kline + kbar + trades factors (combined registry load)
 engine = Engine(
     symbols=["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
     mode="live",
@@ -176,11 +190,43 @@ factors = engine.get_factor_outputs()
 engine.stop()
 ```
 
+### Binance Futures trades example
+
+```python
+from factorengine.engine import Engine
+
+engine = Engine(
+    symbols=["BTC-USDT", "ETH-USDT", "SOL-USDT"],
+    mode="live",
+    exchange="binance",         # Binance Futures (USDT-M)
+    data_freq="1s",
+    factor_group=["okx_perp_trades"],
+    num_threads=4,
+    data_source="trades",       # aggTrade → OHLCV + vwap/buy/sell
+)
+engine.start()
+factors = engine.get_factor_outputs()
+engine.stop()
+```
+
+### Binance Futures kline example (≥ 1m)
+
+```python
+engine = Engine(
+    symbols=["BTC-USDT", "ETH-USDT"],
+    mode="live",
+    exchange="binance",
+    data_freq="60s",            # minimum 1m for Binance klines
+    factor_group=["okx_perp"],
+    data_source="kline",
+)
+```
+
 `factor_group` must be set to start the inference thread and wire `bar_queue`; workers are started based on `data_source`; ClockDriver is created when `factor_group` is set, registering the appropriate workers.
 
 ## Native C++ kernels (`fe_ops`)
 
-**33 operators** (P0–P3), aligned with Python references in `tests/kernel/` where covered.
+**33 operators** (P0–P3), aligned with Python references in `tests/kernel/` where covered. Full documentation: [`docs/OPERATORS.md`](docs/OPERATORS.md).
 
 | Tier | Examples | Count |
 |------|-----------|-------|
@@ -192,13 +238,14 @@ engine.stop()
 ## Tests
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v                          # full suite (1080+ tests)
 
-pytest tests/kernel/ -v
-pytest tests/factors/ -v
-pytest tests/dataflow/ -v
-pytest tests/runtime_engine/ -v
-pytest tests/trades/ -v
+pytest tests/kernel/ -v                   # C++ operator alignment
+pytest tests/factors/ -v                  # registry + inference
+pytest tests/dataflow/ -v                 # kline/trades pipeline
+pytest tests/dataflow/binance/ -v         # Binance-specific
+pytest tests/runtime_engine/ -v           # engine integration
+pytest tests/trades/ -v                   # accumulator + trades factors
 
 python tests/kernel/benchmark/bench_ops.py
 python tests/visualization/demo_visualize.py
@@ -210,26 +257,37 @@ python tests/visualization/demo_visualize.py
 FactorEngine/
 ├── setup.py
 ├── pyproject.toml
-├── examples/engine/           # engine_rt_live, engine_rt_simulation, engine_rt_trades
+├── examples/engine/              # engine_rt_live, engine_rt_trades,
+│                                 # engine_rt_binance_trades, engine_rt_simulation
 ├── dataflow/
+│   ├── base_collector.py         # BaseCollector ABC (shared WS reconnect)
 │   ├── cache.py
-│   ├── clock_driver.py        # unified flush & aggregation center
+│   ├── clock_driver.py           # unified flush & aggregation center
+│   ├── kline/publisher.py        # exchange-agnostic round batching
+│   ├── trades/accumulator.py     # exchange-agnostic trades aggregation
 │   ├── okx/
 │   │   ├── common.py
-│   │   ├── kline/             # collector → adapter → publisher → worker
-│   │   └── trades/            # collector → accumulator → worker
+│   │   ├── kline/                # collector → adapter → publisher → worker
+│   │   └── trades/               # collector → accumulator → worker
+│   ├── binance/
+│   │   ├── common.py             # /market WS route, symbol mapping
+│   │   ├── kline/                # collector → adapter → worker (≥1m)
+│   │   └── trades/               # collector (aggTrade) → worker
 │   └── simulation/
 ├── factorengine/
-│   ├── engine.py
+│   ├── engine.py                 # Engine (exchange, data_source, factor_group)
 │   ├── factors/
-│   │   ├── okx_perp/          # 60 kline-based factors
-│   │   └── okx_perp_trades/   # 6 trades-based factors
+│   │   ├── registry.py           # FactorRegistry, @register_factor
+│   │   ├── okx_perp/             # 70 kline-based factors
+│   │   └── okx_perp_trades/      # 53 trades-based factors
 │   └── scheduler/
-├── native/                    # CMake: fe_ops + fe_runtime
+├── native/                       # CMake: fe_ops + fe_runtime
 └── tests/
     ├── kernel/
     ├── factors/
     ├── dataflow/
+    │   ├── okx/
+    │   └── binance/              # 65 Binance-specific tests
     ├── runtime_engine/
     ├── trades/
     └── visualization/
@@ -239,13 +297,12 @@ FactorEngine/
 
 | Doc | Purpose |
 |-----|---------|
-| [`docs/TUTORIAL.md`](docs/TUTORIAL.md) | Repo orientation. |
+| [`docs/TUTORIAL.md`](docs/TUTORIAL.md) | Repo orientation and reading-order guide. |
+| [`dataflow/README.md`](dataflow/README.md) | Dataflow architecture, exchange notes, extension guide. |
+| [`docs/OPERATORS.md`](docs/OPERATORS.md) | Full C++ operator list with math formulas and test locations. |
+| [`docs/20260504/binance_dataflow_design.md`](docs/20260504/binance_dataflow_design.md) | Binance integration design and implementation notes. |
 | [`docs/20260503/kline_v2/kline_to_factor_pipeline.md`](docs/20260503/kline_v2/kline_to_factor_pipeline.md) | Kline → factor pipeline. |
-| [`docs/20260503/kline_v2/round_batching_design.md`](docs/20260503/kline_v2/round_batching_design.md) | Round batching. |
-| [`docs/20260503/trades_v1/trades_integration_design.md`](docs/20260503/trades_v1/trades_integration_design.md) | Trades integration design (Phase 1). |
-| [`docs/20260503/trades_v1/trades_kline_full_pipeline.md`](docs/20260503/trades_v1/trades_kline_full_pipeline.md) | Full kline+trades pipeline walkthrough. |
 | [`docs/20260503/trades_v2/clockdriver_refactor_plan.md`](docs/20260503/trades_v2/clockdriver_refactor_plan.md) | ClockDriver refactor plan (Plan B). |
-| [`docs/20260503/trades_v2/trades_v2_changelog.md`](docs/20260503/trades_v2/trades_v2_changelog.md) | Trades v2 changelog / migration notes. |
 
 ## Authors
 
