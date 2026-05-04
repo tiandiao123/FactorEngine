@@ -32,7 +32,7 @@ data_source modes:
 In all live modes with factor_group, ClockDriver is the single component
 that pushes aggregated data to bar_queue.  Workers never touch bar_queue.
 
-Usage (live with kline + trades factors):
+Usage (live with kline + trades factors — OKX):
     engine = Engine(symbols=["BTC-USDT-SWAP"], mode="live", data_freq="5s",
                     factor_group=["okx_perp", "okx_perp_trades"],
                     num_threads=4, data_source="kline_trades")
@@ -40,6 +40,13 @@ Usage (live with kline + trades factors):
     time.sleep(30)
     factors = engine.get_factor_outputs()
     engine.stop()
+
+Usage (live trades-only — Binance Futures):
+    engine = Engine(symbols=["BTC-USDT", "ETH-USDT"], mode="live",
+                    exchange="binance", data_freq="1s",
+                    factor_group="okx_perp_trades", data_source="trades",
+                    num_threads=4)
+    engine.start()
 
 Usage (simulation with factors):
     engine = Engine(symbols=["BTC-USDT-SWAP"], mode="simulation", sim_seed=42,
@@ -79,6 +86,7 @@ class Engine:
     """Top-level entry point. Owns the dataflow manager and shared bar cache."""
 
     _VALID_DATA_SOURCES = ("kline", "trades", "kline_trades")
+    _VALID_EXCHANGES = ("okx", "binance")
 
     def __init__(
         self,
@@ -96,11 +104,18 @@ class Engine:
         bar_queue_timeout: float = 0.5,
         enable_debug_cache: bool = True,
         data_source: str = "kline",
+        exchange: str = "okx",
+        testnet: bool = False,
     ):
         if data_source not in self._VALID_DATA_SOURCES:
             raise ValueError(
                 f"Invalid data_source: {data_source!r}. "
                 f"Use one of {self._VALID_DATA_SOURCES}"
+            )
+        if exchange not in self._VALID_EXCHANGES:
+            raise ValueError(
+                f"Invalid exchange: {exchange!r}. "
+                f"Use one of {self._VALID_EXCHANGES}"
             )
 
         self.symbols = symbols
@@ -109,6 +124,8 @@ class Engine:
         self.bar_window_length = bar_window_length
         self.mode = mode
         self._data_source = data_source
+        self._exchange = exchange
+        self._testnet = testnet
 
         self.data_freq_seconds = parse_freq(data_freq)
         self.pull_interval_seconds = parse_freq(pull_interval)
@@ -172,30 +189,65 @@ class Engine:
         """Wire up live mode workers and ClockDriver."""
         from dataflow.cache import BarCache
 
-        bar_channel, _ = resolve_bar_channel(self.data_freq_seconds)
-        logger.info(
-            "Live mode: data_freq=%s (%ds) → channel=%s, factors=%s, data_source=%s",
-            self.data_freq, self.data_freq_seconds, bar_channel,
-            self._factor_group or "none", data_source,
-        )
+        exchange = self._exchange
+
+        # Binance Futures does not support kline below 1m.
+        if exchange == "binance" and data_source in ("kline", "kline_trades"):
+            if self.data_freq_seconds < 60:
+                raise ValueError(
+                    f"Binance Futures does not support kline below 1m. "
+                    f"Use data_source='trades' for {self.data_freq} frequency."
+                )
+
+        if exchange == "okx":
+            bar_channel, _ = resolve_bar_channel(self.data_freq_seconds)
+            logger.info(
+                "Live mode [OKX]: data_freq=%s (%ds) → channel=%s, "
+                "factors=%s, data_source=%s",
+                self.data_freq, self.data_freq_seconds, bar_channel,
+                self._factor_group or "none", data_source,
+            )
+        else:
+            logger.info(
+                "Live mode [%s]: data_freq=%s (%ds), factors=%s, data_source=%s",
+                exchange.upper(), self.data_freq, self.data_freq_seconds,
+                self._factor_group or "none", data_source,
+            )
 
         if enable_debug_cache:
             self._debug_cache = BarCache(window_length=self.bar_window_length)
 
-        # ── Create workers based on data_source ──
+        # ── Create workers based on data_source + exchange ──
         if data_source in ("kline", "kline_trades"):
-            from dataflow.okx.kline.worker import KlineWorker
+            if exchange == "okx":
+                from dataflow.okx.kline.worker import KlineWorker
 
-            self._kline_worker = KlineWorker(
-                symbols=symbols,
-                freq_seconds=self.data_freq_seconds,
-                debug_cache=self._debug_cache,
-            )
+                self._kline_worker = KlineWorker(
+                    symbols=symbols,
+                    freq_seconds=self.data_freq_seconds,
+                    debug_cache=self._debug_cache,
+                )
+            elif exchange == "binance":
+                from dataflow.binance.kline.worker import BinanceKlineWorker
+
+                self._kline_worker = BinanceKlineWorker(
+                    symbols=symbols,
+                    freq_seconds=self.data_freq_seconds,
+                    debug_cache=self._debug_cache,
+                    testnet=self._testnet,
+                )
 
         if data_source in ("trades", "kline_trades"):
-            from dataflow.okx.trades.worker import TradesWorker
+            if exchange == "okx":
+                from dataflow.okx.trades.worker import TradesWorker
 
-            self._trades_worker = TradesWorker(symbols=symbols)
+                self._trades_worker = TradesWorker(symbols=symbols)
+            elif exchange == "binance":
+                from dataflow.binance.trades.worker import BinanceTradesWorker
+
+                self._trades_worker = BinanceTradesWorker(
+                    symbols=symbols, testnet=self._testnet,
+                )
             self._trades_worker.set_freq(self.data_freq_seconds)
 
         # ── ClockDriver: unified flush & aggregation ──
@@ -386,9 +438,9 @@ class Engine:
             self._dataflow.start()
 
         logger.info(
-            "Engine started: mode=%s, %d symbols, data_freq=%s (%ds), "
+            "Engine started: mode=%s, exchange=%s, %d symbols, data_freq=%s (%ds), "
             "bar_window=%d, factors=%s, data_source=%s",
-            self.mode, len(self.symbols), self.data_freq,
+            self.mode, self._exchange, len(self.symbols), self.data_freq,
             self.data_freq_seconds, self.bar_window_length,
             "+".join(self._factor_groups) if self._factor_groups else "none",
             self._data_source,
@@ -443,6 +495,11 @@ class Engine:
     def data_source(self) -> str:
         """Active data source mode."""
         return self._data_source
+
+    @property
+    def exchange(self) -> str:
+        """Active exchange."""
+        return self._exchange
 
     @property
     def kline_stats(self) -> dict[str, int]:
