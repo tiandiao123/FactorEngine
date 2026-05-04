@@ -192,3 +192,44 @@ def build_imbalance_close_beta() -> rt.FactorGraph:
     g.add_unary(Op.NEG, ranked)
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0011: Volume-Return Alpha — excess return unexplained by volume
+#    Intercept of ret regressed on SLog1p(vol): positive = hidden alpha
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0011")
+def build_volume_return_alpha() -> rt.FactorGraph:
+    """TsZscore(TsIntercept(SLog1p(volume), ret, 60), 120)"""
+    g = rt.FactorGraph()
+    vol = g.add_input("volume")
+    ret = g.add_input("ret")
+    svol = g.add_unary(Op.SLOG1P, vol)
+    alpha = g.add_bivariate(Op.TS_INTERCEPT, svol, ret, 60)
+    g.add_rolling(Op.TS_ZSCORE, alpha, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0012: Imbalance-Return Residual — return not explained by imbalance
+#    Baseline shift in price movement independent of trade flow
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0012")
+def build_imbalance_return_residual() -> rt.FactorGraph:
+    """Neg(TsRank(TsIntercept(Div(Sub(buy_vol,sell_vol),Add(buy_vol,sell_vol)), TsPct(close,1), 30), 120))"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    close = g.add_input("close")
+    diff = g.add_binary(Op.SUB, bv, sv)
+    total = g.add_binary(Op.ADD, bv, sv)
+    imbalance = g.add_binary(Op.DIV, diff, total)
+    pct = g.add_rolling(Op.TS_PCT, close, 1)
+    alpha = g.add_bivariate(Op.TS_INTERCEPT, imbalance, pct, 30)
+    ranked = g.add_rolling(Op.TS_RANK, alpha, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g

@@ -148,7 +148,8 @@ PYBIND11_MODULE(fe_ops, m) {
     // P2 bivariate
     m.def("rolling_corr",  [](NpArray x, NpArray y, int w) { return py_bivariate(fe::ops::rolling_corr, x, y, w); }, py::arg("x"), py::arg("y"), py::arg("window"));
     m.def("rolling_cov",   [](NpArray x, NpArray y, int w) { return py_bivariate(fe::ops::rolling_cov, x, y, w); }, py::arg("x"), py::arg("y"), py::arg("window"));
-    m.def("rolling_beta",  [](NpArray x, NpArray y, int w) { return py_bivariate(fe::ops::rolling_beta, y, x, w); }, py::arg("x"), py::arg("y"), py::arg("window"));
+    m.def("rolling_beta",      [](NpArray x, NpArray y, int w) { return py_bivariate(fe::ops::rolling_beta, y, x, w); },      py::arg("x"), py::arg("y"), py::arg("window"));
+    m.def("rolling_intercept", [](NpArray x, NpArray y, int w) { return py_bivariate(fe::ops::rolling_intercept, y, x, w); }, py::arg("x"), py::arg("y"), py::arg("window"));
     m.def("autocorr", [](NpArray x, int w, int lag) {
         auto buf = x.request();
         auto n = static_cast<int>(buf.size);
