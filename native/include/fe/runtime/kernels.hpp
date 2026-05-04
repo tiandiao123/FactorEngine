@@ -380,6 +380,54 @@ private:
     int nan_count_;
 };
 
+// --------------- TsKurt (brute-force O(t) per step) ---------------
+class TsKurtPush {
+public:
+    explicit TsKurtPush(int window)
+        : t_(window >= 4 ? window : 4), ring_(t_), pos_(0), count_(0),
+          sum_(0.0), nan_count_(0) {}
+
+    void push(FeFloat v) {
+        if (count_ >= t_) {
+            FeFloat old = ring_[pos_ % t_];
+            if (fe_is_nan(old)) --nan_count_; else sum_ -= static_cast<double>(old);
+        }
+        ring_[pos_ % t_] = v;
+        if (fe_is_nan(v)) ++nan_count_; else sum_ += static_cast<double>(v);
+        ++pos_;
+        if (count_ < t_) ++count_;
+    }
+
+    [[nodiscard]] bool ready() const { return count_ >= t_ && nan_count_ == 0; }
+    [[nodiscard]] FeFloat output() const {
+        if (!ready()) return kNaN;
+        double dn = static_cast<double>(t_);
+        double mean = sum_ / dn;
+        double m2 = 0.0, m4 = 0.0;
+        for (int j = 0; j < t_; ++j) {
+            double d = static_cast<double>(ring_[j]) - mean;
+            double d2 = d * d;
+            m2 += d2;
+            m4 += d2 * d2;
+        }
+        if (m2 <= 0.0) return 0.0f;
+        double n1 = dn - 1.0;
+        double n2 = dn - 2.0;
+        double n3 = dn - 3.0;
+        return static_cast<FeFloat>(
+            (dn * (dn + 1.0) * n1 / (n2 * n3)) * (m4 / (m2 * m2))
+            - 3.0 * n1 * n1 / (n2 * n3));
+    }
+    void reset() { pos_ = 0; count_ = 0; sum_ = 0.0; nan_count_ = 0; }
+
+private:
+    int t_;
+    std::vector<FeFloat> ring_;
+    int pos_, count_;
+    double sum_;
+    int nan_count_;
+};
+
 // --------------- TsMed (rolling median, min_periods=t) ---------------
 class TsMedPush {
 public:
