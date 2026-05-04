@@ -134,7 +134,7 @@ class TestRsiEdgeCases:
             np.testing.assert_allclose(result[valid], 50.0, atol=0.1)
 
     @pytest.mark.parametrize("nan_ratio", [0.05, 0.2])
-    def test_with_nans(self, nan_ratio):
+    def test_with_nans_range_check(self, nan_ratio):
         rng = np.random.default_rng(123)
         data = rng.standard_normal(N).astype(np.float32).cumsum() + 100.0
         mask = rng.random(N) < nan_ratio
@@ -145,6 +145,31 @@ class TestRsiEdgeCases:
         if valid.any():
             assert (result[valid] >= 0.0 - 1e-5).all()
             assert (result[valid] <= 100.0 + 1e-5).all()
+
+    @pytest.mark.parametrize("w", WINDOWS)
+    def test_nan_values_agree_push_batch(self, w):
+        """Where both push and batch produce non-NaN, values must agree.
+        RSI's NaN gap-skipping means push (stateful) may recover from NaN
+        gaps differently than batch (uses same kernel but fresh state).
+        Since both use the same RsiKernel, they must agree identically."""
+        rng = np.random.default_rng(77)
+        data = rng.standard_normal(N).astype(np.float32).cumsum() + 100.0
+        data[rng.random(N) < 0.15] = np.nan
+        batch = fe_ops.rolling_rsi(data, w)
+        g = rt.FactorGraph()
+        c = g.add_input("close")
+        g.add_rolling(rt.Op.TS_RSI, c, w)
+        g.compile()
+        push_out = []
+        for v in data:
+            g.push_bar(float(v))
+            push_out.append(g.output())
+        push_arr = np.array(push_out, dtype=np.float32)
+        valid = ~np.isnan(batch) & ~np.isnan(push_arr)
+        if valid.any():
+            np.testing.assert_allclose(push_arr[valid], batch[valid], atol=1e-4)
+            assert (push_arr[valid] >= 0.0 - 1e-5).all()
+            assert (push_arr[valid] <= 100.0 + 1e-5).all()
 
     @pytest.mark.parametrize("w", WINDOWS)
     def test_push_matches_batch_with_nans(self, w):

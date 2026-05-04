@@ -474,6 +474,7 @@ def build_close_macd_dif() -> rt.FactorGraph:
 # ═══════════════════════════════════════════════════════════════
 #  T0026: Close MACD DEA — smoothed signal line
 #    DEA crossing zero = major trend reversal
+#    Negated so lower rank = stronger bullish signal
 # ═══════════════════════════════════════════════════════════════
 
 @register_factor("okx_perp_trades", "T0026")

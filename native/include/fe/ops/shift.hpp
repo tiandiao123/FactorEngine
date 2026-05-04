@@ -70,7 +70,7 @@ inline void ts_pct(const FeFloat* x, FeFloat* out, int n, int lag) {
     out[i] = x[i] / (x[i - t] + kEps) - 1.0f;
 }
 
-// TS_GROWTH is semantically identical to TS_PCT: (x - x[t-n]) / x[t-n]
+// TS_GROWTH is semantically identical to TS_PCT: (x - x[t-n]) / (x[t-n] + kEps)
 inline void ts_growth(const FeFloat* x, FeFloat* out, int n, int lag) {
   ts_pct(x, out, n, lag);
 }
