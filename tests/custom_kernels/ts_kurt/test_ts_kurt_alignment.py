@@ -6,7 +6,7 @@ Layer B: push streaming (FactorGraph) vs batch C++ (fe_ops.rolling_kurt)
 
 Usage:
     cd FactorEngine
-    pytest tests/custom_kernels/test_ts_kurt_alignment.py -v
+    pytest tests/custom_kernels/ts_kurt/test_ts_kurt_alignment.py -v
 """
 from __future__ import annotations
 
