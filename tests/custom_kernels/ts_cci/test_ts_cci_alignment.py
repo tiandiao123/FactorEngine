@@ -6,8 +6,6 @@ CCI = (TP - SMA(TP, w)) / (0.015 * MAD(TP, w))
 Reference: pure-Python implementation of Lambert's CCI formula.
 """
 
-import math
-
 import numpy as np
 import pytest
 

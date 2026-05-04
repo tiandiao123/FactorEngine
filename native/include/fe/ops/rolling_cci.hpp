@@ -61,7 +61,7 @@ class CciKernel {
     }
     mad /= dn;
 
-    if (mad < kCciMadEps) return 0.0f;
+    if (mad < kCciMadEps) return static_cast<FeFloat>(0.0);
 
     FeFloat cur = ring_[(pos_ - 1) % t_];
     double cci = (static_cast<double>(cur) - mean) / (kCciLambert * mad);

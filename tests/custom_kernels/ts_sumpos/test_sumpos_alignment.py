@@ -5,8 +5,6 @@ TS_SUM_POS: sum of strictly positive values in rolling window.
 TS_POS_RATIO: fraction of strictly positive values in rolling window.
 """
 
-import math
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -29,7 +27,7 @@ def _pandas_updown_ratio(x: np.ndarray, w: int) -> np.ndarray:
         sp = np.sum(v[v > 0])
         sn = np.sum(np.abs(v[v < 0]))
         if sn < 1e-15:
-            return np.nan if sp < 1e-15 else np.nan
+            return 0.0 if sp < 1e-15 else np.nan
         return sp / sn
     return s.rolling(w).apply(_ud, raw=True).values
 
