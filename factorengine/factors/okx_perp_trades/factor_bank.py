@@ -113,3 +113,41 @@ def build_vwap_mean_reversion() -> rt.FactorGraph:
     g.add_unary(Op.NEG, g.add_binary(Op.DIV, diff, vol))
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0007: Imbalance Kurtosis — tail risk in trade imbalance
+#    High kurtosis = extreme buy/sell bursts (informed trading)
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0007")
+def build_imbalance_kurtosis() -> rt.FactorGraph:
+    """TsZscore(TsKurt(Div(Sub(buy_vol, sell_vol), Add(buy_vol, sell_vol)), 60), 120)"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    diff = g.add_binary(Op.SUB, bv, sv)
+    total = g.add_binary(Op.ADD, bv, sv)
+    imbalance = g.add_binary(Op.DIV, diff, total)
+    kurt = g.add_rolling(Op.TS_KURT, imbalance, 60)
+    g.add_rolling(Op.TS_ZSCORE, kurt, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0008: Buy Volume Kurtosis — tail detection in buy pressure
+#    Sudden spikes in buy volume create heavy tails
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0008")
+def build_buy_vol_kurtosis() -> rt.FactorGraph:
+    """Neg(TsRank(TsKurt(SLog1p(buy_vol), 30), 120))"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sbv = g.add_unary(Op.SLOG1P, bv)
+    kurt = g.add_rolling(Op.TS_KURT, sbv, 30)
+    ranked = g.add_rolling(Op.TS_RANK, kurt, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g

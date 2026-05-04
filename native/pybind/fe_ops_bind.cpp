@@ -15,6 +15,7 @@
 #include "fe/ops/bivariate.hpp"
 #include "fe/ops/rolling_extremal.hpp"
 #include "fe/ops/rolling_skew.hpp"
+#include "fe/ops/rolling_kurt.hpp"
 #include "fe/ops/rolling_median.hpp"
 #include "fe/ops/rolling_wma.hpp"
 
@@ -158,8 +159,9 @@ PYBIND11_MODULE(fe_ops, m) {
     // P2 rolling extremal
     m.def("ts_minmax_diff", [](NpArray x, int w) { return py_rolling(fe::ops::ts_minmax_diff, x, w); }, py::arg("x"), py::arg("window"));
 
-    // P2 rolling skew
+    // P2 rolling skew / kurt
     m.def("rolling_skew",  [](NpArray x, int w) { return py_rolling(fe::ops::rolling_skew, x, w); },  py::arg("x"), py::arg("window"));
+    m.def("rolling_kurt",  [](NpArray x, int w) { return py_rolling(fe::ops::rolling_kurt, x, w); },  py::arg("x"), py::arg("window"));
 
     // P3 rolling median / MAD
     m.def("rolling_median", [](NpArray x, int w) { return py_rolling(fe::ops::rolling_median, x, w); }, py::arg("x"), py::arg("window"));

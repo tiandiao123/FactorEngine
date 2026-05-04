@@ -51,7 +51,7 @@ enum class Op {
     DELAY, TS_DIFF, TS_PCT,
 
     // P2 bivariate / special
-    CORR, AUTOCORR, TS_MINMAX_DIFF, TS_SKEW,
+    CORR, AUTOCORR, TS_MINMAX_DIFF, TS_SKEW, TS_KURT,
 
     // P3 complex
     TS_MED, TS_MAD, TS_WMA, TS_MAX_DIFF, TS_MIN_DIFF,
@@ -86,6 +86,7 @@ using KernelVar = std::variant<
     AutocorrPush,                           // composite: Delay + Corr
     TsMinMaxDiffPush,                       // new: dual monotonic deque
     TsSkewPush,                             // new: brute-force O(t)
+    TsKurtPush,                             // new: brute-force O(t)
     TsMedPush,                              // new: sorted buffer
     TsMadPush,                              // new: two-pass median
     TsWmaPush,                              // new: weighted average
@@ -149,6 +150,10 @@ public:
     }
 
     int add_rolling(Op op, int src, int window) {
+        if (op == Op::TS_KURT && window < 4)
+            throw std::invalid_argument("TS_KURT requires window >= 4, got " + std::to_string(window));
+        if (op == Op::TS_SKEW && window < 3)
+            throw std::invalid_argument("TS_SKEW requires window >= 3, got " + std::to_string(window));
         FactorNode node;
         node.op = op;
         node.input_a = src;
@@ -282,6 +287,7 @@ public:
             case Op::AUTOCORR: { auto& k = std::get<AutocorrPush>(nd.kernel);        k.push(a);    values_[i] = k.output(); break; }
             case Op::TS_MINMAX_DIFF: { auto& k = std::get<TsMinMaxDiffPush>(nd.kernel); k.push(a); values_[i] = k.output(); break; }
             case Op::TS_SKEW:  { auto& k = std::get<TsSkewPush>(nd.kernel);          k.push(a); values_[i] = k.output(); break; }
+            case Op::TS_KURT:  { auto& k = std::get<TsKurtPush>(nd.kernel);          k.push(a); values_[i] = k.output(); break; }
 
             // ── P3 complex ──
             case Op::TS_MED:      { auto& k = std::get<TsMedPush>(nd.kernel);        k.push(a); values_[i] = k.output(); break; }
@@ -388,6 +394,7 @@ private:
         case Op::AUTOCORR: return "AUTOCORR";
         case Op::TS_MINMAX_DIFF: return "TS_MINMAX_DIFF";
         case Op::TS_SKEW:  return "TS_SKEW";
+        case Op::TS_KURT:  return "TS_KURT";
         case Op::TS_MED:   return "TS_MED";
         case Op::TS_MAD:   return "TS_MAD";
         case Op::TS_WMA:   return "TS_WMA";
@@ -409,7 +416,7 @@ private:
         case Op::MA: case Op::TS_SUM: case Op::TS_STD: case Op::TS_VARI:
         case Op::EMA: case Op::TS_MIN: case Op::TS_MAX:
         case Op::TS_RANK: case Op::TREAP_TS_RANK: case Op::TS_ZSCORE:
-        case Op::CORR: case Op::TS_MINMAX_DIFF: case Op::TS_SKEW:
+        case Op::CORR: case Op::TS_MINMAX_DIFF: case Op::TS_SKEW: case Op::TS_KURT:
         case Op::TS_MED: case Op::TS_MAD: case Op::TS_WMA:
         case Op::TS_MAX_DIFF: case Op::TS_MIN_DIFF:
             return nd.window;
@@ -443,6 +450,7 @@ private:
         case Op::AUTOCORR: return AutocorrPush(nd.window, static_cast<int>(nd.scalar));
         case Op::TS_MINMAX_DIFF: return TsMinMaxDiffPush(nd.window);
         case Op::TS_SKEW:  return TsSkewPush(nd.window);
+        case Op::TS_KURT:  return TsKurtPush(nd.window);
         case Op::TS_MED:   return TsMedPush(nd.window);
         case Op::TS_MAD:   return TsMadPush(nd.window);
         case Op::TS_WMA:   return TsWmaPush(nd.window);

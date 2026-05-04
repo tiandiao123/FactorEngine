@@ -23,12 +23,12 @@ namespace fe::ops {
  * each step, avoiding catastrophic cancellation in raw-moment formulas.
  */
 inline void rolling_skew(const FeFloat* x, FeFloat* out, int n, int window) {
-  const auto t = static_cast<std::uint32_t>(window);
-  if (t < 3 || n <= 0) {
+  if (window < 3 || n <= 0) {
     for (int i = 0; i < n; ++i)
       out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
     return;
   }
+  const auto t = static_cast<std::uint32_t>(window);
 
   std::vector<FeFloat> ring(t);
   std::uint32_t pos = 0, count = 0, nan_count = 0;
