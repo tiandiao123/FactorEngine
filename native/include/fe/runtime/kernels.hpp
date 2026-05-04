@@ -320,10 +320,10 @@ private:
     double sx_, sy_, sxy_;
 };
 
-// --------------- Beta (rolling OLS slope, push-level) ---------------
-class BetaPush {
+// --------------- Shared OLS statistics (sx, sy, sxx, sxy) ---------------
+class OlsStatsPush {
 public:
-    explicit BetaPush(int window)
+    explicit OlsStatsPush(int window)
         : t_(window), rx_(t_), ry_(t_),
           pos_(0), count_(0), nan_count_(0),
           sx_(0), sy_(0), sxx_(0), sxy_(0) {}
@@ -351,6 +351,23 @@ public:
     }
 
     [[nodiscard]] bool ready() const { return count_ >= t_ && nan_count_ == 0; }
+    void reset() {
+        pos_ = 0; count_ = 0; nan_count_ = 0;
+        sx_ = sy_ = sxx_ = sxy_ = 0.0;
+    }
+
+protected:
+    int t_;
+    std::vector<FeFloat> rx_, ry_;
+    int pos_, count_, nan_count_;
+    double sx_, sy_, sxx_, sxy_;
+};
+
+// --------------- Beta (rolling OLS slope, push-level) ---------------
+class BetaPush : public OlsStatsPush {
+public:
+    explicit BetaPush(int window) : OlsStatsPush(window) {}
+
     [[nodiscard]] FeFloat output() const {
         if (!ready()) return kNaN;
         double dn = static_cast<double>(t_);
@@ -359,16 +376,22 @@ public:
         double cov_xy = dn * sxy_ - sx_ * sy_;
         return static_cast<FeFloat>(cov_xy / var_x);
     }
-    void reset() {
-        pos_ = 0; count_ = 0; nan_count_ = 0;
-        sx_ = sy_ = sxx_ = sxy_ = 0.0;
-    }
+};
 
-private:
-    int t_;
-    std::vector<FeFloat> rx_, ry_;
-    int pos_, count_, nan_count_;
-    double sx_, sy_, sxx_, sxy_;
+// --------------- Intercept (rolling OLS intercept, push-level) ---------------
+class InterceptPush : public OlsStatsPush {
+public:
+    explicit InterceptPush(int window) : OlsStatsPush(window) {}
+
+    [[nodiscard]] FeFloat output() const {
+        if (!ready()) return kNaN;
+        double dn = static_cast<double>(t_);
+        double var_x = dn * sxx_ - sx_ * sx_;
+        if (var_x <= 0.0) return kNaN;
+        double cov_xy = dn * sxy_ - sx_ * sy_;
+        double beta = cov_xy / var_x;
+        return static_cast<FeFloat>((sy_ - beta * sx_) / dn);
+    }
 };
 
 // --------------- Autocorr (composite: Delay + Corr) ---------------

@@ -206,6 +206,72 @@ inline void rolling_beta(const FeFloat* y, const FeFloat* x,
 }
 
 /**
+ * Rolling OLS intercept (alpha) of y regressed on x:
+ *   alpha = mean(y) - beta * mean(x)
+ *         = (sy * var_x - sx * cov_xy) / (n * var_x)
+ *
+ * where beta = Cov(x,y) / Var(x).
+ * Requires window >= 2.
+ */
+inline void rolling_intercept(const FeFloat* y, const FeFloat* x,
+                              FeFloat* out, int n, int window) {
+  if (window < 2 || n <= 0) {
+    for (int i = 0; i < n; ++i)
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+    return;
+  }
+  const auto t = static_cast<std::uint32_t>(window);
+
+  std::vector<FeFloat> rx(t), ry(t);
+  double sx = 0, sy = 0, sxx = 0, sxy = 0;
+  std::uint32_t pos = 0, count = 0, nan_count = 0;
+
+  for (int i = 0; i < n; ++i) {
+    FeFloat xv = x[i], yv = y[i];
+    bool cur_nan = fe_is_nan(xv) || fe_is_nan(yv);
+
+    if (count >= t) {
+      FeFloat ox = rx[pos % t], oy = ry[pos % t];
+      bool old_nan = fe_is_nan(ox) || fe_is_nan(oy);
+      if (old_nan) {
+        --nan_count;
+      } else {
+        double dx = static_cast<double>(ox), dy = static_cast<double>(oy);
+        sx -= dx; sy -= dy; sxx -= dx * dx; sxy -= dx * dy;
+      }
+    }
+
+    rx[pos % t] = xv;
+    ry[pos % t] = yv;
+
+    if (cur_nan) {
+      ++nan_count;
+    } else {
+      double dx = static_cast<double>(xv), dy = static_cast<double>(yv);
+      sx += dx; sy += dy; sxx += dx * dx; sxy += dx * dy;
+    }
+
+    ++pos;
+    if (count < t) ++count;
+
+    if (count < t || nan_count > 0) {
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+      continue;
+    }
+
+    double dn = static_cast<double>(t);
+    double var_x = dn * sxx - sx * sx;
+    if (var_x <= 0.0) {
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+      continue;
+    }
+    double cov_xy = dn * sxy - sx * sy;
+    double beta = cov_xy / var_x;
+    out[i] = static_cast<FeFloat>((sy - beta * sx) / dn);
+  }
+}
+
+/**
  * Rolling autocorrelation: corr(x, x.shift(lag), window).
  *
  * Exact replication of Autocorr(x, t, n) in ts_ops.py:
