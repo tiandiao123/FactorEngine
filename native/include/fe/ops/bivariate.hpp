@@ -272,6 +272,66 @@ inline void rolling_intercept(const FeFloat* y, const FeFloat* x,
 }
 
 /**
+ * Rolling cosine similarity (no mean-centering):
+ *   cos(x,y) = sum(xi*yi) / (sqrt(sum(xi^2)) * sqrt(sum(yi^2)))
+ *
+ * Unlike CORR which centers around mean, this uses raw values.
+ * Requires window >= 2.
+ */
+inline void rolling_cos(const FeFloat* x, const FeFloat* y,
+                        FeFloat* out, int n, int window) {
+  if (window < 2 || n <= 0) {
+    for (int i = 0; i < n; ++i)
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+    return;
+  }
+  const auto t = static_cast<std::uint32_t>(window);
+
+  std::vector<FeFloat> rx(t), ry(t);
+  double sxx = 0, syy = 0, sxy = 0;
+  std::uint32_t pos = 0, count = 0, nan_count = 0;
+
+  for (int i = 0; i < n; ++i) {
+    FeFloat xv = x[i], yv = y[i];
+    bool cur_nan = fe_is_nan(xv) || fe_is_nan(yv);
+
+    if (count >= t) {
+      FeFloat ox = rx[pos % t], oy = ry[pos % t];
+      bool old_nan = fe_is_nan(ox) || fe_is_nan(oy);
+      if (old_nan) { --nan_count; }
+      else {
+        double dx = static_cast<double>(ox), dy = static_cast<double>(oy);
+        sxx -= dx * dx; syy -= dy * dy; sxy -= dx * dy;
+      }
+    }
+
+    rx[pos % t] = xv;
+    ry[pos % t] = yv;
+
+    if (cur_nan) { ++nan_count; }
+    else {
+      double dx = static_cast<double>(xv), dy = static_cast<double>(yv);
+      sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+    }
+
+    ++pos;
+    if (count < t) ++count;
+
+    if (count < t || nan_count > 0) {
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+      continue;
+    }
+
+    double denom = std::sqrt(sxx * syy);
+    if (denom <= 0.0) {
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+      continue;
+    }
+    out[i] = static_cast<FeFloat>(sxy / denom);
+  }
+}
+
+/**
  * Rolling autocorrelation: corr(x, x.shift(lag), window).
  *
  * Exact replication of Autocorr(x, t, n) in ts_ops.py:

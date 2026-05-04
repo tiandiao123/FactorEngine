@@ -65,6 +65,10 @@ PYBIND11_MODULE(fe_runtime, m) {
         .value("TS_MINMAX_DIFF", Op::TS_MINMAX_DIFF)
         .value("TS_SKEW",        Op::TS_SKEW)
         .value("TS_KURT",        Op::TS_KURT)
+        .value("TS_COS",         Op::TS_COS)
+        // P2b rolling normalized
+        .value("TS_CV",          Op::TS_CV)
+        .value("TS_NORM",        Op::TS_NORM)
         // P3
         .value("TS_MED",      Op::TS_MED)
         .value("TS_MAD",      Op::TS_MAD)

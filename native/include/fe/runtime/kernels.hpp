@@ -109,6 +109,100 @@ private:
     FeFloat cur_ = kNaN;
 };
 
+// --------------- TsCv (composite: std/|mean|, ddof=0) ---------------
+class TsCvComposite {
+public:
+    explicit TsCvComposite(int window)
+        : mean_k_(static_cast<std::uint32_t>(window)),
+          std_k_(static_cast<std::uint32_t>(window)) {}
+    void push(FeFloat x) { mean_k_.push(x); std_k_.push(x); }
+    [[nodiscard]] bool ready() const { return mean_k_.ready(); }
+    [[nodiscard]] FeFloat output() const {
+        FeFloat m = mean_k_.output();
+        FeFloat s = std_k_.output();
+        if (fe_is_nan(m) || fe_is_nan(s)) return kNaN;
+        double abs_m = std::fabs(static_cast<double>(m));
+        if (abs_m < 1e-12) return kNaN;
+        return static_cast<FeFloat>(static_cast<double>(s) / abs_m);
+    }
+    void reset() { mean_k_.reset(); std_k_.reset(); }
+private:
+    fe::ops::RollingMeanKernel mean_k_;
+    fe::ops::RollingStdKernel std_k_;
+};
+
+// --------------- TsNorm (composite: (x - min) / (max - min)) ---------------
+class TsNormComposite {
+public:
+    explicit TsNormComposite(int window)
+        : max_k_(static_cast<std::uint32_t>(window)),
+          min_k_(static_cast<std::uint32_t>(window)) {}
+    void push(FeFloat x) { cur_ = x; max_k_.push(x); min_k_.push(x); }
+    [[nodiscard]] bool ready() const { return max_k_.ready(); }
+    [[nodiscard]] FeFloat output() const {
+        FeFloat mx = max_k_.output();
+        FeFloat mn = min_k_.output();
+        if (fe_is_nan(mx) || fe_is_nan(mn) || fe_is_nan(cur_)) return kNaN;
+        double range = static_cast<double>(mx) - static_cast<double>(mn);
+        if (range <= 0.0) return kNaN;
+        return static_cast<FeFloat>((static_cast<double>(cur_) - static_cast<double>(mn)) / range);
+    }
+    void reset() { max_k_.reset(); min_k_.reset(); cur_ = kNaN; }
+private:
+    fe::ops::RollingMaxKernel max_k_;
+    fe::ops::RollingMinKernel min_k_;
+    FeFloat cur_ = kNaN;
+};
+
+// --------------- TsCos (cosine similarity, no mean-centering) ---------------
+class CosPush {
+public:
+    explicit CosPush(int window)
+        : t_(window), rx_(t_), ry_(t_),
+          pos_(0), count_(0), nan_count_(0),
+          sxx_(0), syy_(0), sxy_(0) {}
+
+    void push(FeFloat xv, FeFloat yv) {
+        bool cur_nan = fe_is_nan(xv) || fe_is_nan(yv);
+        if (count_ >= t_) {
+            FeFloat ox = rx_[pos_ % t_], oy = ry_[pos_ % t_];
+            bool old_nan = fe_is_nan(ox) || fe_is_nan(oy);
+            if (old_nan) { --nan_count_; }
+            else {
+                double dx = static_cast<double>(ox), dy = static_cast<double>(oy);
+                sxx_ -= dx * dx; syy_ -= dy * dy; sxy_ -= dx * dy;
+            }
+        }
+        rx_[pos_ % t_] = xv;
+        ry_[pos_ % t_] = yv;
+        if (cur_nan) { ++nan_count_; }
+        else {
+            double dx = static_cast<double>(xv), dy = static_cast<double>(yv);
+            sxx_ += dx * dx; syy_ += dy * dy; sxy_ += dx * dy;
+        }
+        ++pos_;
+        if (count_ < t_) ++count_;
+    }
+
+    [[nodiscard]] bool ready() const { return count_ >= t_ && nan_count_ == 0; }
+    [[nodiscard]] FeFloat output() const {
+        if (!ready()) return kNaN;
+        double denom = std::sqrt(sxx_ * syy_);
+        if (denom <= 0.0) return kNaN;
+        return static_cast<FeFloat>(sxy_ / denom);
+    }
+    void reset() {
+        pos_ = 0; count_ = 0; nan_count_ = 0;
+        sxx_ = syy_ = sxy_ = 0.0;
+    }
+
+private:
+    int t_;
+    std::vector<FeFloat> rx_, ry_;
+    int pos_, count_, nan_count_;
+    double sxx_, syy_, sxy_;
+};
+
 // ═══════════════════════════════════════════════════════════════
 //  New push-level kernels (no class equivalent in ops/)
 // ═══════════════════════════════════════════════════════════════
