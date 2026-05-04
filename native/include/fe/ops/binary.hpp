@@ -16,6 +16,16 @@ inline FeFloat div_op(FeFloat a, FeFloat b) {
   return a / (b + kEps);
 }
 
+inline FeFloat fmax_op(FeFloat a, FeFloat b) {
+  if (fe_is_nan(a) || fe_is_nan(b)) return std::numeric_limits<FeFloat>::quiet_NaN();
+  return a > b ? a : b;
+}
+
+inline FeFloat fmin_op(FeFloat a, FeFloat b) {
+  if (fe_is_nan(a) || fe_is_nan(b)) return std::numeric_limits<FeFloat>::quiet_NaN();
+  return a < b ? a : b;
+}
+
 // ── Layer 2: array-level functions ──────────────────────────
 
 using BinaryFn = FeFloat (*)(FeFloat, FeFloat);
@@ -61,5 +71,8 @@ inline void mul_sa(FeFloat s, const FeFloat* y, FeFloat* out, int n) { apply_bin
 inline void div_aa(const FeFloat* x, const FeFloat* y, FeFloat* out, int n) { apply_binary_aa(div_op, x, y, out, n); }
 inline void div_as(const FeFloat* x, FeFloat s, FeFloat* out, int n) { apply_binary_as(div_op, x, s, out, n); }
 inline void div_sa(FeFloat s, const FeFloat* y, FeFloat* out, int n) { apply_binary_sa(div_op, s, y, out, n); }
+
+inline void fmax_aa(const FeFloat* x, const FeFloat* y, FeFloat* out, int n) { apply_binary_aa(fmax_op, x, y, out, n); }
+inline void fmin_aa(const FeFloat* x, const FeFloat* y, FeFloat* out, int n) { apply_binary_aa(fmin_op, x, y, out, n); }
 
 }  // namespace fe::ops

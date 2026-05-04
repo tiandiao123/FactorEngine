@@ -44,6 +44,17 @@ inline FeFloat slog1p(FeFloat x) {
   return static_cast<FeFloat>(std::copysign(std::log1p(std::abs(d)), d));
 }
 
+inline FeFloat sqrt_op(FeFloat x) {
+  if (fe_is_nan(x) || x < 0.0f) return std::numeric_limits<FeFloat>::quiet_NaN();
+  return static_cast<FeFloat>(std::sqrt(static_cast<double>(x)));
+}
+
+inline FeFloat sign_sqrt(FeFloat x) {
+  if (fe_is_nan(x)) return std::numeric_limits<FeFloat>::quiet_NaN();
+  double d = static_cast<double>(x);
+  return static_cast<FeFloat>(std::copysign(std::sqrt(std::abs(d)), d));
+}
+
 // ── Layer 2: array-level functions ──────────────────────────
 
 using UnaryFn = FeFloat (*)(FeFloat);
@@ -62,5 +73,7 @@ inline void inv_array(const FeFloat* x, FeFloat* out, int n) { apply_unary(inv, 
 inline void sign_array(const FeFloat* x, FeFloat* out, int n) { apply_unary(sign, x, out, n); }
 inline void tanh_array(const FeFloat* x, FeFloat* out, int n) { apply_unary(tanh_op, x, out, n); }
 inline void slog1p_array(const FeFloat* x, FeFloat* out, int n) { apply_unary(slog1p, x, out, n); }
+inline void sqrt_array(const FeFloat* x, FeFloat* out, int n) { apply_unary(sqrt_op, x, out, n); }
+inline void sign_sqrt_array(const FeFloat* x, FeFloat* out, int n) { apply_unary(sign_sqrt, x, out, n); }
 
 }  // namespace fe::ops

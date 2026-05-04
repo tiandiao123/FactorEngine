@@ -117,7 +117,9 @@ PYBIND11_MODULE(fe_ops, m) {
     m.def("inv",     [](NpArray x) { return py_unary(fe::ops::inv_array, x); });
     m.def("sign",    [](NpArray x) { return py_unary(fe::ops::sign_array, x); });
     m.def("tanh_op", [](NpArray x) { return py_unary(fe::ops::tanh_array, x); });
-    m.def("slog1p",  [](NpArray x) { return py_unary(fe::ops::slog1p_array, x); });
+    m.def("slog1p",    [](NpArray x) { return py_unary(fe::ops::slog1p_array, x); });
+    m.def("sqrt_op",   [](NpArray x) { return py_unary(fe::ops::sqrt_array, x); });
+    m.def("sign_sqrt", [](NpArray x) { return py_unary(fe::ops::sign_sqrt_array, x); });
 
     // P0 binary: 3 overloads each (aa, as, sa)
     m.def("add", [](NpArray x, NpArray y) { return py_binary_aa(fe::ops::add_aa, x, y); });
@@ -135,6 +137,9 @@ PYBIND11_MODULE(fe_ops, m) {
     m.def("div_op", [](NpArray x, NpArray y) { return py_binary_aa(fe::ops::div_aa, x, y); });
     m.def("div_op", [](NpArray x, float s)   { return py_binary_as(fe::ops::div_as, x, s); });
     m.def("div_op", [](float s, NpArray y)   { return py_binary_sa(fe::ops::div_sa, s, y); });
+
+    m.def("fmax", [](NpArray x, NpArray y) { return py_binary_aa(fe::ops::fmax_aa, x, y); });
+    m.def("fmin", [](NpArray x, NpArray y) { return py_binary_aa(fe::ops::fmin_aa, x, y); });
 
     // P1 rolling
     m.def("rolling_mean",  [](NpArray x, int w) { return py_rolling(fe::ops::rolling_mean, x, w); },  py::arg("x"), py::arg("window"));

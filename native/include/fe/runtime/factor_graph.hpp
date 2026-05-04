@@ -36,10 +36,10 @@ enum class Op {
     INPUT_VWAP, INPUT_BUY_VOL, INPUT_SELL_VOL,
 
     // P0 unary (stateless)
-    NEG, ABS, LOG, SQR, INV, SIGN, TANH, SLOG1P,
+    NEG, ABS, LOG, SQR, INV, SIGN, TANH, SLOG1P, SQRT, SIGN_SQRT,
 
     // P0 binary (stateless)
-    ADD, SUB, MUL, DIV,
+    ADD, SUB, MUL, DIV, FMAX, FMIN,
 
     // P0 scalar ops: op(node, scalar) or op(scalar, node)
     ADD_SCALAR, SUB_SCALAR, MUL_SCALAR, DIV_SCALAR,
@@ -282,12 +282,16 @@ public:
             case Op::SIGN:   values_[i] = fe::ops::sign(a);    break;
             case Op::TANH:   values_[i] = fe::ops::tanh_op(a); break;
             case Op::SLOG1P: values_[i] = fe::ops::slog1p(a);  break;
+            case Op::SQRT:      values_[i] = fe::ops::sqrt_op(a);   break;
+            case Op::SIGN_SQRT: values_[i] = fe::ops::sign_sqrt(a); break;
 
             // ── P0 binary — direct calls to fe::ops scalar functions ──
             case Op::ADD: values_[i] = fe::ops::add(a, b);    break;
             case Op::SUB: values_[i] = fe::ops::sub(a, b);    break;
             case Op::MUL: values_[i] = fe::ops::mul(a, b);    break;
-            case Op::DIV: values_[i] = fe::ops::div_op(a, b); break;
+            case Op::DIV:  values_[i] = fe::ops::div_op(a, b);  break;
+            case Op::FMAX: values_[i] = fe::ops::fmax_op(a, b); break;
+            case Op::FMIN: values_[i] = fe::ops::fmin_op(a, b); break;
 
             // ── P0 scalar ──
             case Op::ADD_SCALAR: values_[i] = fe::ops::add(a, nd.scalar); break;
@@ -409,10 +413,14 @@ private:
         case Op::SIGN:    return "SIGN";
         case Op::TANH:    return "TANH";
         case Op::SLOG1P:  return "SLOG1P";
+        case Op::SQRT:      return "SQRT";
+        case Op::SIGN_SQRT: return "SIGN_SQRT";
         case Op::ADD:     return "ADD";
         case Op::SUB:     return "SUB";
         case Op::MUL:     return "MUL";
         case Op::DIV:     return "DIV";
+        case Op::FMAX:    return "FMAX";
+        case Op::FMIN:    return "FMIN";
         case Op::ADD_SCALAR: return "ADD_SCALAR";
         case Op::SUB_SCALAR: return "SUB_SCALAR";
         case Op::MUL_SCALAR: return "MUL_SCALAR";

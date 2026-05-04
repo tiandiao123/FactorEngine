@@ -15,7 +15,7 @@ from factorengine.factors import FactorRegistry
 
 N = 500
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
-NUM_FACTORS = 98  # total: 60 kline (okx_perp) + 38 trades (okx_perp_trades)
+NUM_FACTORS = 106  # total: 60 kline (okx_perp) + 46 trades (okx_perp_trades)
 NUM_KLINE_FACTORS = 60
 
 
@@ -72,7 +72,7 @@ class TestFactorRegistry:
         g = reg.build("0001", group="okx_perp")
         assert g.num_nodes() == 5
 
-    @pytest.mark.parametrize("fid", [f"T{i:04d}" for i in range(29, 39)])
+    @pytest.mark.parametrize("fid", [f"T{i:04d}" for i in range(29, 47)])
     def test_trades_factor_registration_and_output(self, fid):
         """Each new trades factor (T0029-T0038) must register, build, and produce output."""
         reg = FactorRegistry()

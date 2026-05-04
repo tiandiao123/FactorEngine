@@ -703,3 +703,156 @@ def build_updown_netvol_60() -> rt.FactorGraph:
     g.add_unary(Op.NEG, ranked)
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0039: De-correlated VWAP — remove close-correlated component
+#    TsDeCor(close, vwap, w) = vwap - corr(close, vwap, w) * vwap
+#    Residual captures execution-price alpha not explained by price
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0039")
+def build_decor_vwap() -> rt.FactorGraph:
+    """TsZscore(Sub(vwap, Mul(Corr(close, vwap, 60), vwap)), 120)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    vw = g.add_input("vwap")
+    corr = g.add_bivariate(Op.CORR, c, vw, 60)
+    scaled = g.add_binary(Op.MUL, corr, vw)
+    resid = g.add_binary(Op.SUB, vw, scaled)
+    g.add_rolling(Op.TS_ZSCORE, resid, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0040: De-correlated Volume — volume residual after removing
+#    price-driven component; captures independent volume surges
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0040")
+def build_decor_volume() -> rt.FactorGraph:
+    """TsZscore(Sub(SLog1p(vol), Mul(Corr(ret, SLog1p(vol), 60), SLog1p(vol))), 120)"""
+    g = rt.FactorGraph()
+    r = g.add_input("ret")
+    vol = g.add_input("volume")
+    svol = g.add_unary(Op.SLOG1P, vol)
+    corr = g.add_bivariate(Op.CORR, r, svol, 60)
+    scaled = g.add_binary(Op.MUL, corr, svol)
+    resid = g.add_binary(Op.SUB, svol, scaled)
+    g.add_rolling(Op.TS_ZSCORE, resid, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0041: Price Path Modulus — L2 norm of returns: sqrt(Σret²)
+#    High modulus = volatile path; measures "energy" of price path
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0041")
+def build_modulus_ret_30() -> rt.FactorGraph:
+    """Neg(TsRank(Sqrt(TsSum(Sqr(ret), 30)), 120))"""
+    g = rt.FactorGraph()
+    r = g.add_input("ret")
+    r2 = g.add_unary(Op.SQR, r)
+    sum_r2 = g.add_rolling(Op.TS_SUM, r2, 30)
+    mod = g.add_unary(Op.SQRT, sum_r2)
+    ranked = g.add_rolling(Op.TS_RANK, mod, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0042: Volume Path Modulus — L2 norm of log-volume changes
+#    Captures bursts of volume activity
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0042")
+def build_modulus_vol_30() -> rt.FactorGraph:
+    """TsZscore(Sqrt(TsSum(Sqr(TsPct(SLog1p(volume), 1)), 30)), 120)"""
+    g = rt.FactorGraph()
+    vol = g.add_input("volume")
+    svol = g.add_unary(Op.SLOG1P, vol)
+    vol_chg = g.add_rolling(Op.TS_PCT, svol, 1)
+    chg2 = g.add_unary(Op.SQR, vol_chg)
+    sum_chg2 = g.add_rolling(Op.TS_SUM, chg2, 30)
+    mod = g.add_unary(Op.SQRT, sum_chg2)
+    g.add_rolling(Op.TS_ZSCORE, mod, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0043: SignSqrt Return — sign(ret) * sqrt(|ret|)
+#    Compresses extreme returns symmetrically, z-scored
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0043")
+def build_sign_sqrt_ret() -> rt.FactorGraph:
+    """TsZscore(SignSqrt(ret), 120)"""
+    g = rt.FactorGraph()
+    r = g.add_input("ret")
+    ss = g.add_unary(Op.SIGN_SQRT, r)
+    g.add_rolling(Op.TS_ZSCORE, ss, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0044: SignSqrt Imbalance — compressed trade imbalance
+#    SignSqrt on (buy_vol - sell_vol), more robust to outliers
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0044")
+def build_sign_sqrt_imbalance() -> rt.FactorGraph:
+    """TsZscore(SignSqrt(Sub(buy_vol, sell_vol)), 120)"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    net = g.add_binary(Op.SUB, bv, sv)
+    ss = g.add_unary(Op.SIGN_SQRT, net)
+    g.add_rolling(Op.TS_ZSCORE, ss, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0045: Saturated Imbalance — Tanh(imbalance) smoothly clips to [-1, 1]
+#    Robust to extreme imbalance spikes, then ranked
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0045")
+def build_saturated_imbalance() -> rt.FactorGraph:
+    """Neg(TsRank(Tanh(Div(Sub(bv,sv),Add(bv,sv))), 120))"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    diff = g.add_binary(Op.SUB, bv, sv)
+    total = g.add_binary(Op.ADD, bv, sv)
+    imb = g.add_binary(Op.DIV, diff, total)
+    clipped = g.add_unary(Op.TANH, imb)
+    ranked = g.add_rolling(Op.TS_RANK, clipped, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0046: FMax(ret, volume_chg) — captures whichever signal is
+#    stronger: price move or volume surge
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0046")
+def build_fmax_ret_vol() -> rt.FactorGraph:
+    """TsZscore(FMax(ret, TsPct(SLog1p(volume), 1)), 120)"""
+    g = rt.FactorGraph()
+    r = g.add_input("ret")
+    vol = g.add_input("volume")
+    svol = g.add_unary(Op.SLOG1P, vol)
+    vol_chg = g.add_rolling(Op.TS_PCT, svol, 1)
+    mx = g.add_binary(Op.FMAX, r, vol_chg)
+    g.add_rolling(Op.TS_ZSCORE, mx, 120)
+    g.compile()
+    return g

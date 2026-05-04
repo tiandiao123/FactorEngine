@@ -31,11 +31,15 @@ PYBIND11_MODULE(fe_runtime, m) {
         .value("SIGN",   Op::SIGN)
         .value("TANH",   Op::TANH)
         .value("SLOG1P", Op::SLOG1P)
+        .value("SQRT",      Op::SQRT)
+        .value("SIGN_SQRT", Op::SIGN_SQRT)
         // P0 binary
         .value("ADD", Op::ADD)
         .value("SUB", Op::SUB)
         .value("MUL", Op::MUL)
         .value("DIV", Op::DIV)
+        .value("FMAX", Op::FMAX)
+        .value("FMIN", Op::FMIN)
         // P0 scalar
         .value("ADD_SCALAR", Op::ADD_SCALAR)
         .value("SUB_SCALAR", Op::SUB_SCALAR)
