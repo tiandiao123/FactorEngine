@@ -21,12 +21,12 @@ namespace fe::ops {
  */
 inline void rolling_corr(const FeFloat* x, const FeFloat* y,
                           FeFloat* out, int n, int window) {
-  const auto t = static_cast<std::uint32_t>(window);
-  if (t < 2 || n <= 0) {
+  if (window < 2 || n <= 0) {
     for (int i = 0; i < n; ++i)
       out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
     return;
   }
+  const auto t = static_cast<std::uint32_t>(window);
 
   std::vector<FeFloat> rx(t), ry(t);
   double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
@@ -78,6 +78,66 @@ inline void rolling_corr(const FeFloat* x, const FeFloat* y,
 
     double r = cov / denom;
     out[i] = static_cast<FeFloat>(r);
+  }
+}
+
+/**
+ * Rolling sample covariance (ddof=1), aligned with:
+ *   pandas Series.rolling(t, min_periods=t).cov(other)   # default ddof=1
+ *
+ * Uses the same incremental sums as rolling_corr:
+ *   cov = (n*sxy - sx*sy) / (n * (n - 1))
+ * which equals sum((xi-mx)(yi-my)) / (n-1).
+ */
+inline void rolling_cov(const FeFloat* x, const FeFloat* y,
+                        FeFloat* out, int n, int window) {
+  if (window < 2 || n <= 0) {
+    for (int i = 0; i < n; ++i)
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+    return;
+  }
+  const auto t = static_cast<std::uint32_t>(window);
+
+  std::vector<FeFloat> rx(t), ry(t);
+  double sx = 0, sy = 0, sxy = 0;
+  std::uint32_t pos = 0, count = 0, nan_count = 0;
+
+  for (int i = 0; i < n; ++i) {
+    FeFloat xv = x[i], yv = y[i];
+    bool cur_nan = fe_is_nan(xv) || fe_is_nan(yv);
+
+    if (count >= t) {
+      FeFloat ox = rx[pos % t], oy = ry[pos % t];
+      bool old_nan = fe_is_nan(ox) || fe_is_nan(oy);
+      if (old_nan) {
+        --nan_count;
+      } else {
+        double dx = static_cast<double>(ox), dy = static_cast<double>(oy);
+        sx -= dx; sy -= dy; sxy -= dx * dy;
+      }
+    }
+
+    rx[pos % t] = xv;
+    ry[pos % t] = yv;
+
+    if (cur_nan) {
+      ++nan_count;
+    } else {
+      double dx = static_cast<double>(xv), dy = static_cast<double>(yv);
+      sx += dx; sy += dy; sxy += dx * dy;
+    }
+
+    ++pos;
+    if (count < t) ++count;
+
+    if (count < t || nan_count > 0) {
+      out[i] = std::numeric_limits<FeFloat>::quiet_NaN();
+      continue;
+    }
+
+    double dn = static_cast<double>(t);
+    double cov_num = dn * sxy - sx * sy;
+    out[i] = static_cast<FeFloat>(cov_num / (dn * (dn - 1.0)));
   }
 }
 

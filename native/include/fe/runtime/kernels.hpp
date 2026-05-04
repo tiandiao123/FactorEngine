@@ -271,6 +271,55 @@ private:
     double sx_, sy_, sxx_, syy_, sxy_;
 };
 
+// --------------- Cov (rolling sample covariance ddof=1, push-level) ---------------
+class CovPush {
+public:
+    explicit CovPush(int window)
+        : t_(window > 1 ? window : 2), rx_(t_), ry_(t_),
+          pos_(0), count_(0), nan_count_(0),
+          sx_(0), sy_(0), sxy_(0) {}
+
+    void push(FeFloat xv, FeFloat yv) {
+        bool cur_nan = fe_is_nan(xv) || fe_is_nan(yv);
+        if (count_ >= t_) {
+            FeFloat ox = rx_[pos_ % t_], oy = ry_[pos_ % t_];
+            bool old_nan = fe_is_nan(ox) || fe_is_nan(oy);
+            if (old_nan) { --nan_count_; }
+            else {
+                double dx = static_cast<double>(ox), dy = static_cast<double>(oy);
+                sx_ -= dx; sy_ -= dy; sxy_ -= dx * dy;
+            }
+        }
+        rx_[pos_ % t_] = xv;
+        ry_[pos_ % t_] = yv;
+        if (cur_nan) { ++nan_count_; }
+        else {
+            double dx = static_cast<double>(xv), dy = static_cast<double>(yv);
+            sx_ += dx; sy_ += dy; sxy_ += dx * dy;
+        }
+        ++pos_;
+        if (count_ < t_) ++count_;
+    }
+
+    [[nodiscard]] bool ready() const { return count_ >= t_ && nan_count_ == 0; }
+    [[nodiscard]] FeFloat output() const {
+        if (!ready()) return kNaN;
+        double dn = static_cast<double>(t_);
+        double cov_num = dn * sxy_ - sx_ * sy_;
+        return static_cast<FeFloat>(cov_num / (dn * (dn - 1.0)));
+    }
+    void reset() {
+        pos_ = 0; count_ = 0; nan_count_ = 0;
+        sx_ = sy_ = sxy_ = 0.0;
+    }
+
+private:
+    int t_;
+    std::vector<FeFloat> rx_, ry_;
+    int pos_, count_, nan_count_;
+    double sx_, sy_, sxy_;
+};
+
 // --------------- Autocorr (composite: Delay + Corr) ---------------
 class AutocorrPush {
 public:

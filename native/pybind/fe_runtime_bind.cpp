@@ -58,6 +58,7 @@ PYBIND11_MODULE(fe_runtime, m) {
         .value("TS_PCT",    Op::TS_PCT)
         // P2
         .value("CORR",           Op::CORR)
+        .value("TS_COV",         Op::TS_COV)
         .value("AUTOCORR",       Op::AUTOCORR)
         .value("TS_MINMAX_DIFF", Op::TS_MINMAX_DIFF)
         .value("TS_SKEW",        Op::TS_SKEW)

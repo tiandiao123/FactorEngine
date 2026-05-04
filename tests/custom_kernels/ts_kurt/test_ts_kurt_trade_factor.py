@@ -6,7 +6,7 @@ for T0007 (Imbalance Kurtosis) and T0008 (Buy Volume Kurtosis).
 
 Usage:
     cd FactorEngine
-    pytest tests/custom_kernels/test_ts_kurt_trade_factor.py -v
+    pytest tests/custom_kernels/ts_kurt/test_ts_kurt_trade_factor.py -v
 """
 from __future__ import annotations
 

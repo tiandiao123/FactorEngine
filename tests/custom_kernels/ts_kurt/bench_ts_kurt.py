@@ -3,7 +3,7 @@ Benchmark: TS_KURT — C++ vs pandas, batch vs push.
 
 Usage:
     cd FactorEngine
-    python tests/custom_kernels/bench_ts_kurt.py
+    python tests/custom_kernels/ts_kurt/bench_ts_kurt.py
 """
 from __future__ import annotations
 
