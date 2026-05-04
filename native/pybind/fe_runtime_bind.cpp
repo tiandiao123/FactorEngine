@@ -69,6 +69,8 @@ PYBIND11_MODULE(fe_runtime, m) {
         // P2b rolling normalized
         .value("TS_CV",          Op::TS_CV)
         .value("TS_NORM",        Op::TS_NORM)
+        // P2c momentum / technical
+        .value("TS_RSI",         Op::TS_RSI)
         // P3
         .value("TS_MED",      Op::TS_MED)
         .value("TS_MAD",      Op::TS_MAD)
@@ -79,6 +81,7 @@ PYBIND11_MODULE(fe_runtime, m) {
         .value("TREAP_TS_RANK", Op::TREAP_TS_RANK)
         // Derived
         .value("PCT_CHANGE", Op::PCT_CHANGE)
+        .value("TS_GROWTH",  Op::TS_GROWTH)
         .export_values();
 
     py::class_<FactorGraph::NodeInfo>(m, "NodeInfo")

@@ -346,3 +346,86 @@ def build_volume_norm() -> rt.FactorGraph:
     g.add_unary(Op.NEG, ranked)
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0019: Close RSI — classic momentum oscillator on trades-close
+#    RSI near 70+ = overbought, 30- = oversold
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0019")
+def build_close_rsi() -> rt.FactorGraph:
+    """TsZscore(TsRsi(close, 14), 120)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    rsi = g.add_rolling(Op.TS_RSI, c, 14)
+    g.add_rolling(Op.TS_ZSCORE, rsi, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0020: VWAP RSI — RSI on volume-weighted average price
+#    Captures mean-reversion signal in execution price
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0020")
+def build_vwap_rsi() -> rt.FactorGraph:
+    """Neg(TsRank(TsRsi(vwap, 14), 120))"""
+    g = rt.FactorGraph()
+    v = g.add_input("vwap")
+    rsi = g.add_rolling(Op.TS_RSI, v, 14)
+    ranked = g.add_rolling(Op.TS_RANK, rsi, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0021: Short-term RSI — fast RSI(5) captures rapid momentum
+#    shifts at high frequency
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0021")
+def build_short_rsi() -> rt.FactorGraph:
+    """TsZscore(TsRsi(close, 5), 60)"""
+    g = rt.FactorGraph()
+    c = g.add_input("close")
+    rsi = g.add_rolling(Op.TS_RSI, c, 5)
+    g.add_rolling(Op.TS_ZSCORE, rsi, 60)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0022: Volume Growth Momentum — rolling growth rate of volume
+#    Sudden volume growth = event detection
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0022")
+def build_volume_growth() -> rt.FactorGraph:
+    """TsZscore(TsGrowth(SLog1p(volume), 5), 120)"""
+    g = rt.FactorGraph()
+    vol = g.add_input("volume")
+    svol = g.add_unary(Op.SLOG1P, vol)
+    growth = g.add_rolling(Op.TS_GROWTH, svol, 5)
+    g.add_rolling(Op.TS_ZSCORE, growth, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0023: VWAP Growth Acceleration — rate of change in VWAP
+#    Positive acceleration = strengthening trend
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0023")
+def build_vwap_growth() -> rt.FactorGraph:
+    """Neg(TsRank(TsGrowth(vwap, 10), 120))"""
+    g = rt.FactorGraph()
+    v = g.add_input("vwap")
+    growth = g.add_rolling(Op.TS_GROWTH, v, 10)
+    ranked = g.add_rolling(Op.TS_RANK, growth, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g
