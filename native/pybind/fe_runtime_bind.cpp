@@ -74,7 +74,8 @@ PYBIND11_MODULE(fe_runtime, m) {
         .value("TS_CCI",         Op::TS_CCI)
         // P2d conditional rolling
         .value("TS_SUM_POS",     Op::TS_SUM_POS)
-        .value("TS_POS_RATIO",   Op::TS_POS_RATIO)
+        .value("TS_POS_RATIO",       Op::TS_POS_RATIO)
+        .value("TS_UP_DOWN_RATIO", Op::TS_UP_DOWN_RATIO)
         // P3
         .value("TS_MED",      Op::TS_MED)
         .value("TS_MAD",      Op::TS_MAD)

@@ -668,3 +668,38 @@ def build_posratio_netvol_60() -> rt.FactorGraph:
     g.add_rolling(Op.TS_ZSCORE, pr, 120)
     g.compile()
     return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0037: Return Up/Down Ratio — Σ(pos ret) / Σ(|neg ret|) over 30 bars
+#    ratio > 1 = upside dominates; ratio < 1 = downside dominates
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0037")
+def build_updown_ret_30() -> rt.FactorGraph:
+    """TsZscore(TsUpDownRatio(ret, 30), 120)"""
+    g = rt.FactorGraph()
+    r = g.add_input("ret")
+    ud = g.add_rolling(Op.TS_UP_DOWN_RATIO, r, 30)
+    g.add_rolling(Op.TS_ZSCORE, ud, 120)
+    g.compile()
+    return g
+
+
+# ═══════════════════════════════════════════════════════════════
+#  T0038: Volume Up/Down Ratio — Σ(buy_vol - sell_vol when >0)
+#    / Σ(|buy_vol - sell_vol when <0|), microstructure pressure
+# ═══════════════════════════════════════════════════════════════
+
+@register_factor("okx_perp_trades", "T0038")
+def build_updown_netvol_60() -> rt.FactorGraph:
+    """Neg(TsRank(TsUpDownRatio(Sub(buy_vol, sell_vol), 60), 120))"""
+    g = rt.FactorGraph()
+    bv = g.add_input("buy_vol")
+    sv = g.add_input("sell_vol")
+    net = g.add_binary(Op.SUB, bv, sv)
+    ud = g.add_rolling(Op.TS_UP_DOWN_RATIO, net, 60)
+    ranked = g.add_rolling(Op.TS_RANK, ud, 120)
+    g.add_unary(Op.NEG, ranked)
+    g.compile()
+    return g

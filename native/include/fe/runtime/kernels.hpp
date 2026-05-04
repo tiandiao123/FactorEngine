@@ -170,6 +170,7 @@ using CciPush = fe::ops::CciKernel;
 // --------------- TsSumPos / TsPosRatio: aliases to rolling_sumpos.hpp -------
 using SumPosPush = fe::ops::SumPosKernel;
 using PosRatioPush = fe::ops::PosRatioKernel;
+using UpDownRatioPush = fe::ops::UpDownRatioKernel;
 
 // ═══════════════════════════════════════════════════════════════
 //  New push-level kernels (no class equivalent in ops/)
