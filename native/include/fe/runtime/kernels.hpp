@@ -26,6 +26,7 @@
 #include "fe/ops/rolling_ema.hpp"
 #include "fe/ops/rolling_minmax.hpp"
 #include "fe/ops/shift.hpp"
+#include "fe/ops/bivariate.hpp"
 
 namespace fe::runtime {
 
@@ -122,7 +123,7 @@ public:
         FeFloat s = std_k_.output();
         if (fe_is_nan(m) || fe_is_nan(s)) return kNaN;
         double abs_m = std::fabs(static_cast<double>(m));
-        if (abs_m < 1e-12) return kNaN;
+        if (abs_m < fe::ops::kCvMeanEps) return kNaN;
         return static_cast<FeFloat>(static_cast<double>(s) / abs_m);
     }
     void reset() { mean_k_.reset(); std_k_.reset(); }
@@ -154,54 +155,8 @@ private:
     FeFloat cur_ = kNaN;
 };
 
-// --------------- TsCos (cosine similarity, no mean-centering) ---------------
-class CosPush {
-public:
-    explicit CosPush(int window)
-        : t_(window), rx_(t_), ry_(t_),
-          pos_(0), count_(0), nan_count_(0),
-          sxx_(0), syy_(0), sxy_(0) {}
-
-    void push(FeFloat xv, FeFloat yv) {
-        bool cur_nan = fe_is_nan(xv) || fe_is_nan(yv);
-        if (count_ >= t_) {
-            FeFloat ox = rx_[pos_ % t_], oy = ry_[pos_ % t_];
-            bool old_nan = fe_is_nan(ox) || fe_is_nan(oy);
-            if (old_nan) { --nan_count_; }
-            else {
-                double dx = static_cast<double>(ox), dy = static_cast<double>(oy);
-                sxx_ -= dx * dx; syy_ -= dy * dy; sxy_ -= dx * dy;
-            }
-        }
-        rx_[pos_ % t_] = xv;
-        ry_[pos_ % t_] = yv;
-        if (cur_nan) { ++nan_count_; }
-        else {
-            double dx = static_cast<double>(xv), dy = static_cast<double>(yv);
-            sxx_ += dx * dx; syy_ += dy * dy; sxy_ += dx * dy;
-        }
-        ++pos_;
-        if (count_ < t_) ++count_;
-    }
-
-    [[nodiscard]] bool ready() const { return count_ >= t_ && nan_count_ == 0; }
-    [[nodiscard]] FeFloat output() const {
-        if (!ready()) return kNaN;
-        double denom = std::sqrt(sxx_ * syy_);
-        if (denom <= 0.0) return kNaN;
-        return static_cast<FeFloat>(sxy_ / denom);
-    }
-    void reset() {
-        pos_ = 0; count_ = 0; nan_count_ = 0;
-        sxx_ = syy_ = sxy_ = 0.0;
-    }
-
-private:
-    int t_;
-    std::vector<FeFloat> rx_, ry_;
-    int pos_, count_, nan_count_;
-    double sxx_, syy_, sxy_;
-};
+// --------------- TsCos: alias to shared RollingCosKernel in bivariate.hpp ----
+using CosPush = fe::ops::RollingCosKernel;
 
 // ═══════════════════════════════════════════════════════════════
 //  New push-level kernels (no class equivalent in ops/)

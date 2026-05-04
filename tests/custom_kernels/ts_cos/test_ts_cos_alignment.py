@@ -101,12 +101,16 @@ class TestCosEdgeCases:
         assert np.isnan(result[4:]).all()
 
     @pytest.mark.parametrize("nan_ratio", [0.05, 0.2])
-    def test_with_nans(self, nan_ratio):
+    @pytest.mark.parametrize("nan_target", ["x", "y", "both"])
+    def test_with_nans(self, nan_ratio, nan_target):
         rng = np.random.default_rng(123)
         x = rng.standard_normal(N).astype(np.float32) + 5.0
         y = rng.standard_normal(N).astype(np.float32) + 3.0
         mask = rng.random(N) < nan_ratio
-        x[mask] = np.nan
+        if nan_target in ("x", "both"):
+            x[mask] = np.nan
+        if nan_target in ("y", "both"):
+            y[mask] = np.nan
         w = 10
         cpp = fe_ops.rolling_cos(x, y, w)
         ref = _pandas_cos(x, y, w)

@@ -56,12 +56,12 @@ class TestCvBatchAlignment:
         valid = ~np.isnan(batch)
         np.testing.assert_allclose(push_arr[valid], batch[valid], atol=1e-5)
 
-    def test_constant_input_returns_nan(self):
+    def test_constant_input_returns_zero(self):
+        """Constant series: std=0, mean!=0, so CV=0.0 exactly."""
         const = np.full(100, 3.14, dtype=np.float32)
         result = fe_ops.rolling_cv(const, 10)
         assert np.isnan(result[:9]).all()
-        for v in result[9:]:
-            assert v == pytest.approx(0.0, abs=1e-6) or math.isnan(v)
+        np.testing.assert_allclose(result[9:], 0.0, atol=1e-6)
 
     def test_zero_mean_returns_nan(self):
         data = np.array([1, -1] * 50, dtype=np.float32)
