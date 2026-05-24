@@ -120,7 +120,7 @@ engine.start()
 freq_seconds = engine.data_freq_seconds
 
 try:
-    for cycle in range(1, 600):
+    for cycle in range(1, 6000):
         time.sleep(freq_seconds)
 
         factors = engine.get_factor_outputs()
