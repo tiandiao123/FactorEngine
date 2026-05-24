@@ -108,6 +108,31 @@ def test_engine_update_symbols_stages_until_explicit_commit():
     engine.stop()
 
 
+def test_engine_dynamic_symbols_notify_okx_trades_worker():
+    engine = Engine(
+        symbols=["BTC-USDT-SWAP"],
+        mode="live",
+        exchange="okx",
+        data_source="trades",
+        data_freq="1s",
+        factor_group=None,
+        enable_dynamic_symbols=True,
+    )
+
+    diff = engine.update_symbols(["BTC-USDT-SWAP", "ETH-USDT-SWAP"], version="v2")
+    engine.commit_pending_symbol_diff(effective_from_ts_ms=1000)
+
+    assert diff is not None
+    assert engine.active_symbols == {"BTC-USDT-SWAP", "ETH-USDT-SWAP"}
+    assert engine.symbol_version == "v2"
+    assert engine._trades_worker.active_symbols() == {
+        "BTC-USDT-SWAP",
+        "ETH-USDT-SWAP",
+    }
+    assert engine._trades_worker._rebuild_requested.is_set()
+    engine.stop()
+
+
 def test_clockdriver_commit_enqueues_symbol_diff_after_bar_payload():
     engine = Engine(
         symbols=["BTC-USDT"],

@@ -358,20 +358,20 @@ The second element (`round_trades`) maps symbol → dict with keys:
 
 ## Dynamic symbol universe rebalance
 
-Dynamic symbols are intended for low-frequency rebalance, such as refreshing a Binance USDT perpetual top-N universe every 30 minutes. The goal is **process continuity**, not zero-gap high-frequency subscription churn.
+Dynamic symbols are intended for low-frequency rebalance, such as refreshing a Binance USDT perpetual top-N universe or an OKX swap universe every 30 minutes. The goal is **process continuity**, not zero-gap high-frequency subscription churn.
 
 Supported first-version path:
 
 | Area | Status |
 |------|--------|
 | `exchange="binance"` + `data_source="trades"` | Supported |
+| `exchange="okx"` + `data_source="trades"` | Supported |
 | Manual `engine.update_symbols([...])` | Supported |
 | Background `symbol_provider.fetch()` refresh thread | Supported |
-| Binance trades worker subscription rebuild | Supported |
+| Binance / OKX trades worker subscription rebuild | Supported |
 | Structured runtime payloads with `symbol_version` and `active_symbols` | Supported |
 | Audit `symbol_diff` events and verifier timeline | Supported |
-| OKX dynamic WS subscription | Not first-version scope |
-| Binance kline / `kline_trades` dynamic universe | Not first-version scope |
+| Kline / `kline_trades` dynamic universe | Not first-version scope |
 | Physical deletion of C++ symbol runners | Not first-version scope |
 
 ### How a rebalance starts
@@ -389,7 +389,7 @@ or:
 # Low-frequency provider-driven update.
 engine = Engine(
     symbols=["BTC-USDT"],
-    exchange="binance",
+    exchange="binance",  # or "okx" with symbols like "BTC-USDT-SWAP"
     data_source="trades",
     enable_dynamic_symbols=True,
     symbol_provider=provider,
@@ -454,13 +454,13 @@ ClockDriver thread, next tick:
   → Engine.commit_pending_symbol_diff(bucket_ts_ms)
       → SymbolManager.commit_pending()
       → Engine updates active_symbols / symbol_version
-      → BinanceTradesWorker.apply_symbol_diff(diff)
+      → TradesWorker/BinanceTradesWorker.apply_symbol_diff(diff)
       → AuditWriter.write_symbol_diff(...)
       → bar_queue.put({"type": "symbol_diff", "diff": diff, ...})
 
-BinanceTradesWorker thread:
+Trades worker thread:
   → collector stops
-  → worker loop rebuilds BinanceTradesCollector with target symbols
+  → worker loop rebuilds the exchange collector with target symbols
 
 factor-infer runtime thread:
   → consumes old bars payload
@@ -468,11 +468,11 @@ factor-infer runtime thread:
   → consumes following bars payload under new symbol_version
 ```
 
-The ClockDriver thread never waits for a WebSocket reconnect. `BinanceTradesWorker.apply_symbol_diff()` updates in-memory symbol state under a lock, requests a collector rebuild, and returns quickly.
+The ClockDriver thread never waits for a WebSocket reconnect. `TradesWorker.apply_symbol_diff()` / `BinanceTradesWorker.apply_symbol_diff()` update in-memory symbol state under a lock, request a collector rebuild, and return quickly.
 
-### BinanceTradesWorker behavior
+### Trades worker dynamic behavior
 
-`BinanceTradesWorker` keeps three symbol-related states:
+The OKX `TradesWorker` and `BinanceTradesWorker` keep three symbol-related states:
 
 | Field | Purpose |
 |-------|---------|
@@ -527,7 +527,7 @@ Committed universe changes write separate events:
 }
 ```
 
-The Binance audit verifier reads `symbol_diff` events and builds a best-effort active-symbol timeline. If a symbol has been removed, later missing aggregate bars are counted as `inactive_missing`, not as data loss.
+The audit verifier reads `symbol_diff` events and builds a best-effort active-symbol timeline. If a symbol has been removed, later missing aggregate bars are counted as `inactive_missing`, not as data loss.
 
 ### Failure behavior
 
@@ -580,4 +580,4 @@ pytest tests/runtime_engine/test_engine_dynamic_symbols.py -v
 pytest tests/audit/ -v
 ```
 
-Test coverage includes: collector message parsing, adapter filtering, publisher round batching, worker flush logic, ClockDriver aggregation, Engine integration with queue injection, dynamic symbol manager/provider/filter behavior, Binance trades worker rebuild requests, and audit/verifier symbol timeline handling. Live WebSocket access is not required for these unit/integration tests.
+Test coverage includes: collector message parsing, adapter filtering, publisher round batching, worker flush logic, ClockDriver aggregation, Engine integration with queue injection, dynamic symbol manager/provider/filter behavior, Binance/OKX trades worker rebuild requests, and audit/verifier symbol timeline handling. Live WebSocket access is not required for these unit/integration tests.

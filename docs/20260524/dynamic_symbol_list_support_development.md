@@ -2,7 +2,7 @@
 
 > 日期：2026-05-24
 > 状态：开发设计
-> 范围：第一版优先支持 `exchange="binance"` + `data_source="trades"` 的低频 symbol universe rebalance，目标是进程不中断
+> 范围：第一版支持 `exchange="binance"` / `exchange="okx"` + `data_source="trades"` 的低频 symbol universe rebalance，目标是进程不中断
 
 ---
 
@@ -49,7 +49,7 @@ Real-time dynamic subscription with zero data gap
 Exchange REST / local txt universe
   -> SymbolManager 计算 diff
   -> ClockDriver 在 tick 后提交 diff
-  -> BinanceTradesWorker 切换订阅
+  -> BinanceTradesWorker / OKX TradesWorker 切换订阅
   -> runtime thread 顺序 add/reset symbol
   -> outputs 按 payload universe 过滤
 ```
@@ -62,7 +62,7 @@ Exchange REST / local txt universe
 
 ```mermaid
 flowchart LR
-    C[Binance WS collector thread] --> W[BinanceTradesWorker accumulators]
+    C[WS collector thread] --> W[TradesWorker accumulators]
     CLK[ClockDriver thread] -->|flush| W
     CLK -->|bar payload| Q[bar_queue]
     Q --> R[Runtime thread]
@@ -89,28 +89,28 @@ flowchart LR
 
 ### 3.1 支持
 
-1. `exchange="binance"`。
+1. `exchange="binance"` / `exchange="okx"`。
 2. `data_source="trades"`。
 3. 低频刷新，默认可以按 30 分钟级别执行一次。
 4. `BinanceExchangeSymbolSource` 从 Binance 官方 REST 拉可交易 USDT-M 合约。
-5. `LocalTextSymbolSource` 从人工维护的 txt 文件读取允许交易的 symbol 池。
-6. filter pipeline 支持 top-N 24h 成交额、白名单、黑名单等筛选。
-7. 手动 `engine.update_symbols([...])`，用于测试或策略侧主动触发。
-8. 新增 symbol 创建 accumulator，并在 runtime thread 中创建 C++ runner/factors。
-9. 移除 symbol 停止输出、停止订阅，C++ runner 保留 inactive。
-10. re-add symbol 默认 reset state，避免 rolling window 跨断层复用。
-11. payload 带 `symbol_version` / `active_symbols`。
-12. 调整期间 Engine 进程不中断，ClockDriver / runtime 继续运行。
+5. `OkxExchangeSymbolSource` 从 OKX 官方 REST 拉可交易 instruments。
+6. `LocalTextSymbolSource` 从人工维护的 txt 文件读取允许交易的 symbol 池。
+7. filter pipeline 支持 top-N 24h 成交额、白名单、黑名单等筛选。
+8. 手动 `engine.update_symbols([...])`，用于测试或策略侧主动触发。
+9. 新增 symbol 创建 accumulator，并在 runtime thread 中创建 C++ runner/factors。
+10. 移除 symbol 停止输出、停止订阅，C++ runner 保留 inactive。
+11. re-add symbol 默认 reset state，避免 rolling window 跨断层复用。
+12. payload 带 `symbol_version` / `active_symbols`。
+13. 调整期间 Engine 进程不中断，ClockDriver / runtime 继续运行。
 
 ### 3.2 暂不支持
 
-1. OKX 动态订阅。
-2. Binance kline / `kline_trades` 动态 universe。
-3. C++ 物理删除 symbol runner。
-4. 新 symbol 历史 warmup。
-5. 毫秒级无断流订阅切换。
-6. WS 内动态 SUBSCRIBE / UNSUBSCRIBE 命令队列。
-7. 零数据空窗保证。第一版允许低频 rebalance 时存在短暂 collector 重连窗口。
+1. Binance / OKX kline 或 `kline_trades` 动态 universe。
+2. C++ 物理删除 symbol runner。
+3. 新 symbol 历史 warmup。
+4. 毫秒级无断流订阅切换。
+5. WS 内动态 SUBSCRIBE / UNSUBSCRIBE 命令队列。
+6. 零数据空窗保证。第一版允许低频 rebalance 时存在短暂 collector 重连窗口。
 
 ---
 
@@ -164,7 +164,7 @@ class SymbolSource:
 | Source | 用途 |
 |--------|------|
 | `BinanceExchangeSymbolSource` | 从 Binance 官方 REST 拉 USDT-M 合约列表和 24h ticker |
-| `OkxExchangeSymbolSource` | 从 OKX 官方 REST 拉 instruments / ticker，先用于后续 OKX 支持 |
+| `OkxExchangeSymbolSource` | 从 OKX 官方 REST 拉 instruments，支持 OKX trades 动态 universe |
 | `LocalTextSymbolSource` | 从人工维护的 txt 文件读取允许交易 symbol 池 |
 | `StaticSymbolSource` | 测试用，直接从 list 构造 |
 
@@ -884,6 +884,7 @@ pytest tests/runtime_engine/test_engine_dynamic_symbols.py -v
 
 ```bash
 pytest tests/dataflow/binance/test_binance_trades_worker.py -v
+pytest tests/dataflow/test_okx_trades_worker_dynamic.py -v
 ```
 
 ### Phase 3：Exchange source + filter pipeline
@@ -891,7 +892,7 @@ pytest tests/dataflow/binance/test_binance_trades_worker.py -v
 目标：
 
 1. `BinanceExchangeSymbolSource` 拉 Binance 官方 `exchangeInfo` 和 `ticker/24hr`。
-2. `OkxExchangeSymbolSource` 先实现 instruments/ticker 获取，供后续 OKX 动态订阅使用。
+2. `OkxExchangeSymbolSource` 实现 instruments 获取，供 OKX trades 动态 universe 使用。
 3. `AllowListFilter.from_txt(...)` 支持人工维护池。
 4. `TopQuoteVolumeFilter(top_n=...)` 支持 24h quote volume 排序截断。
 5. source/filter 只产出 `SymbolUniverse`，不直接改 Engine。
@@ -1111,7 +1112,7 @@ max_removed_per_commit = 50
 2. 新增 `SymbolSource` / `SymbolFilter` / `SymbolProvider` 抽象。
 3. 实现 `StaticSymbolSource` / `LocalTextSymbolSource`。
 4. 实现 `BinanceExchangeSymbolSource`，拉官方 `exchangeInfo` 和 `ticker/24hr`。
-5. 预留 `OkxExchangeSymbolSource`，先完成官方 REST 获取和 normalize。
+5. 实现 `OkxExchangeSymbolSource`，完成官方 REST 获取和 normalize。
 6. 实现 `AllowListFilter.from_txt(...)` / `DenyListFilter` / `TopQuoteVolumeFilter`。
 7. `ClockDriver` 增加 `after_flush_commit` hook。
 8. `ClockDriver` bar payload 支持结构化 dict，并保留 legacy tuple 兼容。
@@ -1119,8 +1120,8 @@ max_removed_per_commit = 50
 10. `Engine.update_symbols()` 只 stage diff。
 11. `Engine.commit_pending_symbol_diff()` 只做轻量通知。
 12. 可选 symbol refresh thread 以低频周期调用 `symbol_provider.fetch()`，默认 1800 秒级别。
-13. `BinanceTradesWorker` 加 symbol lock 和 active snapshot flush。
-14. `BinanceTradesWorker` 支持异步 collector rebuild。
+13. `BinanceTradesWorker` / OKX `TradesWorker` 加 symbol lock 和 active snapshot flush。
+14. `BinanceTradesWorker` / OKX `TradesWorker` 支持异步 collector rebuild。
 15. C++ / pybind 增加 `reset_symbol()`，或明确第一版 re-add 暂时复用旧 state。
 16. `signal_deque` 记录 `symbol_version` / `active_symbols`。
 17. audit 增加 `symbol_version` 和 universe change event。
@@ -1130,4 +1131,4 @@ max_removed_per_commit = 50
 
 ## 18. 一句话结论
 
-Dynamic symbol list support 的核心不是让 `symbols` 可变，而是建立一条可审计、可顺序化、线程所有权清晰的低频 rebalance 控制流：**上游 universe 先变成 pending diff，ClockDriver 在 post-flush 边界提交版本，worker 异步重建订阅但不停止进程，runtime thread 顺序 add/reset symbol，outputs 和 audit 都携带当时的 universe version**。第一版只做 Binance trades，可以把风险控制在最短的数据链路里。
+Dynamic symbol list support 的核心不是让 `symbols` 可变，而是建立一条可审计、可顺序化、线程所有权清晰的低频 rebalance 控制流：**上游 universe 先变成 pending diff，ClockDriver 在 post-flush 边界提交版本，worker 异步重建订阅但不停止进程，runtime thread 顺序 add/reset symbol，outputs 和 audit 都携带当时的 universe version**。第一版覆盖 Binance / OKX trades，可以把风险控制在最短的数据链路里。

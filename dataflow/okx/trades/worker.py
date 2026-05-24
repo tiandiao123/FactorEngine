@@ -22,6 +22,8 @@ import time
 
 import numpy as np
 
+from dataflow.symbols import SymbolDiff
+
 from .accumulator import TradesAccumulator
 from .collector import OKXTradesCollector
 
@@ -41,23 +43,33 @@ class TradesWorker:
 
     def __init__(self, symbols: list[str]):
         self.symbols = list(symbols)
+        self._symbol_lock = threading.RLock()
+        self._active_symbols: set[str] = set(self.symbols)
+        self._target_symbols: set[str] = set(self.symbols)
         self._accumulators: dict[str, TradesAccumulator] = {
             sym: TradesAccumulator() for sym in self.symbols
         }
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._collector: OKXTradesCollector | None = None
+        self._rebuild_requested = threading.Event()
         # Written from the WS asyncio thread (_on_trade), read from main
         # thread (stats/stop). Safe in CPython (GIL guarantees atomic int
         # read/write) but not portable to free-threaded builds.
         self._trade_count = 0
         self._flush_count = 0
+        self._rebuild_count = 0
         self._freq_ms: float = 0.0  # set via set_freq(); 0 = no alignment
 
     @property
     def accumulators(self) -> dict[str, TradesAccumulator]:
         """Per-symbol accumulators (read-only access for tests/monitoring)."""
         return self._accumulators
+
+    def active_symbols(self) -> set[str]:
+        """Return the currently active symbol set."""
+        with self._symbol_lock:
+            return set(self._active_symbols)
 
     # ── flush interface (called by ClockDriver) ────────────────
 
@@ -83,8 +95,13 @@ class TradesWorker:
         round_bars: dict[str, np.ndarray] = {}
         round_trades: dict[str, dict] = {}
 
-        for sym in self.symbols:
-            acc = self._accumulators.get(sym)
+        with self._symbol_lock:
+            accumulators = {
+                sym: self._accumulators.get(sym)
+                for sym in sorted(self._active_symbols)
+            }
+
+        for sym, acc in accumulators.items():
             if acc is None:
                 continue
             snap = acc.snapshot_and_reset()
@@ -108,6 +125,18 @@ class TradesWorker:
     def set_freq(self, freq_seconds: float) -> None:
         """Set the bar frequency for timestamp alignment in flush()."""
         self._freq_ms = freq_seconds * 1000
+
+    def apply_symbol_diff(self, diff: SymbolDiff) -> None:
+        """Apply a committed universe diff and request collector rebuild."""
+        with self._symbol_lock:
+            for sym in diff.added:
+                self._accumulators[sym] = TradesAccumulator()
+            for sym in diff.removed:
+                self._accumulators.pop(sym, None)
+            self._active_symbols = set(diff.target)
+            self._target_symbols = set(diff.target)
+            self.symbols = sorted(diff.target)
+        self._request_collector_rebuild()
 
     # ── lifecycle ──────────────────────────────────────────────
 
@@ -150,7 +179,8 @@ class TradesWorker:
             "trade_count": self._trade_count,
             "flush_count": self._flush_count,
             "ws_msg_count": self._collector.msg_count if self._collector else 0,
-            "symbols": len(self.symbols),
+            "symbols": len(self.active_symbols()),
+            "rebuild_count": self._rebuild_count,
         }
 
     # ── internal ──────────────────────────────────────────────
@@ -158,10 +188,18 @@ class TradesWorker:
     def _on_trade(
         self, symbol: str, px: float, sz: float, side: str, ts_ms: int
     ) -> None:
-        acc = self._accumulators.get(symbol)
+        with self._symbol_lock:
+            acc = self._accumulators.get(symbol)
         if acc is not None:
             acc.update(px, sz, side)
             self._trade_count += 1
+
+    def _request_collector_rebuild(self) -> None:
+        self._rebuild_requested.set()
+        if self._collector is not None:
+            self._collector.stop()
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(lambda: None)
 
     def _cancel_loop(self):
         for task in asyncio.all_tasks(self._loop):
@@ -187,12 +225,23 @@ class TradesWorker:
             self._loop.close()
 
     async def _run(self):
-        collector = OKXTradesCollector(
-            symbols=self.symbols,
-            on_trade=self._on_trade,
-        )
-        self._collector = collector
-        try:
-            await collector.run()
-        except asyncio.CancelledError:
-            pass
+        while True:
+            with self._symbol_lock:
+                symbols = sorted(self._target_symbols)
+            self._rebuild_requested.clear()
+            collector = OKXTradesCollector(
+                symbols=symbols,
+                on_trade=self._on_trade,
+            )
+            self._collector = collector
+            try:
+                await collector.run()
+            except asyncio.CancelledError:
+                pass
+            if not self._rebuild_requested.is_set():
+                break
+            self._rebuild_count += 1
+            logger.info(
+                "TradesWorker rebuilding collector: %d symbols",
+                len(self.active_symbols()),
+            )
