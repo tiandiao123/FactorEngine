@@ -56,14 +56,26 @@ class ClockDriver:
     ----------
     freq_seconds : float
         Flush interval in seconds (e.g. 5.0 for 5s bars).
-    bar_queue : queue.Queue
-        Destination queue consumed by ``Engine._runtime_loop()``.
+    bar_queue : queue.Queue | None
+        Destination queue consumed by ``Engine._runtime_loop()``.  May be
+        ``None`` for audit-only live collection without factor inference.
     """
 
-    def __init__(self, freq_seconds: float, bar_queue: queue.Queue):
+    def __init__(
+        self,
+        freq_seconds: float,
+        bar_queue: queue.Queue | None,
+        *,
+        audit=None,
+        exchange: str | None = None,
+        data_source: str | None = None,
+    ):
         self._freq = freq_seconds
         self._freq_ms = freq_seconds * 1000
         self._bar_queue = bar_queue
+        self._audit = audit
+        self._exchange = exchange or ""
+        self._data_source = data_source or ""
         self._workers: dict[str, FlushableWorker] = {}
         self._running = False
         self._thread: threading.Thread | None = None
@@ -172,16 +184,33 @@ class ClockDriver:
         if not merged_bars:
             return
 
-        payload = (merged_bars, merged_trades if merged_trades else None)
-        try:
-            self._bar_queue.put(payload, block=False)
-        except queue.Full:
-            self._drop_count += 1
-            if self._drop_count % 100 == 1:
-                logger.warning(
-                    "ClockDriver: bar_queue full — dropped tick %d "
-                    "(total drops: %d)", self._tick_count, self._drop_count,
+        if self._audit is not None:
+            try:
+                self._audit.write_aggregate_batch(
+                    exchange=self._exchange,
+                    data_source=self._data_source,
+                    freq_seconds=self._freq,
+                    bars=merged_bars,
+                    trades=merged_trades,
+                    flush_ts_ms=int(time.time() * 1000),
                 )
+            except Exception:
+                logger.exception(
+                    "ClockDriver: audit aggregate write error (tick=%d)",
+                    self._tick_count,
+                )
+
+        if self._bar_queue is not None:
+            payload = (merged_bars, merged_trades if merged_trades else None)
+            try:
+                self._bar_queue.put(payload, block=False)
+            except queue.Full:
+                self._drop_count += 1
+                if self._drop_count % 100 == 1:
+                    logger.warning(
+                        "ClockDriver: bar_queue full — dropped tick %d "
+                        "(total drops: %d)", self._tick_count, self._drop_count,
+                    )
 
     def _aggregate(
         self, raw: dict[str, Any],
