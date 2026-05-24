@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AuditConfig
-from .schema import AggregateBarEvent
+from .schema import AggregateBarEvent, SymbolDiffEvent
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,9 @@ class AuditWriter:
     def write_aggregate_bar(self, event: AggregateBarEvent) -> None:
         self._enqueue(("aggregate_bar", event.to_dict()))
 
+    def write_symbol_diff(self, event: SymbolDiffEvent) -> None:
+        self._enqueue(("symbol_diff", event.to_dict()))
+
     def write_aggregate_batch(
         self,
         *,
@@ -84,6 +87,8 @@ class AuditWriter:
         bars: dict[str, Any],
         trades: dict[str, dict] | None,
         flush_ts_ms: int | None = None,
+        symbol_version: str | None = None,
+        active_symbols_count: int | None = None,
     ) -> None:
         flush_ts = int(time.time() * 1000) if flush_ts_ms is None else flush_ts_ms
         trade_map = trades or {}
@@ -106,6 +111,8 @@ class AuditWriter:
                     buy_vol=_finite_or_none(trade.get("buy_vol")),
                     sell_vol=_finite_or_none(trade.get("sell_vol")),
                     trade_count=int(trade.get("trade_count", 0) or 0),
+                    symbol_version=symbol_version,
+                    active_symbols_count=active_symbols_count,
                 )
             )
 

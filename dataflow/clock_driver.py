@@ -36,7 +36,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -69,6 +69,10 @@ class ClockDriver:
         audit=None,
         exchange: str | None = None,
         data_source: str | None = None,
+        after_flush_commit: Callable[[int], None] | None = None,
+        structured_payload: bool = False,
+        symbol_version_getter: Callable[[], str | None] | None = None,
+        active_symbols_getter: Callable[[], set[str] | frozenset[str] | None] | None = None,
     ):
         self._freq = freq_seconds
         self._freq_ms = freq_seconds * 1000
@@ -76,6 +80,10 @@ class ClockDriver:
         self._audit = audit
         self._exchange = exchange or ""
         self._data_source = data_source or ""
+        self._after_flush_commit = after_flush_commit
+        self._structured_payload = structured_payload
+        self._symbol_version_getter = symbol_version_getter
+        self._active_symbols_getter = active_symbols_getter
         self._workers: dict[str, FlushableWorker] = {}
         self._running = False
         self._thread: threading.Thread | None = None
@@ -181,10 +189,19 @@ class ClockDriver:
 
         merged_bars, merged_trades = self._aggregate(raw)
 
-        if not merged_bars:
-            return
+        bucket_ts_ms = _bucket_ts_ms(merged_bars)
+        symbol_version = (
+            self._symbol_version_getter()
+            if self._symbol_version_getter is not None
+            else None
+        )
+        active_symbols = (
+            self._active_symbols_getter()
+            if self._active_symbols_getter is not None
+            else None
+        )
 
-        if self._audit is not None:
+        if merged_bars and self._audit is not None:
             try:
                 self._audit.write_aggregate_batch(
                     exchange=self._exchange,
@@ -193,6 +210,10 @@ class ClockDriver:
                     bars=merged_bars,
                     trades=merged_trades,
                     flush_ts_ms=int(time.time() * 1000),
+                    symbol_version=symbol_version,
+                    active_symbols_count=(
+                        len(active_symbols) if active_symbols is not None else None
+                    ),
                 )
             except Exception:
                 logger.exception(
@@ -200,8 +221,14 @@ class ClockDriver:
                     self._tick_count,
                 )
 
-        if self._bar_queue is not None:
-            payload = (merged_bars, merged_trades if merged_trades else None)
+        if merged_bars and self._bar_queue is not None:
+            payload = self._build_payload(
+                merged_bars,
+                merged_trades,
+                bucket_ts_ms,
+                symbol_version=symbol_version,
+                active_symbols=active_symbols,
+            )
             try:
                 self._bar_queue.put(payload, block=False)
             except queue.Full:
@@ -211,6 +238,35 @@ class ClockDriver:
                         "ClockDriver: bar_queue full — dropped tick %d "
                         "(total drops: %d)", self._tick_count, self._drop_count,
                     )
+
+        if self._after_flush_commit is not None:
+            try:
+                self._after_flush_commit(bucket_ts_ms)
+            except Exception:
+                logger.exception(
+                    "ClockDriver: after_flush_commit error (tick=%d)",
+                    self._tick_count,
+                )
+
+    def _build_payload(
+        self,
+        merged_bars: dict[str, np.ndarray],
+        merged_trades: dict[str, dict],
+        bucket_ts_ms: int,
+        *,
+        symbol_version: str | None = None,
+        active_symbols: set[str] | frozenset[str] | None = None,
+    ) -> Any:
+        if not self._structured_payload:
+            return (merged_bars, merged_trades if merged_trades else None)
+        return {
+            "type": "bars",
+            "bars": merged_bars,
+            "trades": merged_trades if merged_trades else None,
+            "bucket_ts_ms": bucket_ts_ms,
+            "symbol_version": symbol_version,
+            "active_symbols": set(active_symbols or set(merged_bars)),
+        }
 
     def _aggregate(
         self, raw: dict[str, Any],
@@ -242,3 +298,12 @@ class ClockDriver:
                         merged_bars[sym] = bar
 
         return merged_bars, merged_trades
+
+
+def _bucket_ts_ms(merged_bars: dict[str, np.ndarray]) -> int:
+    for bar in merged_bars.values():
+        try:
+            return int(bar[0])
+        except (IndexError, TypeError, ValueError):
+            continue
+    return int(time.time() * 1000)

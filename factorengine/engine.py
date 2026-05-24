@@ -62,6 +62,7 @@ import logging
 import queue
 import re
 import threading
+import time
 from collections import deque
 
 import numpy as np
@@ -108,6 +109,9 @@ class Engine:
         exchange: str = "okx",
         testnet: bool = False,
         audit_config: AuditConfig | None = None,
+        enable_dynamic_symbols: bool = False,
+        symbol_provider=None,
+        symbol_refresh_interval_seconds: float | None = None,
     ):
         if data_source not in self._VALID_DATA_SOURCES:
             raise ValueError(
@@ -128,6 +132,12 @@ class Engine:
         self._data_source = data_source
         self._exchange = exchange
         self._testnet = testnet
+        self._dynamic_symbols_enabled = enable_dynamic_symbols
+        self._symbol_manager = None
+        self._symbol_provider = symbol_provider
+        self._symbol_refresh_interval_seconds = symbol_refresh_interval_seconds
+        self._active_symbols: set[str] = set(symbols)
+        self._symbol_version = "initial"
         self._audit = None
         if audit_config is not None and audit_config.enabled:
             from dataflow.audit.writer import AuditWriter
@@ -154,12 +164,24 @@ class Engine:
         self._prev_closes: dict[str, float] = {}
         self._bars_pushed = 0
         self._last_bar_debug: dict | None = None
+        self._last_symbol_diff = None
+
+        if enable_dynamic_symbols:
+            from dataflow.symbols import SymbolManager
+
+            self._symbol_manager = SymbolManager(
+                symbols,
+                exchange=exchange,
+                version=self._symbol_version,
+            )
 
         # Inter-thread communication: ClockDriver → runtime.
         self._bar_queue: queue.Queue | None = None
         self._bar_queue_timeout = bar_queue_timeout
         self._runtime_thread: threading.Thread | None = None
+        self._symbol_refresh_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._symbol_refresh_stop_event = threading.Event()
 
         if self._factor_groups:
             self._init_inference(self._factor_groups, num_threads)
@@ -267,6 +289,14 @@ class Engine:
                 audit=self._audit,
                 exchange=self._exchange,
                 data_source=self._data_source,
+                after_flush_commit=(
+                    self.commit_pending_symbol_diff
+                    if self._dynamic_symbols_enabled
+                    else None
+                ),
+                structured_payload=self._dynamic_symbols_enabled,
+                symbol_version_getter=lambda: self._symbol_version,
+                active_symbols_getter=lambda: set(self._active_symbols),
             )
 
             if self._kline_worker is not None:
@@ -320,15 +350,17 @@ class Engine:
             except queue.Empty:
                 continue
 
-            # Unpack: ClockDriver sends (round_bars, round_trades | None).
-            if isinstance(payload, tuple):
-                round_bars, round_trades = payload
-            else:
-                round_bars, round_trades = payload, None
+            parsed = self._parse_runtime_payload(payload)
+            if parsed is None:
+                continue
+            round_bars, round_trades, payload_meta = parsed
 
             ts_ms = 0
             batch: dict[str, rt.BarData] = {}
+            active_symbols = payload_meta.get("active_symbols")
             for sym, bar in round_bars.items():
+                if active_symbols is not None and sym not in active_symbols:
+                    continue
                 ts_ms = int(bar[0])
                 close = float(bar[4])
                 volume = float(bar[5])
@@ -377,13 +409,154 @@ class Engine:
             }
 
             result = self._inference.get_all_outputs()
+            if active_symbols is not None:
+                result = {
+                    sym: factors
+                    for sym, factors in result.items()
+                    if sym in active_symbols
+                }
             self._signal_deque.append({
                 "ts": ts_ms,
                 "bar_index": self._bars_pushed,
+                "symbol_version": payload_meta.get("symbol_version"),
+                "active_symbols": active_symbols,
                 "factors": result,
             })
 
         logger.info("factor-infer thread stopped (bars_pushed=%d)", self._bars_pushed)
+
+    def _parse_runtime_payload(self, payload):
+        """Normalize legacy and structured runtime queue payloads."""
+        if isinstance(payload, dict) and payload.get("type") == "symbol_diff":
+            diff = payload.get("diff")
+            self._last_symbol_diff = diff
+            if diff is not None:
+                self._active_symbols = set(diff.target)
+                self._symbol_version = diff.version
+            return None
+        if isinstance(payload, dict) and payload.get("type") == "bars":
+            meta = {
+                "symbol_version": payload.get("symbol_version"),
+                "active_symbols": (
+                    set(payload["active_symbols"])
+                    if payload.get("active_symbols") is not None
+                    else None
+                ),
+            }
+            return payload.get("bars", {}), payload.get("trades"), meta
+        if isinstance(payload, tuple):
+            round_bars, round_trades = payload
+            return round_bars, round_trades, {}
+        return payload, None, {}
+
+    def update_symbols(
+        self,
+        symbols: list[str],
+        *,
+        version: str | None = None,
+        metadata: dict | None = None,
+        allow_empty: bool = False,
+    ):
+        """Stage a full target symbol list for the next post-flush commit."""
+        if not self._dynamic_symbols_enabled or self._symbol_manager is None:
+            raise RuntimeError("Dynamic symbols are not enabled for this Engine")
+        if version is None:
+            version = f"manual:{int(time.time() * 1000)}"
+        return self._symbol_manager.update_symbols(
+            symbols,
+            version=version,
+            metadata=metadata,
+            allow_empty=allow_empty,
+        )
+
+    def refresh_symbols_once(self):
+        """Fetch provider universe once and stage the resulting diff."""
+        if self._symbol_provider is None:
+            raise RuntimeError("No symbol_provider configured")
+        if not self._dynamic_symbols_enabled or self._symbol_manager is None:
+            raise RuntimeError("Dynamic symbols are not enabled for this Engine")
+        universe = self._symbol_provider.fetch()
+        return self._symbol_manager.stage_universe(universe)
+
+    def _symbol_refresh_loop(self) -> None:
+        interval = self._symbol_refresh_interval()
+        logger.info("symbol-refresh thread started: interval=%.1fs", interval)
+        self._refresh_symbols_safely()
+        while not self._symbol_refresh_stop_event.wait(interval):
+            self._refresh_symbols_safely()
+        logger.info("symbol-refresh thread stopped")
+
+    def _refresh_symbols_safely(self) -> None:
+        try:
+            self.refresh_symbols_once()
+        except Exception:
+            logger.exception("symbol-refresh failed")
+
+    def _symbol_refresh_interval(self) -> float:
+        if self._symbol_refresh_interval_seconds is not None:
+            interval = self._symbol_refresh_interval_seconds
+        else:
+            interval = getattr(
+                self._symbol_provider,
+                "refresh_interval_seconds",
+                None,
+            )
+            if interval is None:
+                interval = 1800.0
+        interval = float(interval)
+        if interval <= 0:
+            raise ValueError("symbol refresh interval must be positive")
+        return interval
+
+    def commit_pending_symbol_diff(self, effective_from_ts_ms: int | None = None) -> None:
+        """Commit staged symbol diff after ClockDriver has flushed a bucket."""
+        if self._symbol_manager is None:
+            return
+        diff = self._symbol_manager.commit_pending()
+        if diff is None:
+            return
+
+        self._active_symbols = set(diff.target)
+        self._symbol_version = diff.version
+        self.symbols = sorted(diff.target)
+
+        if self._trades_worker is not None and hasattr(self._trades_worker, "apply_symbol_diff"):
+            self._trades_worker.apply_symbol_diff(diff)
+
+        self._write_symbol_diff_audit(diff, effective_from_ts_ms)
+
+        if self._bar_queue is not None:
+            try:
+                self._bar_queue.put({
+                    "type": "symbol_diff",
+                    "diff": diff,
+                    "effective_from_ts_ms": effective_from_ts_ms,
+                }, block=False)
+            except queue.Full:
+                logger.warning("Dynamic symbol diff dropped because bar_queue is full")
+
+    def _write_symbol_diff_audit(self, diff, effective_from_ts_ms: int | None) -> None:
+        if self._audit is None:
+            return
+        try:
+            from dataflow.audit import SymbolDiffEvent
+
+            self._audit.write_symbol_diff(
+                SymbolDiffEvent(
+                    commit_ts_ms=int(time.time() * 1000),
+                    effective_from_ts_ms=effective_from_ts_ms,
+                    exchange=self._exchange,
+                    data_source=self._data_source,
+                    symbol_version=diff.version,
+                    added=sorted(diff.added),
+                    removed=sorted(diff.removed),
+                    unchanged_count=len(diff.unchanged),
+                    target_count=len(diff.target),
+                    reason=diff.reason,
+                )
+            )
+        except Exception:
+            logger.exception("Dynamic symbol diff audit write failed")
 
     def get_factor_outputs(
         self, symbols: list[str] | None = None
@@ -406,6 +579,36 @@ class Engine:
     def factor_ids(self) -> list[str]:
         """List of registered factor IDs (empty if no factor_group configured)."""
         return self._factor_ids if self._inference else []
+
+    @property
+    def active_symbols(self) -> set[str]:
+        """Current committed active symbol set."""
+        return set(self._active_symbols)
+
+    @property
+    def pending_symbol_diff(self):
+        """Pending dynamic symbol diff, if any."""
+        if self._symbol_manager is None:
+            return None
+        return self._symbol_manager.pending_diff
+
+    @property
+    def symbol_version(self) -> str:
+        """Current committed symbol universe version."""
+        return self._symbol_version
+
+    @property
+    def symbol_stats(self) -> dict:
+        """Dynamic symbol manager stats."""
+        if self._symbol_manager is None:
+            return {
+                "enabled": False,
+                "version": self._symbol_version,
+                "active_count": len(self._active_symbols),
+            }
+        stats = self._symbol_manager.stats()
+        stats["enabled"] = True
+        return stats
 
     @property
     def bars_pushed(self) -> int:
@@ -432,6 +635,19 @@ class Engine:
         """Start the dataflow collection and (optionally) the inference thread."""
         if self._audit is not None:
             self._audit.start()
+
+        if (
+            self._dynamic_symbols_enabled
+            and self._symbol_provider is not None
+            and self._symbol_refresh_thread is None
+        ):
+            self._symbol_refresh_stop_event.clear()
+            self._symbol_refresh_thread = threading.Thread(
+                target=self._symbol_refresh_loop,
+                daemon=True,
+                name="symbol-refresh",
+            )
+            self._symbol_refresh_thread.start()
 
         if self._bar_queue is not None and self._inference is not None:
             self._stop_event.clear()
@@ -461,6 +677,11 @@ class Engine:
 
     def stop(self):
         """Stop the dataflow collection and inference thread."""
+        if self._symbol_refresh_thread is not None:
+            self._symbol_refresh_stop_event.set()
+            self._symbol_refresh_thread.join(timeout=5)
+            self._symbol_refresh_thread = None
+
         if self.mode == "live":
             if self._clock_driver is not None:
                 self._clock_driver.stop()

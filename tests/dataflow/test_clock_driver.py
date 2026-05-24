@@ -165,3 +165,50 @@ class TestClockDriverQueue:
         time.sleep(2.0)
         cd.stop()
         assert cd.drop_count >= 1 or q.qsize() >= 1
+
+    def test_after_flush_commit_runs_after_queue_put(self):
+        q = queue.Queue(maxsize=8)
+        events = []
+        kline_data = {
+            "BTC": np.array([5000, 100, 106, 98, 103, 80, 0, 0], dtype=np.float64)
+        }
+
+        def after_flush(bucket_ts_ms):
+            events.append(("hook", bucket_ts_ms, q.qsize()))
+            q.put_nowait({"type": "symbol_diff", "version": "v2"})
+
+        cd = ClockDriver(
+            freq_seconds=0.5,
+            bar_queue=q,
+            after_flush_commit=after_flush,
+        )
+        cd.register("kline", FakeWorker(data=kline_data))
+        cd._flush_and_aggregate()
+
+        assert events == [("hook", 5000, 1)]
+        first = q.get_nowait()
+        second = q.get_nowait()
+        assert isinstance(first, tuple)
+        assert second["type"] == "symbol_diff"
+
+    def test_structured_payload_includes_universe_metadata(self):
+        q = queue.Queue(maxsize=8)
+        kline_data = {
+            "BTC": np.array([5000, 100, 106, 98, 103, 80, 0, 0], dtype=np.float64)
+        }
+        cd = ClockDriver(
+            freq_seconds=0.5,
+            bar_queue=q,
+            structured_payload=True,
+            symbol_version_getter=lambda: "v1",
+            active_symbols_getter=lambda: {"BTC", "ETH"},
+        )
+        cd.register("kline", FakeWorker(data=kline_data))
+        cd._flush_and_aggregate()
+
+        payload = q.get_nowait()
+        assert payload["type"] == "bars"
+        assert payload["bucket_ts_ms"] == 5000
+        assert payload["symbol_version"] == "v1"
+        assert payload["active_symbols"] == {"BTC", "ETH"}
+        assert "BTC" in payload["bars"]

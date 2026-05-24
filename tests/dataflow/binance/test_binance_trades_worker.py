@@ -9,6 +9,7 @@ import math
 import numpy as np
 import pytest
 
+from dataflow.symbols import SymbolDiff
 from dataflow.binance.trades.worker import BinanceTradesWorker
 
 
@@ -88,6 +89,7 @@ class TestBinanceTradesWorkerFlush:
         assert s["symbols"] == 2
         assert s["trade_count"] == 0
         assert s["flush_count"] == 0
+        assert s["rebuild_count"] == 0
 
     def test_vwap_calculation(self):
         worker = BinanceTradesWorker(symbols=["BTC-USDT"])
@@ -97,6 +99,81 @@ class TestBinanceTradesWorkerFlush:
         _, trades = worker.flush()
         expected_vwap = (100.0 * 3.0 + 200.0 * 1.0) / (3.0 + 1.0)
         assert trades["BTC-USDT"]["vwap"] == pytest.approx(expected_vwap)
+
+
+class TestBinanceTradesWorkerDynamicSymbols:
+    def test_apply_symbol_diff_adds_and_removes_accumulators(self):
+        worker = BinanceTradesWorker(symbols=["BTC-USDT", "ETH-USDT"])
+        diff = SymbolDiff(
+            version="v2",
+            added=frozenset({"SOL-USDT"}),
+            removed=frozenset({"ETH-USDT"}),
+            unchanged=frozenset({"BTC-USDT"}),
+            target=frozenset({"BTC-USDT", "SOL-USDT"}),
+        )
+
+        worker.apply_symbol_diff(diff)
+
+        assert worker.active_symbols() == {"BTC-USDT", "SOL-USDT"}
+        assert worker.symbols == ["BTC-USDT", "SOL-USDT"]
+        assert "SOL-USDT" in worker.accumulators
+        assert "ETH-USDT" not in worker.accumulators
+        assert worker._rebuild_requested.is_set()
+
+    def test_removed_symbol_late_trade_is_ignored(self):
+        worker = BinanceTradesWorker(symbols=["BTC-USDT", "ETH-USDT"])
+        diff = SymbolDiff(
+            version="v2",
+            added=frozenset(),
+            removed=frozenset({"ETH-USDT"}),
+            unchanged=frozenset({"BTC-USDT"}),
+            target=frozenset({"BTC-USDT"}),
+        )
+        worker.apply_symbol_diff(diff)
+
+        worker._on_trade("ETH-USDT", 3800.0, 1.0, "buy", 0)
+        worker._on_trade("BTC-USDT", 97500.0, 1.0, "buy", 0)
+
+        round_bars, round_trades = worker.flush()
+        assert "ETH-USDT" not in round_bars
+        assert "ETH-USDT" not in round_trades
+        assert round_trades["BTC-USDT"]["trade_count"] == 1
+        assert worker.trade_count == 1
+
+    def test_flush_uses_active_symbol_snapshot_after_diff(self):
+        worker = BinanceTradesWorker(symbols=["BTC-USDT", "ETH-USDT"])
+        worker._on_trade("ETH-USDT", 3800.0, 1.0, "buy", 0)
+        worker.apply_symbol_diff(
+            SymbolDiff(
+                version="v2",
+                added=frozenset({"SOL-USDT"}),
+                removed=frozenset({"ETH-USDT"}),
+                unchanged=frozenset({"BTC-USDT"}),
+                target=frozenset({"BTC-USDT", "SOL-USDT"}),
+            )
+        )
+
+        worker._on_trade("SOL-USDT", 180.0, 2.0, "sell", 0)
+        round_bars, round_trades = worker.flush()
+
+        assert set(round_bars) == {"BTC-USDT", "SOL-USDT"}
+        assert set(round_trades) == {"BTC-USDT", "SOL-USDT"}
+        assert round_trades["SOL-USDT"]["trade_count"] == 1
+
+    def test_apply_symbol_diff_requests_rebuild_without_running_loop(self):
+        worker = BinanceTradesWorker(symbols=["BTC-USDT"])
+        worker.apply_symbol_diff(
+            SymbolDiff(
+                version="v2",
+                added=frozenset({"ETH-USDT"}),
+                removed=frozenset(),
+                unchanged=frozenset({"BTC-USDT"}),
+                target=frozenset({"BTC-USDT", "ETH-USDT"}),
+            )
+        )
+
+        assert worker._rebuild_requested.is_set()
+        assert worker.stats()["symbols"] == 2
 
 
 class TestBinanceTradesWorkerWithEngine:

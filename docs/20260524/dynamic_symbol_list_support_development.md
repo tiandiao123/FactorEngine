@@ -2,7 +2,7 @@
 
 > 日期：2026-05-24
 > 状态：开发设计
-> 范围：第一版优先支持 `exchange="binance"` + `data_source="trades"` 的运行时 symbol universe 切换
+> 范围：第一版优先支持 `exchange="binance"` + `data_source="trades"` 的低频 symbol universe rebalance，目标是进程不中断
 
 ---
 
@@ -27,7 +27,21 @@ engine = Engine(
 4. `get_factor_outputs()` 输出集合。
 5. audit / verifier 对缺失 bar 的解释。
 
-Dynamic symbol list support 的目标是让 Engine 支持运行中切换 symbol universe，例如从 top 200 成交额合约切换到新的 top 200，而不是重启整个进程。
+Dynamic symbol list support 的目标是让 Engine 支持运行中自主 rebalance symbol universe，例如每 30 分钟从 top 200 成交额合约切换到新的 top 200，而不是重启整个进程。
+
+第一版不是高频动态订阅系统。可以把目标理解为：
+
+```text
+Dynamic symbol rebalance without process restart
+```
+
+而不是：
+
+```text
+Real-time dynamic subscription with zero data gap
+```
+
+也就是说，我们接受低频切换时 worker 短暂重建连接和新 symbol 自然 warmup，但不接受 Engine 进程退出、ClockDriver 卡死、runtime 并发崩溃或上一根 bucket 被错误丢弃。
 
 第一版只做最小闭环：
 
@@ -77,14 +91,16 @@ flowchart LR
 
 1. `exchange="binance"`。
 2. `data_source="trades"`。
-3. 手动 `engine.update_symbols([...])`。
+3. 低频刷新，默认可以按 30 分钟级别执行一次。
 4. `BinanceExchangeSymbolSource` 从 Binance 官方 REST 拉可交易 USDT-M 合约。
 5. `LocalTextSymbolSource` 从人工维护的 txt 文件读取允许交易的 symbol 池。
 6. filter pipeline 支持 top-N 24h 成交额、白名单、黑名单等筛选。
-7. 新增 symbol 创建 accumulator，并在 runtime thread 中创建 C++ runner/factors。
-8. 移除 symbol 停止输出、停止订阅，C++ runner 保留 inactive。
-9. re-add symbol 默认 reset state，避免 rolling window 跨断层复用。
-10. payload 带 `symbol_version` / `active_symbols`。
+7. 手动 `engine.update_symbols([...])`，用于测试或策略侧主动触发。
+8. 新增 symbol 创建 accumulator，并在 runtime thread 中创建 C++ runner/factors。
+9. 移除 symbol 停止输出、停止订阅，C++ runner 保留 inactive。
+10. re-add symbol 默认 reset state，避免 rolling window 跨断层复用。
+11. payload 带 `symbol_version` / `active_symbols`。
+12. 调整期间 Engine 进程不中断，ClockDriver / runtime 继续运行。
 
 ### 3.2 暂不支持
 
@@ -94,6 +110,7 @@ flowchart LR
 4. 新 symbol 历史 warmup。
 5. 毫秒级无断流订阅切换。
 6. WS 内动态 SUBSCRIBE / UNSUBSCRIBE 命令队列。
+7. 零数据空窗保证。第一版允许低频 rebalance 时存在短暂 collector 重连窗口。
 
 ---
 
@@ -214,7 +231,7 @@ provider = SymbolProvider(
         AllowListFilter.from_txt("config/symbol_pools/binance_usdt_perp.txt"),
         TopQuoteVolumeFilter(top_n=200),
     ],
-    refresh_interval_seconds=30,
+    refresh_interval_seconds=1800,
 )
 ```
 
@@ -226,7 +243,7 @@ provider = SymbolProvider(
     filters=[
         DenyListFilter(["BAD-USDT"]),
     ],
-    refresh_interval_seconds=30,
+    refresh_interval_seconds=1800,
 )
 ```
 
@@ -476,12 +493,12 @@ engine = Engine(
             AllowListFilter.from_txt("config/symbol_pools/binance_usdt_perp.txt"),
             TopQuoteVolumeFilter(top_n=200),
         ],
-        refresh_interval_seconds=30,
+        refresh_interval_seconds=1800,
     ),
 )
 ```
 
-这里的 txt 文件是人工维护的可交易池；交易所 REST 提供实时可交易状态和 24h 成交额；filter pipeline 负责取交集和 top-N。
+这里的 txt 文件是人工维护的可交易池；交易所 REST 提供实时可交易状态和 24h 成交额；filter pipeline 负责取交集和 top-N。默认刷新周期可以按 30 分钟级别配置，第一版不需要 30 秒级高频刷新。
 
 ### 7.2 手动更新
 
@@ -631,6 +648,8 @@ acc.update(px, sz, side)
 
 第一版不做 WS 内动态 subscribe/unsubscribe，而是重建连接。
 
+这个选择和“低频 universe rebalance”目标匹配：如果 symbol list 半小时左右才调整一次，重建连接带来的短暂断流是可以接受的，换来的是实现简单、状态边界清晰、reconnect 后订阅集合确定。
+
 不要在 ClockDriver 线程里同步执行：
 
 ```text
@@ -654,6 +673,14 @@ sequenceDiagram
 ```
 
 这样即使重建连接耗时，也不会卡住 ClockDriver tick。
+
+重建期间的期望行为：
+
+1. Engine 进程继续运行。
+2. ClockDriver 不因等待重连而卡死。
+3. runtime thread 继续处理已经入队的 payload / control message。
+4. 新连接建立后，worker 使用最新 target symbols 继续累计 trades。
+5. audit universe event 记录这次 rebalance，便于解释切换窗口。
 
 ---
 
@@ -883,7 +910,7 @@ pytest tests/symbols/ -v
 2. `Engine.active_symbols` / `symbol_version` / `pending_symbol_diff`。
 3. `_runtime_loop()` 处理结构化 bars payload 和 symbol diff。
 4. `get_factor_outputs()` 按 payload active symbols 过滤。
-5. 可选 symbol refresh thread 周期性调用 `symbol_provider.fetch()`，并把结果 stage 到 `SymbolManager`。
+5. 可选 symbol refresh thread 以低频周期调用 `symbol_provider.fetch()`，默认可按 1800 秒执行，并把结果 stage 到 `SymbolManager`。
 
 测试：
 
@@ -1072,7 +1099,7 @@ max_removed_per_commit = 50
 
 ### 16.4 Collector 重建断流
 
-第一版接受短暂断流。原因是目标是 correctness，不是毫秒级切换。
+第一版接受低频 rebalance 时的短暂断流。原因是目标是 correctness 和 process continuity，不是毫秒级切换或 zero-gap subscription。
 
 后续如果断流不可接受，再升级到 WS 内动态 SUBSCRIBE / UNSUBSCRIBE。
 
@@ -1091,7 +1118,7 @@ max_removed_per_commit = 50
 9. `Engine._runtime_loop()` 支持 `type="bars"` / `type="symbol_diff"`。
 10. `Engine.update_symbols()` 只 stage diff。
 11. `Engine.commit_pending_symbol_diff()` 只做轻量通知。
-12. 可选 symbol refresh thread 周期性调用 `symbol_provider.fetch()`。
+12. 可选 symbol refresh thread 以低频周期调用 `symbol_provider.fetch()`，默认 1800 秒级别。
 13. `BinanceTradesWorker` 加 symbol lock 和 active snapshot flush。
 14. `BinanceTradesWorker` 支持异步 collector rebuild。
 15. C++ / pybind 增加 `reset_symbol()`，或明确第一版 re-add 暂时复用旧 state。
@@ -1103,4 +1130,4 @@ max_removed_per_commit = 50
 
 ## 18. 一句话结论
 
-Dynamic symbol list support 的核心不是让 `symbols` 可变，而是建立一条可审计、可顺序化、线程所有权清晰的控制流：**上游 universe 先变成 pending diff，ClockDriver 在 post-flush 边界提交版本，worker 异步切换订阅，runtime thread 顺序 add/reset symbol，outputs 和 audit 都携带当时的 universe version**。第一版只做 Binance trades，可以把风险控制在最短的数据链路里。
+Dynamic symbol list support 的核心不是让 `symbols` 可变，而是建立一条可审计、可顺序化、线程所有权清晰的低频 rebalance 控制流：**上游 universe 先变成 pending diff，ClockDriver 在 post-flush 边界提交版本，worker 异步重建订阅但不停止进程，runtime thread 顺序 add/reset symbol，outputs 和 audit 都携带当时的 universe version**。第一版只做 Binance trades，可以把风险控制在最短的数据链路里。
