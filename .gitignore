@@ -30,3 +30,4 @@ Thumbs.db
 
 # Data (runtime generated)
 data/
+examples/engine/data/

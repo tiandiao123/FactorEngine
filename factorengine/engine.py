@@ -66,6 +66,7 @@ from collections import deque
 
 import numpy as np
 
+from dataflow.audit.config import AuditConfig
 from dataflow.okx.common import resolve_bar_channel
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ class Engine:
         data_source: str = "kline",
         exchange: str = "okx",
         testnet: bool = False,
+        audit_config: AuditConfig | None = None,
     ):
         if data_source not in self._VALID_DATA_SOURCES:
             raise ValueError(
@@ -126,6 +128,11 @@ class Engine:
         self._data_source = data_source
         self._exchange = exchange
         self._testnet = testnet
+        self._audit = None
+        if audit_config is not None and audit_config.enabled:
+            from dataflow.audit.writer import AuditWriter
+
+            self._audit = AuditWriter(audit_config)
 
         self.data_freq_seconds = parse_freq(data_freq)
         self.pull_interval_seconds = parse_freq(pull_interval)
@@ -251,12 +258,15 @@ class Engine:
             self._trades_worker.set_freq(self.data_freq_seconds)
 
         # ── ClockDriver: unified flush & aggregation ──
-        if self._bar_queue is not None:
+        if self._bar_queue is not None or self._audit is not None:
             from dataflow.clock_driver import ClockDriver
 
             self._clock_driver = ClockDriver(
                 freq_seconds=self.data_freq_seconds,
                 bar_queue=self._bar_queue,
+                audit=self._audit,
+                exchange=self._exchange,
+                data_source=self._data_source,
             )
 
             if self._kline_worker is not None:
@@ -265,8 +275,8 @@ class Engine:
                 self._clock_driver.register("trades", self._trades_worker)
         else:
             logger.info(
-                "Live mode without factor_group: ClockDriver not created "
-                "(no bar_queue consumer).",
+                "Live mode without factor_group/audit: ClockDriver not created "
+                "(no bar_queue consumer or audit writer).",
             )
 
     # ── Factor inference ──────────────────────────────────────
@@ -420,6 +430,9 @@ class Engine:
 
     def start(self):
         """Start the dataflow collection and (optionally) the inference thread."""
+        if self._audit is not None:
+            self._audit.start()
+
         if self._bar_queue is not None and self._inference is not None:
             self._stop_event.clear()
             self._runtime_thread = threading.Thread(
@@ -462,6 +475,8 @@ class Engine:
             self._stop_event.set()
             self._runtime_thread.join(timeout=5)
             self._runtime_thread = None
+        if self._audit is not None:
+            self._audit.stop()
         logger.info("Engine stopped")
 
     def get_data(self, symbols: list[str] | None = None) -> dict[str, np.ndarray]:
@@ -523,4 +538,11 @@ class Engine:
                 "clock_ticks": self._clock_driver.tick_count,
                 "clock_drops": self._clock_driver.drop_count,
             }
+        return {}
+
+    @property
+    def audit_stats(self) -> dict:
+        """Audit writer statistics (empty dict if audit logging is disabled)."""
+        if self._audit is not None:
+            return self._audit.stats()
         return {}
