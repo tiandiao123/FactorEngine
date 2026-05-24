@@ -32,7 +32,7 @@ Dynamic symbol list support 的目标是让 Engine 支持运行中切换 symbol 
 第一版只做最小闭环：
 
 ```text
-Static / manual / future HTTP universe
+Exchange REST / local txt universe
   -> SymbolManager 计算 diff
   -> ClockDriver 在 tick 后提交 diff
   -> BinanceTradesWorker 切换订阅
@@ -78,11 +78,13 @@ flowchart LR
 1. `exchange="binance"`。
 2. `data_source="trades"`。
 3. 手动 `engine.update_symbols([...])`。
-4. 后续可接 `HttpSymbolProvider`，但第一版可以先用 `StaticSymbolProvider` / manual update。
-5. 新增 symbol 创建 accumulator，并在 runtime thread 中创建 C++ runner/factors。
-6. 移除 symbol 停止输出、停止订阅，C++ runner 保留 inactive。
-7. re-add symbol 默认 reset state，避免 rolling window 跨断层复用。
-8. payload 带 `symbol_version` / `active_symbols`。
+4. `BinanceExchangeSymbolSource` 从 Binance 官方 REST 拉可交易 USDT-M 合约。
+5. `LocalTextSymbolSource` 从人工维护的 txt 文件读取允许交易的 symbol 池。
+6. filter pipeline 支持 top-N 24h 成交额、白名单、黑名单等筛选。
+7. 新增 symbol 创建 accumulator，并在 runtime thread 中创建 C++ runner/factors。
+8. 移除 symbol 停止输出、停止订阅，C++ runner 保留 inactive。
+9. re-add symbol 默认 reset state，避免 rolling window 跨断层复用。
+10. payload 带 `symbol_version` / `active_symbols`。
 
 ### 3.2 暂不支持
 
@@ -97,7 +99,159 @@ flowchart LR
 
 ## 4. 新增核心概念
 
-### 4.1 SymbolUniverse
+### 4.1 Source / Filter / Provider 分层
+
+第一版不需要 internal HTTP source。我们需要支持的是：
+
+1. 从 Binance / OKX 官方接口拉全市场可交易标的和 24h ticker。
+2. 从人工维护的本地 txt 文件读取允许交易的 symbol 池。
+3. 对原始 universe 执行 filter，例如只保留 USDT 永续、剔除黑名单、取 24h 成交额 top N。
+
+因此建议把概念拆成三层：
+
+```text
+SymbolSource
+  -> 负责“从哪里拿原始候选 symbol / metadata”
+
+SymbolFilter
+  -> 负责“怎么过滤、排序、截断”
+
+SymbolProvider
+  -> 组合 source + filters，最终产出 SymbolUniverse
+```
+
+流程：
+
+```mermaid
+flowchart LR
+    SRC[SymbolSource] --> RAW[Raw instruments / tickers]
+    RAW --> F1[SymbolFilter 1]
+    F1 --> F2[SymbolFilter 2]
+    F2 --> F3[SymbolFilter N]
+    F3 --> P[SymbolProvider]
+    P --> U[SymbolUniverse]
+```
+
+### 4.2 SymbolSource
+
+`SymbolSource` 只负责拿原始候选，不负责改 Engine。
+
+```python
+class SymbolSource:
+    def fetch(self) -> SymbolSourceSnapshot:
+        ...
+```
+
+建议第一版实现：
+
+| Source | 用途 |
+|--------|------|
+| `BinanceExchangeSymbolSource` | 从 Binance 官方 REST 拉 USDT-M 合约列表和 24h ticker |
+| `OkxExchangeSymbolSource` | 从 OKX 官方 REST 拉 instruments / ticker，先用于后续 OKX 支持 |
+| `LocalTextSymbolSource` | 从人工维护的 txt 文件读取允许交易 symbol 池 |
+| `StaticSymbolSource` | 测试用，直接从 list 构造 |
+
+不做：
+
+| Source | 原因 |
+|--------|------|
+| `InternalHttpSymbolSource` | 当前没有内部 symbol-service，暂不设计为第一版依赖 |
+
+### 4.3 本地 txt 文件格式
+
+人工维护 symbol 池可以先用最简单的一列一 symbol：
+
+```text
+# config/symbol_pools/binance_usdt_perp.txt
+# lines starting with # are comments
+BTC-USDT
+ETH-USDT
+SOL-USDT
+BNB-USDT
+DOGE-USDT
+```
+
+读取规则：
+
+1. 空行忽略。
+2. `#` 开头忽略。
+3. symbol 统一 normalize 成内部格式，例如 `BTC-USDT`。
+4. 重复 symbol 去重。
+5. 文件不存在或读失败时，不清空当前 active universe，而是记录 provider error。
+
+这个 txt 文件可以作为“人工允许池”。例如先从 Binance 官方 REST 拉全市场，再和 txt 文件取交集，只在人工允许池里做 top-N。
+
+### 4.4 SymbolFilter
+
+`SymbolFilter` 负责把 raw candidates 变成目标候选集合。
+
+```python
+class SymbolFilter:
+    def apply(self, snapshot: SymbolSourceSnapshot) -> SymbolSourceSnapshot:
+        ...
+```
+
+第一版建议支持：
+
+| Filter | 作用 |
+|--------|------|
+| `QuoteAssetFilter("USDT")` | 只保留 USDT 计价 |
+| `ContractTypeFilter("PERPETUAL")` | 只保留永续合约 |
+| `TradableStatusFilter()` | 只保留交易中标的 |
+| `AllowListFilter(symbols)` | 只保留人工 txt 池里的 symbol |
+| `DenyListFilter(symbols)` | 剔除黑名单 |
+| `TopQuoteVolumeFilter(top_n=200)` | 按 24h quote volume 排序取 top N |
+
+示例：从 Binance 官方 REST 拉全市场，再取人工允许池中的成交额 top 200：
+
+```python
+provider = SymbolProvider(
+    source=BinanceExchangeSymbolSource(),
+    filters=[
+        QuoteAssetFilter("USDT"),
+        ContractTypeFilter("PERPETUAL"),
+        TradableStatusFilter(),
+        AllowListFilter.from_txt("config/symbol_pools/binance_usdt_perp.txt"),
+        TopQuoteVolumeFilter(top_n=200),
+    ],
+    refresh_interval_seconds=30,
+)
+```
+
+示例：只用人工 txt 文件作为 universe：
+
+```python
+provider = SymbolProvider(
+    source=LocalTextSymbolSource("config/symbol_pools/binance_usdt_perp.txt"),
+    filters=[
+        DenyListFilter(["BAD-USDT"]),
+    ],
+    refresh_interval_seconds=30,
+)
+```
+
+### 4.5 SymbolProvider
+
+`SymbolProvider` 是 source + filters 的编排器。它输出的仍然是全量目标 universe。
+
+```python
+class SymbolProvider:
+    def fetch(self) -> SymbolUniverse:
+        snapshot = self.source.fetch()
+        for f in self.filters:
+            snapshot = f.apply(snapshot)
+        return SymbolUniverse(
+            version=snapshot.version,
+            exchange=snapshot.exchange,
+            symbols=tuple(snapshot.symbols),
+            ttl_seconds=self.ttl_seconds,
+            metadata=snapshot.metadata,
+        )
+```
+
+注意：即使 provider 从交易所官方接口拉到了全市场，它也不直接覆盖 `engine.symbols`。它只是产出 `SymbolUniverse`，后续仍然走 `SymbolManager -> pending diff -> ClockDriver post-flush commit`。
+
+### 4.6 SymbolUniverse
 
 上游传入的是全量目标列表，而不是增量事件。
 
@@ -123,7 +277,7 @@ class SymbolUniverse:
 }
 ```
 
-### 4.2 SymbolDiff
+### 4.7 SymbolDiff
 
 `SymbolManager` 根据当前 active set 和目标 universe 计算 diff。
 
@@ -138,7 +292,7 @@ class SymbolDiff:
     reason: str | None = None
 ```
 
-### 4.3 SymbolManager
+### 4.8 SymbolManager
 
 职责：
 
@@ -153,7 +307,9 @@ class SymbolDiff:
 
 ```mermaid
 flowchart TB
-    P[SymbolProvider / update_symbols] --> U[SymbolUniverse]
+    S[Exchange REST / local txt] --> P[SymbolProvider]
+    P --> U[SymbolUniverse]
+    MANUAL[engine.update_symbols] --> U
     U --> M[SymbolManager.refresh_or_stage]
     M -->|valid new version| D[SymbolDiff pending]
     M -->|old / invalid / empty| E[reject and keep active]
@@ -280,7 +436,10 @@ Engine(symbols=["BTC-USDT", "ETH-USDT"], ...)
 内部可等价为：
 
 ```python
-symbol_provider = StaticSymbolProvider(symbols)
+symbol_provider = SymbolProvider(
+    source=StaticSymbolSource(symbols),
+    filters=[],
+)
 symbol_manager = SymbolManager(
     initial_symbols=symbols,
     exchange=exchange,
@@ -299,6 +458,30 @@ allow_dynamic_symbols: bool = False
 ```python
 engine.update_symbols(["BTC-USDT", "ETH-USDT", "SOL-USDT"])
 ```
+
+更完整的自动刷新用法：
+
+```python
+engine = Engine(
+    exchange="binance",
+    data_source="trades",
+    data_freq="5s",
+    factor_group="okx_perp_trades",
+    symbol_provider=SymbolProvider(
+        source=BinanceExchangeSymbolSource(),
+        filters=[
+            QuoteAssetFilter("USDT"),
+            ContractTypeFilter("PERPETUAL"),
+            TradableStatusFilter(),
+            AllowListFilter.from_txt("config/symbol_pools/binance_usdt_perp.txt"),
+            TopQuoteVolumeFilter(top_n=200),
+        ],
+        refresh_interval_seconds=30,
+    ),
+)
+```
+
+这里的 txt 文件是人工维护的可交易池；交易所 REST 提供实时可交易状态和 24h 成交额；filter pipeline 负责取交集和 top-N。
 
 ### 7.2 手动更新
 
@@ -648,10 +831,11 @@ flowchart LR
 目标：
 
 1. 新增 `SymbolUniverse` / `SymbolDiff` / `SymbolManager`。
-2. `ClockDriver` 支持 `after_flush_commit` hook。
-3. bar payload 支持结构化 dict，同时保持 legacy tuple 兼容。
-4. runtime loop 支持 `symbol_diff` control message。
-5. fake worker 验证 post-flush commit 不丢上一根 bucket。
+2. 新增 `StaticSymbolSource` / `LocalTextSymbolSource` 和基础 filter 接口。
+3. `ClockDriver` 支持 `after_flush_commit` hook。
+4. bar payload 支持结构化 dict，同时保持 legacy tuple 兼容。
+5. runtime loop 支持 `symbol_diff` control message。
+6. fake worker 验证 post-flush commit 不丢上一根 bucket。
 
 测试：
 
@@ -675,7 +859,23 @@ pytest tests/runtime_engine/test_engine_dynamic_symbols.py -v
 pytest tests/dataflow/binance/test_binance_trades_worker.py -v
 ```
 
-### Phase 3：Engine 集成
+### Phase 3：Exchange source + filter pipeline
+
+目标：
+
+1. `BinanceExchangeSymbolSource` 拉 Binance 官方 `exchangeInfo` 和 `ticker/24hr`。
+2. `OkxExchangeSymbolSource` 先实现 instruments/ticker 获取，供后续 OKX 动态订阅使用。
+3. `AllowListFilter.from_txt(...)` 支持人工维护池。
+4. `TopQuoteVolumeFilter(top_n=...)` 支持 24h quote volume 排序截断。
+5. source/filter 只产出 `SymbolUniverse`，不直接改 Engine。
+
+测试：
+
+```bash
+pytest tests/symbols/ -v
+```
+
+### Phase 4：Engine 集成
 
 目标：
 
@@ -683,6 +883,7 @@ pytest tests/dataflow/binance/test_binance_trades_worker.py -v
 2. `Engine.active_symbols` / `symbol_version` / `pending_symbol_diff`。
 3. `_runtime_loop()` 处理结构化 bars payload 和 symbol diff。
 4. `get_factor_outputs()` 按 payload active symbols 过滤。
+5. 可选 symbol refresh thread 周期性调用 `symbol_provider.fetch()`，并把结果 stage 到 `SymbolManager`。
 
 测试：
 
@@ -691,7 +892,7 @@ pytest tests/runtime_engine/test_engine_dynamic_symbols.py -v
 pytest tests/dataflow/binance/test_engine_binance.py -v
 ```
 
-### Phase 4：Audit / verifier
+### Phase 5：Audit / verifier
 
 目标：
 
@@ -709,7 +910,72 @@ pytest tests/audit/ -v
 
 ## 15. 关键测试用例
 
-### 15.1 post-flush commit 不丢 bucket
+### 15.1 本地 txt 人工池读取
+
+输入文件：
+
+```text
+# comment
+BTC-USDT
+ETH-USDT
+
+SOL-USDT
+BTC-USDT
+```
+
+期望：
+
+1. 忽略注释和空行。
+2. 去重。
+3. 输出 `BTC-USDT` / `ETH-USDT` / `SOL-USDT`。
+4. 文件读取失败不清空当前 active universe，只记录 provider error。
+
+### 15.2 Exchange REST source + top volume filter
+
+使用 fake Binance REST 响应：
+
+```text
+exchangeInfo:
+  BTCUSDT PERPETUAL TRADING
+  ETHUSDT PERPETUAL TRADING
+  OLDUSDT PERPETUAL BREAK
+
+ticker/24hr:
+  BTCUSDT quoteVolume=100
+  ETHUSDT quoteVolume=200
+```
+
+期望：
+
+1. `TradableStatusFilter` 剔除非 trading symbol。
+2. `QuoteAssetFilter("USDT")` 只保留 USDT。
+3. `TopQuoteVolumeFilter(top_n=1)` 选择 `ETH-USDT`。
+
+### 15.3 AllowListFilter 与交易所全集取交集
+
+人工 txt：
+
+```text
+BTC-USDT
+SOL-USDT
+```
+
+交易所可交易：
+
+```text
+BTC-USDT
+ETH-USDT
+```
+
+期望：
+
+```text
+final symbols = {BTC-USDT}
+```
+
+`SOL-USDT` 因为交易所不可交易被剔除，`ETH-USDT` 因为不在人工允许池被剔除。
+
+### 15.4 post-flush commit 不丢 bucket
 
 场景：
 
@@ -726,7 +992,7 @@ ETH accumulator has trades in [T-5s, T)
 2. diff 在 payload 后提交。
 3. tick T+5s 起 ETH 不再出现在 worker flush。
 
-### 15.2 runtime control message 顺序
+### 15.5 runtime control message 顺序
 
 队列顺序：
 
@@ -742,7 +1008,7 @@ bars(version_2)
 2. runtime 处理 diff 后 add SOL runner。
 3. 第二条 bars 可以 push SOL。
 
-### 15.3 removed symbol 迟到 trade
+### 15.6 removed symbol 迟到 trade
 
 场景：
 
@@ -755,7 +1021,7 @@ bars(version_2)
 2. 不创建新的 accumulator。
 3. 下一次 `flush()` 不返回 DOGE。
 
-### 15.4 re-add reset
+### 15.7 re-add reset
 
 场景：
 
@@ -773,12 +1039,12 @@ bars(version_2)
 
 ## 16. 风险和降级
 
-### 16.1 Provider 失败
+### 16.1 Source / Provider 失败
 
 行为：
 
 1. 保留当前 active universe。
-2. `provider_errors += 1`。
+2. `provider_errors += 1` 或 `source_errors += 1`。
 3. 超过 TTL 后告警。
 4. 不自动清空 symbols。
 
@@ -815,17 +1081,23 @@ max_removed_per_commit = 50
 ## 17. 开发 checklist
 
 1. 新增 `dataflow/symbols/` 或 `factorengine/symbols/` 放 `SymbolUniverse` / `SymbolDiff` / `SymbolManager`。
-2. `ClockDriver` 增加 `after_flush_commit` hook。
-3. `ClockDriver` bar payload 支持结构化 dict，并保留 legacy tuple 兼容。
-4. `Engine._runtime_loop()` 支持 `type="bars"` / `type="symbol_diff"`。
-5. `Engine.update_symbols()` 只 stage diff。
-6. `Engine.commit_pending_symbol_diff()` 只做轻量通知。
-7. `BinanceTradesWorker` 加 symbol lock 和 active snapshot flush。
-8. `BinanceTradesWorker` 支持异步 collector rebuild。
-9. C++ / pybind 增加 `reset_symbol()`，或明确第一版 re-add 暂时复用旧 state。
-10. `signal_deque` 记录 `symbol_version` / `active_symbols`。
-11. audit 增加 `symbol_version` 和 universe change event。
-12. verifier 支持 universe events 后再判断 missing。
+2. 新增 `SymbolSource` / `SymbolFilter` / `SymbolProvider` 抽象。
+3. 实现 `StaticSymbolSource` / `LocalTextSymbolSource`。
+4. 实现 `BinanceExchangeSymbolSource`，拉官方 `exchangeInfo` 和 `ticker/24hr`。
+5. 预留 `OkxExchangeSymbolSource`，先完成官方 REST 获取和 normalize。
+6. 实现 `AllowListFilter.from_txt(...)` / `DenyListFilter` / `TopQuoteVolumeFilter`。
+7. `ClockDriver` 增加 `after_flush_commit` hook。
+8. `ClockDriver` bar payload 支持结构化 dict，并保留 legacy tuple 兼容。
+9. `Engine._runtime_loop()` 支持 `type="bars"` / `type="symbol_diff"`。
+10. `Engine.update_symbols()` 只 stage diff。
+11. `Engine.commit_pending_symbol_diff()` 只做轻量通知。
+12. 可选 symbol refresh thread 周期性调用 `symbol_provider.fetch()`。
+13. `BinanceTradesWorker` 加 symbol lock 和 active snapshot flush。
+14. `BinanceTradesWorker` 支持异步 collector rebuild。
+15. C++ / pybind 增加 `reset_symbol()`，或明确第一版 re-add 暂时复用旧 state。
+16. `signal_deque` 记录 `symbol_version` / `active_symbols`。
+17. audit 增加 `symbol_version` 和 universe change event。
+18. verifier 支持 universe events 后再判断 missing。
 
 ---
 
