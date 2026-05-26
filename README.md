@@ -6,7 +6,7 @@ Real-time factor stack for **quantitative trading**: Python **market data collec
 
 **123 factors** across two groups: **70 kline-based** (`okx_perp`) and **53 trades-based** (`okx_perp_trades`).
 
-For a reading-order tour, see [`docs/TUTORIAL.md`](docs/TUTORIAL.md). For the dataflow architecture, see [`dataflow/README.md`](dataflow/README.md).
+For a reading-order tour, see [`docs/TUTORIAL.md`](docs/TUTORIAL.md). For the dataflow architecture, see [`dataflow/README.md`](dataflow/README.md). Recent operational design notes live under [`docs/20260523`](docs/20260523), [`docs/20260524`](docs/20260524), [`docs/20260525`](docs/20260525), and [`docs/20260526`](docs/20260526).
 
 ## Architecture (v4 — ClockDriver unified flush, multi-exchange)
 
@@ -15,9 +15,11 @@ Top-level [`factorengine.engine.Engine`](factorengine/engine.py) coordinates:
 1. **Dataflow threads** — independent workers per exchange, each collecting one data stream:
    - **Kline** — `KlineWorker` (OKX) / `BinanceKlineWorker`: exchange WS → adapter → `KlinePublisher` (shared round buffer).
    - **Trades** — `TradesWorker` (OKX) / `BinanceTradesWorker`: exchange WS → per-symbol `TradesAccumulator` (shared incremental aggregator).
-2. **ClockDriver thread** — the **single aggregation center**. Fires on wall-clock aligned boundaries (`:00`, `:05`, `:10`, …), calls `flush()` on every registered worker, merges results via `_aggregate()`, and pushes one `(merged_bars, merged_trades)` payload into `bar_queue`. Workers never touch `bar_queue`.
+2. **ClockDriver thread** — the **single aggregation center**. Fires on wall-clock aligned boundaries (`:00`, `:05`, `:10`, …), calls `flush()` on every registered worker, merges results via `_aggregate()`, optionally writes aggregate audit records, and pushes one `(merged_bars, merged_trades)` payload into `bar_queue`. Workers never touch `bar_queue`.
 3. **Runtime thread** — `bar_queue.get()` → builds `fe_runtime.BarData` (OHLCV + `ret` + optional trades fields) → `InferenceEngine.push_bars` → **signal deque**.
-4. **Main thread** — `get_factor_outputs()` (O(1)), optional `get_data()` (bar cache snapshot), `kline_stats` / `trades_stats` / `clock_stats`.
+4. **Main thread** — `get_factor_outputs()` (O(1)), optional `get_data()` (bar cache snapshot), `kline_stats` / `trades_stats` / `clock_stats` / `audit_stats`.
+
+Dynamic symbol lists are supported for live engines through a staged universe update flow: `Engine.update_symbols(...)` validates and stages the target universe, `ClockDriver` commits the diff after a flush boundary, exchange workers rebuild subscriptions, and the C++ runtime adds/removes per-symbol runners in the same `bar_queue` order as data updates. Static `Engine(symbols=...)` usage remains supported.
 
 ```
 ┌─ Exchange Workers (OKX or Binance) ─────────────────────────────────┐
@@ -31,6 +33,7 @@ Top-level [`factorengine.engine.Engine`](factorengine/engine.py) coordinates:
          │    kline_data  = kline_worker.flush()     │
          │    trades_data = trades_worker.flush()    │
          │    → _aggregate(kline priority per sym)   │
+         │    → optional audit JSONL write           │
          │    → bar_queue.put((merged_bars, trades)) │
          └────────────────────┬──────────────────────┘
                               v
@@ -69,15 +72,16 @@ Top-level [`factorengine.engine.Engine`](factorengine/engine.py) coordinates:
 | **`dataflow/kline/publisher.py`** | Exchange-agnostic `KlinePublisher` — round batching, timeout, forward-fill. |
 | **`dataflow/trades/accumulator.py`** | Exchange-agnostic `TradesAccumulator` — per-symbol O(1) streaming aggregation. |
 | **`dataflow/clock_driver.py`** | Unified wall-clock flush & aggregation center; `register(name, worker)` + `_aggregate()` → `bar_queue`. |
+| **`dataflow/audit/`** | Optional aggregate audit logging: ClockDriver aggregate bars → async JSONL writer with flush and rotation controls. |
 | **`dataflow/okx/`** | OKX exchange: kline `collector` → `adapter` → `publisher` → `worker`; trades `collector` → `accumulator` → `worker`. |
 | **`dataflow/binance/`** | Binance Futures: same pattern as OKX, with `/market` WS route and `aggTrade` stream. |
 | **`dataflow/simulation/`** | Synthetic bars + optional `bar_queue` for tests/demos. |
 | **`dataflow/cache.py`** | Rolling `BarCache` for `get_data()` snapshots. |
-| **`factorengine.Engine`** | `exchange`, `data_source`, `factor_group` as **str or list**; **`get_factor_outputs`**, **`get_data`**, **`kline_stats`**, **`trades_stats`**, **`clock_stats`**. |
+| **`factorengine.Engine`** | `exchange`, `data_source`, `factor_group` as **str or list**; **`update_symbols`**, **`get_factor_outputs`**, **`get_ready_factor_outputs`**, **`get_symbol_status`**, **`get_data`**, **stats** accessors. |
 | **`fe_ops` / `fe_runtime`** | Batch kernels + DAG streaming; **`BarData`** includes **`vwap`, `buy_vol`, `sell_vol`**; `add_input` supports those names. |
 | **`factorengine/factors/`** | `FactorRegistry`, `@register_factor` — **`okx_perp`** (70 kline factors), **`okx_perp_trades`** (53 trades factors). |
 
-Design references: [`docs/20260503/kline_v2/`](docs/20260503/kline_v2/), [`docs/20260503/trades_v1/`](docs/20260503/trades_v1/), [`docs/20260503/trades_v2/`](docs/20260503/trades_v2/), [`docs/20260504/binance_dataflow_design.md`](docs/20260504/binance_dataflow_design.md).
+Design references: [`docs/20260504/binance_dataflow_design.md`](docs/20260504/binance_dataflow_design.md), [`docs/20260505/trades_aggfeatures_plan.md`](docs/20260505/trades_aggfeatures_plan.md), [`docs/20260523/dynamic_symbol_list_design.md`](docs/20260523/dynamic_symbol_list_design.md), [`docs/20260525/dynamic_symbol_end_to_end_flow.md`](docs/20260525/dynamic_symbol_end_to_end_flow.md), [`docs/20260526/exchange_time_trades_aggregation_allowed_lateness.md`](docs/20260526/exchange_time_trades_aggregation_allowed_lateness.md).
 
 ## Quick start
 
@@ -169,7 +173,9 @@ render_graph(g, "factor_0001.png")   # needs graphviz
 |--------|-------------|
 | [`engine_rt_live.py`](examples/engine/engine_rt_live.py) | OKX kline + factors (`data_source="kline"`). |
 | [`engine_rt_trades.py`](examples/engine/engine_rt_trades.py) | OKX trades-only with 20 symbols and 53 trades factors. |
-| [`engine_rt_binance_trades.py`](examples/engine/engine_rt_binance_trades.py) | **Binance Futures** trades-only, 20 symbols, production `aggTrade` stream. |
+| [`engine_rt_binance_trades.py`](examples/engine/engine_rt_binance_trades.py) | **Binance Futures** trades-only, picks top 200 USDT-M perpetuals at startup and enables aggregate audit logging. |
+| [`engine_rt_binance_dynamic_symbols.py`](examples/dynamic_symbol_list/engine_rt_binance_dynamic_symbols.py) | Binance trades-only dynamic symbol universe demo with readiness logging and aggregate audit output. |
+| [`engine_rt_okx_dynamic_symbols.py`](examples/dynamic_symbol_list/engine_rt_okx_dynamic_symbols.py) | OKX trades-only dynamic symbol universe demo mirroring the Binance configuration. |
 | [`engine_rt_simulation.py`](examples/engine/engine_rt_simulation.py) | Simulation bars + factors. |
 
 ### OKX kline example
@@ -224,9 +230,97 @@ engine = Engine(
 
 `factor_group` must be set to start the inference thread and wire `bar_queue`; workers are started based on `data_source`; ClockDriver is created when `factor_group` is set, registering the appropriate workers.
 
+### Aggregate audit logging
+
+`Engine` accepts an optional `AuditConfig`. When enabled, ClockDriver writes the aggregate bars it already flushed to JSONL files. This is aggregate-only audit: it does not persist raw websocket messages or per-trade events.
+
+```python
+from dataflow.audit import AuditConfig
+from factorengine.engine import Engine
+
+engine = Engine(
+    symbols=["BTC-USDT", "ETH-USDT", "SOL-USDT"],
+    mode="live",
+    exchange="binance",
+    data_freq="5s",
+    factor_group=["okx_perp_trades"],
+    data_source="trades",
+    audit_config=AuditConfig(
+        enabled=True,
+        root_dir="data/audit/binance_trades_demo",
+        flush_interval_seconds=1.0,
+        flush_max_records=10_000,
+        flush_max_bytes=4 * 1024 * 1024,
+        rotate_interval_seconds=3600,
+        rotate_max_bytes=512 * 1024 * 1024,
+    ),
+)
+```
+
+Audit files look like:
+
+```text
+data/audit/binance_trades_demo/aggregate_bars_YYYYMMDD_HHMMSS_part000001.jsonl
+```
+
+Use `engine.audit_stats` to inspect queue, flush, drop, and current-file state. See [`docs/20260524/aggregate_audit_implementation.md`](docs/20260524/aggregate_audit_implementation.md) for the full call flow.
+
+### Audit verifier
+
+The verifier compares FactorEngine aggregate audit bars with Binance official 1m klines:
+
+```bash
+python examples/verifier/verify_binance_audit_vs_kline.py \
+  --audit-file examples/engine/data/audit/binance_trades_demo/aggregate_bars_20260524_101827_part000001.jsonl \
+  --symbols BTC-USDT,ETH-USDT,SOL-USDT \
+  --start "2026-05-24T10:19:00Z" \
+  --end "2026-05-24T10:24:00Z" \
+  --audit-ts-is-end \
+  --price-rtol 0.001 \
+  --volume-rtol 0.02 \
+  --max-mismatches 3
+```
+
+`trade_count` is displayed for context but is not part of the match decision. See [`examples/verifier/README.md`](examples/verifier/README.md) for timestamp semantics and tolerance rules.
+
+### Dynamic symbol lists
+
+Static symbol lists still work:
+
+```python
+engine = Engine(symbols=["BTC-USDT", "ETH-USDT"], ...)
+```
+
+For low-frequency universe rebalances, create the engine with `enable_dynamic_symbols=True` and stage updates with `update_symbols(...)`:
+
+```python
+engine.update_symbols(
+    ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
+    version="manual-rotate:20260526T120000Z:0",
+    metadata={"reason": "scheduled_rebalance"},
+)
+```
+
+The update is applied after a `ClockDriver` flush boundary. Added symbols get fresh C++ `SymbolRunner` state; removed symbols are physically removed from the runtime. Use `get_symbol_status()` to inspect per-symbol warmup state and `get_ready_factor_outputs()` when downstream consumers should ignore symbols whose factors are not fully warmed up yet.
+
+See [`examples/dynamic_symbol_list/`](examples/dynamic_symbol_list/), [`docs/20260523/dynamic_symbol_list_design.md`](docs/20260523/dynamic_symbol_list_design.md), and [`docs/20260525/dynamic_symbol_end_to_end_flow.md`](docs/20260525/dynamic_symbol_end_to_end_flow.md) for the full flow.
+
+### Next dataflow work: exchange-time buckets
+
+Current trades aggregation is still receive-time based: each trade updates the current per-symbol `TradesAccumulator`, and `ClockDriver` snapshots/resets it on local wall-clock flush boundaries. That is good enough for live factor production, but it can differ from exchange official klines around second/minute boundaries.
+
+The next dataflow design step is to introduce an exchange-time bucketing strategy:
+
+```text
+symbol -> EventTimeTradesAccumulator
+          -> buckets[bucket_start_ms] -> TradeBucket
+```
+
+Each trade should be assigned by exchange `trade_ts_ms`, not local receive time. `ClockDriver` will advance a watermark (`now_ms - allowed_lateness_ms`) and flush all mature buckets whose `bucket_end_ms <= watermark_ms`. This map-based bucket design is documented in [`docs/20260526/exchange_time_trades_aggregation_allowed_lateness.md`](docs/20260526/exchange_time_trades_aggregation_allowed_lateness.md).
+
 ## Native C++ kernels (`fe_ops`)
 
-**33 operators** (P0–P3), aligned with Python references in `tests/kernel/` where covered. Full documentation: [`docs/OPERATORS.md`](docs/OPERATORS.md).
+**33 operators** (P0–P3), aligned with Python references in `tests/kernels/` where covered. Full documentation: [`docs/OPERATORS.md`](docs/OPERATORS.md).
 
 | Tier | Examples | Count |
 |------|-----------|-------|
@@ -240,14 +334,14 @@ engine = Engine(
 ```bash
 pytest tests/ -v                          # full suite (1080+ tests)
 
-pytest tests/kernel/ -v                   # C++ operator alignment
+pytest tests/kernels/ -v                  # C++ operator alignment
 pytest tests/factors/ -v                  # registry + inference
 pytest tests/dataflow/ -v                 # kline/trades pipeline
-pytest tests/dataflow/binance/ -v         # Binance-specific
 pytest tests/runtime_engine/ -v           # engine integration
 pytest tests/trades/ -v                   # accumulator + trades factors
+pytest tests/audit/ -v                    # aggregate audit writer + ClockDriver integration
 
-python tests/kernel/benchmark/bench_ops.py
+python tests/kernels/benchmark/bench_ops.py
 python tests/visualization/demo_visualize.py
 ```
 
@@ -257,10 +351,13 @@ python tests/visualization/demo_visualize.py
 FactorEngine/
 ├── setup.py
 ├── pyproject.toml
-├── examples/engine/              # engine_rt_live, engine_rt_trades,
-│                                 # engine_rt_binance_trades, engine_rt_simulation
+├── examples/
+│   ├── engine/                   # live/simulation Engine demos
+│   ├── dynamic_symbol_list/      # dynamic universe demos for Binance and OKX
+│   └── verifier/                 # audit vs Binance official kline verifier
 ├── dataflow/
 │   ├── base_collector.py         # BaseCollector ABC (shared WS reconnect)
+│   ├── audit/                    # aggregate audit schema/config/writer
 │   ├── cache.py
 │   ├── clock_driver.py           # unified flush & aggregation center
 │   ├── kline/publisher.py        # exchange-agnostic round batching
@@ -280,14 +377,12 @@ FactorEngine/
 │   │   ├── registry.py           # FactorRegistry, @register_factor
 │   │   ├── okx_perp/             # 70 kline-based factors
 │   │   └── okx_perp_trades/      # 53 trades-based factors
-│   └── scheduler/
 ├── native/                       # CMake: fe_ops + fe_runtime
 └── tests/
-    ├── kernel/
+    ├── audit/
+    ├── kernels/
     ├── factors/
     ├── dataflow/
-    │   ├── okx/
-    │   └── binance/              # 65 Binance-specific tests
     ├── runtime_engine/
     ├── trades/
     └── visualization/
@@ -301,8 +396,15 @@ FactorEngine/
 | [`dataflow/README.md`](dataflow/README.md) | Dataflow architecture, exchange notes, extension guide. |
 | [`docs/OPERATORS.md`](docs/OPERATORS.md) | Full C++ operator list with math formulas and test locations. |
 | [`docs/20260504/binance_dataflow_design.md`](docs/20260504/binance_dataflow_design.md) | Binance integration design and implementation notes. |
-| [`docs/20260503/kline_v2/kline_to_factor_pipeline.md`](docs/20260503/kline_v2/kline_to_factor_pipeline.md) | Kline → factor pipeline. |
-| [`docs/20260503/trades_v2/clockdriver_refactor_plan.md`](docs/20260503/trades_v2/clockdriver_refactor_plan.md) | ClockDriver refactor plan (Plan B). |
+| [`docs/20260505/trades_aggfeatures_plan.md`](docs/20260505/trades_aggfeatures_plan.md) | Trades aggregate factor plan. |
+| [`docs/20260523/dynamic_symbol_list_design.md`](docs/20260523/dynamic_symbol_list_design.md) | Design for runtime symbol universe updates. |
+| [`docs/20260523/stream_audit_replay_refactor_plan.md`](docs/20260523/stream_audit_replay_refactor_plan.md) | Stream audit/replay refactor design. |
+| [`docs/20260524/aggregate_audit_implementation.md`](docs/20260524/aggregate_audit_implementation.md) | Implemented aggregate audit logging call flow and schema. |
+| [`docs/20260524/bar_schema_alignment_design.md`](docs/20260524/bar_schema_alignment_design.md) | Bar schema alignment risks and cleanup plan. |
+| [`docs/20260525/cpp_runtime_dynamic_symbol_support_development.md`](docs/20260525/cpp_runtime_dynamic_symbol_support_development.md) | C++ runtime add/remove/reset symbol plan and implementation details. |
+| [`docs/20260525/dynamic_symbol_end_to_end_flow.md`](docs/20260525/dynamic_symbol_end_to_end_flow.md) | End-to-end dynamic symbol update flow across dataflow and C++ runtime. |
+| [`docs/20260526/exchange_time_trades_aggregation_allowed_lateness.md`](docs/20260526/exchange_time_trades_aggregation_allowed_lateness.md) | Planned exchange-time trades bucketing with `allowed_lateness`. |
+| [`examples/verifier/README.md`](examples/verifier/README.md) | Audit verifier usage and tolerance semantics. |
 
 ## Authors
 

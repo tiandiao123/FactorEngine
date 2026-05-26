@@ -31,3 +31,4 @@ Thumbs.db
 # Data (runtime generated)
 data/
 examples/engine/data/
+examples/dynamic_symbol_list/data/

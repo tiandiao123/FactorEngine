@@ -11,6 +11,7 @@
  *   auto& outputs = runner.outputs();  // vector of floats
  */
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,23 @@ public:
     [[nodiscard]] int bars_pushed() const { return bars_pushed_; }
     [[nodiscard]] const std::vector<FeFloat>& outputs() const { return outputs_; }
     [[nodiscard]] const std::vector<std::string>& factor_ids() const { return factor_ids_; }
+    [[nodiscard]] int warmup_bars() const {
+        int max_warmup = 0;
+        for (const auto& graph : graphs_) {
+            max_warmup = std::max(max_warmup, graph.warmup_bars());
+        }
+        return max_warmup;
+    }
+    [[nodiscard]] std::size_t ready_factor_count() const {
+        std::size_t count = 0;
+        for (const auto& graph : graphs_) {
+            if (graph.ready()) ++count;
+        }
+        return count;
+    }
+    [[nodiscard]] bool ready() const {
+        return !graphs_.empty() && ready_factor_count() == graphs_.size();
+    }
 
     [[nodiscard]] FeFloat output(std::size_t idx) const {
         return (idx < outputs_.size()) ? outputs_[idx] : kNaN;

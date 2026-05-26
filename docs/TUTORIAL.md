@@ -6,7 +6,7 @@ If you only read three files first, read these in order:
 
 1. `factorengine/engine.py` — the actual runtime entry point.
 2. `dataflow/README.md` — the dataflow architecture (exchange adapters, ClockDriver, shared components).
-3. `docs/20260503/kline_v2/kline_to_factor_pipeline.md` — the live data pipeline (kline → factor inference).
+3. `docs/20260524/aggregate_audit_implementation.md` — the current aggregate audit logging flow and schema.
 
 ## 1. What this project is
 
@@ -19,6 +19,7 @@ At a high level it combines:
 - C++ operator kernels for fast rolling/time-series math (**33 operators**)
 - a C++ DAG runtime for streaming factor inference
 - a unified ClockDriver that synchronizes and aggregates heterogeneous data streams
+- optional aggregate audit logging for post-run verification
 - an exchange-agnostic architecture with shared components (`BaseCollector`, `KlinePublisher`, `TradesAccumulator`)
 
 The core idea is simple: market data arrives continuously via WebSocket push, independent workers collect and buffer each data stream, a ClockDriver periodically flushes all workers on wall-clock boundaries, aggregates the results, and a factor runtime turns each merged bar into updated factor values.
@@ -39,7 +40,9 @@ Exchange WebSocket (kline / aggTrade / trades)
                       (wall-clock aligned flush)
                       kline_data = kline_worker.flush()
                       trades_data = trades_worker.flush()
-                      → _aggregate() → bar_queue.put()
+                      → _aggregate()
+                      → optional audit JSONL write
+                      → bar_queue.put()
                               │
                               v
                C++ inference runtime
@@ -62,13 +65,14 @@ The current implementation is the v4 architecture (multi-thread streaming model 
 
 1. **Thread 1 (exchange-kline)**: `KlineWorker` (OKX) or `BinanceKlineWorker` daemon thread — collects exchange WebSocket kline data, filters/aggregates via adapter, batches all symbols via `KlinePublisher` into an internal buffer. Does not push to any queue. Exposes `flush()` for ClockDriver.
 2. **Thread 2 (exchange-trades)**: `TradesWorker` (OKX) or `BinanceTradesWorker` daemon thread — collects trades via WebSocket, routes each trade to per-symbol `TradesAccumulator` instances. Exposes `flush()` which snapshots all accumulators and returns `(round_bars, round_trades)`.
-3. **Thread 3 (clock-driver)**: `ClockDriver` daemon thread — fires on wall-clock aligned boundaries (e.g. every 5 seconds at `:00`, `:05`, `:10`, …). Calls `flush()` on all registered workers, runs `_aggregate()` to merge kline + trades data (kline bars take priority per symbol), and pushes the unified payload to `bar_queue`.
+3. **Thread 3 (clock-driver)**: `ClockDriver` daemon thread — fires on wall-clock aligned boundaries (e.g. every 5 seconds at `:00`, `:05`, `:10`, …). Calls `flush()` on all registered workers, runs `_aggregate()` to merge kline + trades data (kline bars take priority per symbol), optionally writes aggregate audit records, and pushes the unified payload to `bar_queue`.
 4. **Thread 4 (factor-infer)**: `Engine._runtime_loop` daemon thread — consumes `bar_queue`, constructs `rt.BarData`, calls C++ `InferenceEngine.push_bars()`, stores results in `signal_deque`.
 5. **Thread 5 (main)**: User strategy code — reads `engine.get_factor_outputs()` and `engine.get_data()`.
 
 That separation matters because:
 - Each data source (kline, trades, future: orderbook, funding rate) runs independently with its own WS connection and event loop
 - ClockDriver ensures all data sources are flushed at the exact same wall-clock boundary, guaranteeing time alignment
+- Audit logging records exactly the aggregate bars that ClockDriver flushed, so post-run checks can compare the online aggregate output with external references
 - Adding a new data source (e.g. orderbook) only requires implementing a worker with a `flush()` method and calling `clock_driver.register("ob", ob_worker)`
 - Adding a new exchange only requires implementing collector/adapter/worker in a new `dataflow/<exchange>/` package — the shared components (`KlinePublisher`, `TradesAccumulator`, `BaseCollector`, `ClockDriver`) require zero changes
 - Factor computation is completely decoupled from data ingestion
@@ -83,7 +87,6 @@ This is the main Python package.
 - `factors/`: factor registration, factor discovery, and graph visualization.
   - `okx_perp/`: 70 kline-based factors (inputs: close, volume, open, high, low, ret)
   - `okx_perp_trades/`: 53 trades-based factors (inputs: vwap, buy_vol, sell_vol, plus OHLCV)
-- `scheduler/`: an older Python-first scheduler prototype. Useful for simple experiments but not the main high-performance path.
 
 ### `dataflow/`
 
@@ -91,6 +94,7 @@ This is the market-data side of the system. See [`dataflow/README.md`](../datafl
 
 - `base_collector.py`: **BaseCollector ABC** — shared reconnect/lifecycle logic inherited by all four collectors.
 - `clock_driver.py`: **ClockDriver** — the unified wall-clock aligned flush driver and aggregation center. Registered workers are flushed simultaneously on each tick, their outputs merged, and the result pushed to `bar_queue`. This is the single component that bridges workers and the inference thread.
+- `audit/`: **aggregate audit logging** — optional async JSONL writer for ClockDriver aggregate bars. It records aggregate bars only, not raw websocket messages or per-trade events.
 - `kline/publisher.py`: **KlinePublisher** — exchange-agnostic round batching with timeout, forward-fill, and deduplication. Used by both OKX and Binance kline workers.
 - `trades/accumulator.py`: **TradesAccumulator** — exchange-agnostic per-symbol O(1) streaming aggregation. Tracks vwap, buy_vol, sell_vol, trade_count, and derives OHLCV from trades. Used by both OKX and Binance trades workers.
 - `okx/`: OKX exchange data streams (WebSocket-based).
@@ -122,17 +126,19 @@ Runnable demos:
 
 - `engine_rt_live.py`: live mode connecting to OKX, streaming kline data, computing 70 factors for 3 symbols in real-time.
 - `engine_rt_trades.py`: live OKX trades-only mode, computing 53 trades factors for 20 symbols at 1s frequency.
-- `engine_rt_binance_trades.py`: live **Binance Futures** trades-only mode, computing 53 trades factors for 20 symbols using the production `aggTrade` stream.
+- `engine_rt_binance_trades.py`: live **Binance Futures** trades-only mode, picks the top 200 USDT-M perpetuals by 24h quote volume at startup, computes 53 trades factors, and enables aggregate audit logging.
 - `engine_rt_simulation.py`: simulation mode with synthetic data, useful for testing and debugging.
+- `verifier/`: audit verification scripts. `verify_binance_audit_vs_kline.py` compares aggregate audit bars against Binance official 1m klines.
 
 ### `tests/`
 
 This repo is heavily test-driven across several slices:
 
 - `tests/dataflow/`: kline adapter, publisher, worker, end-to-end pipeline, and ClockDriver tests
-- `tests/dataflow/binance/`: Binance-specific tests (65 tests) — collector parsing, worker flush, Engine integration
+- `tests/dataflow/binance/`: Binance-specific tests — collector parsing, worker flush, Engine integration
 - `tests/factors/`: registry and end-to-end factor inference
-- `tests/kernel/`: C++ operator alignment and benchmarks
+- `tests/kernels/`: C++ operator alignment and benchmarks
+- `tests/audit/`: aggregate audit writer and ClockDriver integration tests
 - `tests/runtime_engine/`: runtime-level integration tests (including trades integration and ClockDriver aggregation)
 - `tests/trades/`: accumulator, collector, worker, and trades factor tests
 - `tests/visualization/`: graph visualization demos
@@ -144,14 +150,12 @@ This folder contains both stable onboarding docs and dated design notes.
 - `TUTORIAL.md`: this file, intended as the quick orientation entry point
 - `OPERATORS.md`: full C++ operator list with math formulas and test locations
 - `20260504/binance_dataflow_design.md`: Binance Futures integration design and implementation notes
-- `20260503/kline_v2/kline_to_factor_pipeline.md`: **comprehensive pipeline doc** — kline collection → aggregation → batching → factor inference, with architecture diagrams
-- `20260503/kline_v2/round_batching_design.md`: design doc for Publisher round batching (v2)
-- `20260503/trades_v1/trades_integration_design.md`: trades integration design (Phase 1)
-- `20260503/trades_v1/trades_kline_full_pipeline.md`: full kline+trades pipeline walkthrough
-- `20260503/trades_v2/clockdriver_refactor_plan.md`: ClockDriver refactor plan (Plan B — unified scheduling)
-- `20260503/trades_v2/trades_v2_changelog.md`: trades v2 changelog / migration notes
-- `20260419/engine_architecture_refactor.md`: engine architecture baseline
-- earlier dated folders: design and implementation notes by milestone
+- `20260505/trades_aggfeatures_plan.md`: trades aggregate factor plan
+- `20260523/dynamic_symbol_list_design.md`: design for runtime symbol universe updates
+- `20260523/stream_audit_replay_design.md`: stream audit/replay design notes
+- `20260523/stream_audit_replay_refactor_plan.md`: stream audit/replay refactor plan
+- `20260524/aggregate_audit_implementation.md`: implemented aggregate audit logging call flow and schema
+- `20260524/bar_schema_alignment_design.md`: bar schema alignment risks and cleanup plan
 
 ## 5. The main Python modules
 
@@ -172,6 +176,7 @@ What it owns:
 - the queue between ClockDriver and runtime thread
 - the deque holding latest factor outputs
 - snapshot APIs like `get_data()` and `get_factor_outputs()`
+- optional `audit_config` wiring and `audit_stats`
 - `testnet` parameter for Binance Futures testnet connectivity
 
 If you want to know how the system actually runs, this file is the most important place to read.
@@ -188,18 +193,6 @@ Key pieces:
 - `okx_perp_trades/`: 53 trades-based factors (inputs: vwap, buy_vol, sell_vol)
 
 The registry does not execute factors itself. Its job is to discover builder functions and return compiled `FactorGraph` objects that are later handed to `fe_runtime`.
-
-### `factorengine.scheduler`
-
-This is a minimal Python-side factor evaluation prototype.
-
-It includes:
-
-- `Scheduler`: a timer-driven callback loop
-- `FactorRuntime`: pulls snapshots from `Engine`, slices windows, and computes values in Python
-- `FactorSpec` and `FactorSnapshot`: lightweight factor definition and result containers
-
-This part is useful for understanding the older pure-Python evaluation path and for rapid prototyping, but it is not the main high-throughput runtime.
 
 ## 6. The dataflow modules
 
@@ -222,12 +215,31 @@ ClockDriver is a daemon thread that:
 1. Registers named workers via `register(name, worker)` — any object with a `flush()` method
 2. On each wall-clock aligned tick, calls `flush()` on every registered worker
 3. Runs `_aggregate()` to merge outputs — kline bars take priority per symbol, trades-derived OHLCV is used as fallback
-4. Pushes the unified `(merged_bars, merged_trades)` payload to `bar_queue`
+4. Optionally writes aggregate audit records to `AuditWriter`
+5. Pushes the unified `(merged_bars, merged_trades)` payload to `bar_queue`
 
 This design means adding a new data source (orderbook, funding rate) is as simple as:
 ```python
 clock_driver.register("ob", orderbook_worker)
 ```
+
+### `dataflow.audit`
+
+Aggregate audit logging records the bars ClockDriver already flushed. It is intentionally aggregate-only: it does not save raw websocket messages or every trade.
+
+Important files:
+
+- `config.py`: `AuditConfig`, including queue size, flush interval, flush thresholds, and file rotation rules
+- `schema.py`: `AggregateBarEvent`, the JSONL record schema
+- `writer.py`: `AuditWriter`, the async writer that batches records and rotates files
+
+When enabled through `Engine(audit_config=AuditConfig(...))`, audit files are written as JSONL:
+
+```text
+data/audit/<name>/aggregate_bars_YYYYMMDD_HHMMSS_part000001.jsonl
+```
+
+Use `engine.audit_stats` to inspect queue, flush, drop, and current-file state.
 
 ### `dataflow.kline.publisher`
 
@@ -368,6 +380,7 @@ Thread 3 (clock-driver daemon):
     kline_data  = kline_worker.flush()   → dict[sym, ndarray] | None
     trades_data = trades_worker.flush()  → (dict[sym, ndarray], dict[sym, dict])
     merged      = _aggregate(kline_data, trades_data)
+    optional aggregate audit JSONL write
     bar_queue.put((merged_bars, merged_trades))
 
 Thread 4 (factor-infer daemon):
@@ -382,6 +395,7 @@ Thread 5 (main / strategy):
   engine.get_factor_outputs()  → read signal_deque[-1]
   engine.get_data()            → read debug_cache snapshot
   engine.clock_stats           → ClockDriver tick/drop counts
+  engine.audit_stats           → audit queue/flush/drop/current-file state
 ```
 
 ### Simulation mode
@@ -407,7 +421,60 @@ That symmetry is why simulation mode is the easiest place to understand the full
 | Buy/sell field | `side` = `"buy"` / `"sell"` | `is_buyer_maker` (inverted) |
 | Testnet support | N/A | `testnet=True` → `stream.binancefuture.com` |
 
-## 10. What to read depending on your goal
+## 10. Audit and verification workflow
+
+The current audit workflow is designed for post-run sanity checks of aggregate bars:
+
+```text
+ClockDriver aggregate output
+        │
+        v
+AuditWriter JSONL files
+        │
+        v
+examples/verifier/verify_binance_audit_vs_kline.py
+        │
+        v
+Compare audit 5s bars aggregated to 1m vs Binance official 1m klines
+```
+
+The verifier compares `open`, `high`, `low`, `close`, and `volume`. `trade_count` is printed for context but does not participate in the match decision because the official kline count and the current audit aggregation count do not necessarily share the same counting semantics.
+
+Example:
+
+```bash
+python examples/verifier/verify_binance_audit_vs_kline.py \
+  --audit-file examples/engine/data/audit/binance_trades_demo/aggregate_bars_20260524_101827_part000001.jsonl \
+  --symbols BTC-USDT,ETH-USDT,SOL-USDT \
+  --start "2026-05-24T10:19:00Z" \
+  --end "2026-05-24T10:24:00Z" \
+  --audit-ts-is-end \
+  --price-rtol 0.001 \
+  --volume-rtol 0.02 \
+  --max-mismatches 3
+```
+
+Read [`examples/verifier/README.md`](../examples/verifier/README.md) for timestamp semantics and tolerance rules.
+
+## 11. Symbol list status
+
+`Engine(symbols=...)` currently treats the symbol list as fixed for the lifetime of an engine instance.
+
+The Binance trades demo does this:
+
+```text
+startup:
+  fetch Binance exchangeInfo + 24h ticker
+  choose top-N USDT-M perpetuals by quoteVolume
+  pass that list into Engine(symbols=...)
+
+runtime:
+  subscriptions and accumulators stay fixed
+```
+
+So if the process runs for a long time, the top-200 universe does not automatically rebalance. Runtime symbol list updates are a separate design topic documented in [`docs/20260523/dynamic_symbol_list_design.md`](20260523/dynamic_symbol_list_design.md).
+
+## 12. What to read depending on your goal
 
 ### I want to understand the public API
 
@@ -442,7 +509,7 @@ Read these files:
 Read these files:
 
 1. `dataflow/clock_driver.py` — `register()`, `_flush_and_aggregate()`, `_aggregate()`
-2. `docs/20260503/trades_v2/clockdriver_refactor_plan.md` — design rationale
+2. `docs/20260524/aggregate_audit_implementation.md` — current ClockDriver → audit → runtime call flow
 3. `factorengine/engine.py` — `_init_live()` to see how workers are registered per exchange
 
 ### I want to understand how a new exchange was added
@@ -459,19 +526,28 @@ Read these files:
 Read these documents:
 
 1. `dataflow/README.md` — full dataflow architecture with diagrams
-2. `docs/20260503/kline_v2/kline_to_factor_pipeline.md` — OKX kline pipeline with diagrams
-3. `docs/20260503/trades_v1/trades_kline_full_pipeline.md` — kline+trades pipeline walkthrough
-4. `docs/20260503/trades_v2/clockdriver_refactor_plan.md` — ClockDriver unified architecture
+2. `docs/20260505/trades_aggfeatures_plan.md` — trades aggregate factor plan
+3. `docs/20260524/aggregate_audit_implementation.md` — implemented ClockDriver aggregate audit path
+4. `docs/20260524/bar_schema_alignment_design.md` — bar schema alignment constraints
 
-### I want to understand the older Python prototype path
+### I want to understand audit verification
 
 Read these files:
 
-1. `factorengine/scheduler/runtime.py`
-2. `factorengine/scheduler/scheduler.py`
-3. `factorengine/scheduler/factor_spec.py`
+1. `dataflow/audit/config.py` — audit runtime knobs
+2. `dataflow/audit/writer.py` — async JSONL writer, flush, and rotation
+3. `examples/verifier/verify_binance_audit_vs_kline.py` — Binance official kline comparison
+4. `examples/verifier/README.md` — usage and tolerance semantics
 
-## 11. A practical reading order for new contributors
+### I want to understand dynamic symbol lists
+
+Read these files:
+
+1. `docs/20260523/dynamic_symbol_list_design.md` — current design proposal
+2. `examples/engine/engine_rt_binance_trades.py` — startup-only top-N symbol selection
+3. `dataflow/base_collector.py` — current fixed-list subscription lifecycle
+
+## 13. A practical reading order for new contributors
 
 If you are new to the repo, this order is efficient:
 
@@ -484,23 +560,19 @@ If you are new to the repo, this order is efficient:
 7. `dataflow/kline/publisher.py` — shared round batching
 8. `dataflow/okx/trades/worker.py` → `dataflow/trades/accumulator.py`
 9. `dataflow/binance/trades/worker.py` → `collector.py` — see how Binance mirrors OKX
-10. `docs/20260503/kline_v2/kline_to_factor_pipeline.md`
-11. `examples/engine/engine_rt_binance_trades.py`
-12. `factorengine/factors/registry.py`
-13. `native/include/fe/runtime/`
+10. `docs/20260524/aggregate_audit_implementation.md`
+11. `examples/verifier/README.md`
+12. `examples/engine/engine_rt_binance_trades.py`
+13. `factorengine/factors/registry.py`
+14. `native/include/fe/runtime/`
 
 That gives you the control plane first, then the ClockDriver coordination, the shared components, each exchange's data pipeline, and finally the factor runtime.
 
-## 12. Common source of confusion
+## 14. Common source of confusion
 
-### There are two factor execution ideas in the repo
+### Which factor execution path is current
 
-Yes.
-
-- `factorengine.scheduler` is the Python-first prototype path.
-- `fe_runtime` plus `factorengine.Engine` is the current high-performance path.
-
-When in doubt, treat `Engine` plus `fe_runtime` as the mainline architecture.
+`fe_runtime` plus `factorengine.Engine` is the current high-performance path. Older Python-first scheduler notes may appear in historical design docs, but the active package no longer exposes a `factorengine.scheduler` module.
 
 ### Why both Python and C++ exist
 
@@ -517,6 +589,12 @@ The factor inference thread (`_runtime_loop`) is identical in both modes. The on
 - **Simulation**: `SimBarWorker` (synthetic generator → cache → queue)
 
 This means any factor bug you find in simulation will also exist in live, and vice versa.
+
+### Why audit logs only aggregate bars
+
+The current audit path is designed for low-overhead operational checks. It records the same aggregate bars that ClockDriver sends to the runtime, so it can verify time alignment, OHLCV shape, missing minutes, and large drift against external references.
+
+It does not prove every raw trade was processed correctly. For that level of proof, the system would need selected raw trade logging or replay from exchange historical trade APIs.
 
 ### Why ClockDriver instead of letting each worker push to bar_queue
 
@@ -540,7 +618,7 @@ Three reasons:
 
 **Different**: WS endpoints, message formats, subscription protocols, symbol naming, kline frequency limits (Binance has no sub-minute klines), buy/sell side field semantics.
 
-## 13. Recommended next steps
+## 15. Recommended next steps
 
 After reading this tutorial, the most useful follow-up is usually one of these:
 
@@ -550,5 +628,6 @@ After reading this tutorial, the most useful follow-up is usually one of these:
 4. Run `examples/engine/engine_rt_trades.py` to see OKX trades factors with the full ClockDriver pipeline.
 5. Open `factorengine/engine.py` and trace `Engine.start()` → `_init_live()` → ClockDriver wiring.
 6. Pick one factor group under `factorengine/factors/okx_perp/` and follow how it becomes a compiled `FactorGraph`.
-7. Read `docs/20260503/trades_v2/clockdriver_refactor_plan.md` for the full Plan B architecture rationale.
-8. Read `docs/20260504/binance_dataflow_design.md` for how multi-exchange support was added.
+7. Read `docs/20260524/aggregate_audit_implementation.md` for the audit call flow.
+8. Run `examples/verifier/run.sh` after you have a local audit file to compare against Binance official klines.
+9. Read `docs/20260504/binance_dataflow_design.md` for how multi-exchange support was added.

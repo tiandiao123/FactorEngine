@@ -33,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <algorithm>
 #include <vector>
 
 #include "fe/runtime/symbol_runner.hpp"
@@ -131,6 +132,27 @@ public:
         symbol_order_.push_back(symbol);
     }
 
+    [[nodiscard]] bool has_symbol(const std::string& symbol) const {
+        return runners_.count(symbol) > 0;
+    }
+
+    void reset_symbol(const std::string& symbol) {
+        auto it = runners_.find(symbol);
+        if (it == runners_.end())
+            throw std::runtime_error("Symbol not registered: " + symbol);
+        it->second.reset();
+    }
+
+    bool remove_symbol(const std::string& symbol) {
+        auto erased = runners_.erase(symbol);
+        if (erased == 0) return false;
+        symbol_order_.erase(
+            std::remove(symbol_order_.begin(), symbol_order_.end(), symbol),
+            symbol_order_.end()
+        );
+        return true;
+    }
+
     void add_factor(const std::string& symbol,
                     const std::string& factor_id,
                     FactorGraph graph) {
@@ -207,6 +229,37 @@ public:
         if (it == runners_.end())
             throw std::runtime_error("Symbol not registered: " + symbol);
         return it->second.factor_ids();
+    }
+
+    [[nodiscard]] std::unordered_map<std::string, int>
+    get_symbol_status(const std::string& symbol) const {
+        auto it = runners_.find(symbol);
+        if (it == runners_.end())
+            throw std::runtime_error("Symbol not registered: " + symbol);
+        const auto& runner = it->second;
+        return {
+            {"bars_pushed", runner.bars_pushed()},
+            {"warmup_bars", runner.warmup_bars()},
+            {"ready", runner.ready() ? 1 : 0},
+            {"ready_factor_count", static_cast<int>(runner.ready_factor_count())},
+            {"factor_count", static_cast<int>(runner.num_factors())},
+        };
+    }
+
+    [[nodiscard]] std::unordered_map<std::string, std::unordered_map<std::string, int>>
+    get_all_symbol_status() const {
+        std::unordered_map<std::string, std::unordered_map<std::string, int>> result;
+        result.reserve(runners_.size());
+        for (const auto& [sym, runner] : runners_) {
+            result[sym] = {
+                {"bars_pushed", runner.bars_pushed()},
+                {"warmup_bars", runner.warmup_bars()},
+                {"ready", runner.ready() ? 1 : 0},
+                {"ready_factor_count", static_cast<int>(runner.ready_factor_count())},
+                {"factor_count", static_cast<int>(runner.num_factors())},
+            };
+        }
+        return result;
     }
 
     /// Return all symbols' outputs in one call: {symbol: {factor_id: value}}.

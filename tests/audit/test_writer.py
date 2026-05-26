@@ -4,7 +4,7 @@ import json
 import time
 
 from dataflow.audit import AuditConfig, AuditWriter
-from dataflow.audit.schema import AggregateBarEvent
+from dataflow.audit.schema import AggregateBarEvent, SymbolDiffEvent
 
 
 def test_audit_writer_writes_aggregate_jsonl(tmp_path):
@@ -58,9 +58,58 @@ def test_audit_writer_writes_aggregate_jsonl(tmp_path):
             "sell_vol": 4.0,
             "trade_count": 3,
             "source": "online_clockdriver",
+            "event_type": "aggregate_bar",
+            "symbol_version": None,
+            "active_symbols_count": None,
         }
     ]
     assert writer.stats()["written"] == 1
+
+
+def test_audit_writer_writes_symbol_diff_jsonl(tmp_path):
+    writer = AuditWriter(
+        AuditConfig(
+            enabled=True,
+            root_dir=str(tmp_path),
+            flush_interval_seconds=0.01,
+        )
+    )
+    writer.start()
+    writer.write_symbol_diff(
+        SymbolDiffEvent(
+            commit_ts_ms=2000,
+            effective_from_ts_ms=1000,
+            exchange="binance",
+            data_source="trades",
+            symbol_version="v2",
+            added=["ETH-USDT"],
+            removed=["SOL-USDT"],
+            unchanged_count=1,
+            target_count=2,
+            reason="test",
+        )
+    )
+    writer.stop()
+
+    files = list(tmp_path.glob("aggregate_bars_*.jsonl"))
+    assert len(files) == 1
+    rows = [json.loads(line) for line in files[0].read_text().splitlines()]
+    assert rows == [
+        {
+            "commit_ts_ms": 2000,
+            "effective_from_ts_ms": 1000,
+            "exchange": "binance",
+            "data_source": "trades",
+            "symbol_version": "v2",
+            "added": ["ETH-USDT"],
+            "removed": ["SOL-USDT"],
+            "unchanged_count": 1,
+            "target_count": 2,
+            "reason": "test",
+            "source": "engine_symbol_manager",
+            "event_type": "symbol_diff",
+        }
+    ]
 
 
 def test_audit_writer_drops_when_queue_full(tmp_path):

@@ -148,6 +148,9 @@ PYBIND11_MODULE(fe_runtime, m) {
         .def("symbol",       &SymbolRunner::symbol)
         .def("num_factors",  &SymbolRunner::num_factors)
         .def("bars_pushed",  &SymbolRunner::bars_pushed)
+        .def("warmup_bars",  &SymbolRunner::warmup_bars)
+        .def("ready_factor_count", &SymbolRunner::ready_factor_count)
+        .def("ready",        &SymbolRunner::ready)
         .def("outputs",      &SymbolRunner::outputs)
         .def("output",       &SymbolRunner::output,       py::arg("idx"))
         .def("output_by_id", &SymbolRunner::output_by_id, py::arg("factor_id"))
@@ -181,6 +184,9 @@ PYBIND11_MODULE(fe_runtime, m) {
     py::class_<InferenceEngine>(m, "InferenceEngine")
         .def(py::init<int>(), py::arg("num_threads") = 0)
         .def("add_symbol",     &InferenceEngine::add_symbol,     py::arg("symbol"))
+        .def("has_symbol",     &InferenceEngine::has_symbol,     py::arg("symbol"))
+        .def("reset_symbol",   &InferenceEngine::reset_symbol,   py::arg("symbol"))
+        .def("remove_symbol",  &InferenceEngine::remove_symbol,  py::arg("symbol"))
         .def("add_factor",     &InferenceEngine::add_factor,
              py::arg("symbol"), py::arg("factor_id"), py::arg("graph"))
         .def("push_bar",       &InferenceEngine::push_bar,
@@ -201,6 +207,8 @@ PYBIND11_MODULE(fe_runtime, m) {
            "Batch push bars for multiple symbols in parallel (releases GIL).")
         .def("get_outputs",     &InferenceEngine::get_outputs,     py::arg("symbol"))
         .def("get_factor_ids", &InferenceEngine::get_factor_ids, py::arg("symbol"))
+        .def("get_symbol_status", &InferenceEngine::get_symbol_status, py::arg("symbol"))
+        .def("get_all_symbol_status", &InferenceEngine::get_all_symbol_status)
         .def("get_all_outputs", &InferenceEngine::get_all_outputs,
              "Return all symbols' outputs: {symbol: {factor_id: float}}")
         .def("symbols",        &InferenceEngine::symbols)

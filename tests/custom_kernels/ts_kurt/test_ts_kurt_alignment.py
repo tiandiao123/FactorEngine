@@ -212,7 +212,9 @@ class TestKurtPushVsBatch:
             g.push_bar(float(x[i]))
             assert not g.ready(), f"should not be ready at bar {i}"
         g.push_bar(float(x[w - 1]))
-        assert g.ready(), "should be ready after warmup"
+        assert not g.ready(), "should require one extra bar past warmup boundary"
+        g.push_bar(float(x[w]))
+        assert g.ready(), "should be ready after warmup plus one guard bar"
 
     def test_reset_clears_state(self):
         w = 20

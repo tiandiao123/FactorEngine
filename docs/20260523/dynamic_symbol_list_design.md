@@ -1,7 +1,7 @@
 # Dynamic Symbol List 设计思考
 
 > 日期：2026-05-23
-> 状态：设计草案
+> 状态：设计草案，2026-05-24 结合当前 audit/verifier 和代码结构重新 review 后修订
 > 目标：让 FactorEngine 从启动时静态 `symbols` 进化到可运行时动态调整的 symbol universe
 
 ---
@@ -91,9 +91,10 @@ Engine.__init__
 2. 运行时移除 symbol。
 3. 上游 symbol list 服务可周期性同步。
 4. 全量快照和增量 diff 都可表达。
-5. 变更在 ClockDriver tick 边界生效，避免半个 bar 的数据污染。
+5. 变更在 ClockDriver tick 边界生效，并且不丢失刚刚结束的上一根 bar。
 6. dataflow、runtime、cache、outputs 的 active symbol 集合一致。
 7. reconnect 后 worker 能恢复最新 active subscriptions。
+8. audit log 能解释某个时间段的 active universe，便于事后核查 missing symbol 是异常还是当时不在 universe。
 
 ### 3.2 暂不追求
 
@@ -135,7 +136,7 @@ Engine 只接受 version 单调前进的更新，避免旧响应覆盖新状态�
 
 这样可以避免在 runtime thread 正在 `push_bars()` 时删除 runner。
 
-### 4.3 变更在 ClockDriver tick 边界提交
+### 4.3 变更在 ClockDriver tick 边界提交，但不能早于 flush
 
 不要让 collector 线程、runtime 线程、用户线程同时直接修改 symbol 集合。
 
@@ -151,13 +152,32 @@ SymbolManager 计算 diff
 pending diff
         │
         v
-ClockDriver tick 边界提交
+ClockDriver tick 边界：先 flush 当前已结束 bucket
         │
-        ├── workers.apply_symbol_diff(diff)
-        ├── inference.apply_symbol_diff(diff)
-        ├── cache.apply_symbol_diff(diff)
-        └── active_symbols = target_symbols
+        v
+aggregate + audit + enqueue
+        │
+        v
+提交 diff，使其从下一根 bucket 生效
+        │
+        ├── Engine 更新 active_symbols / symbol_version
+        ├── 通知 workers 切换 target symbols（不得长时间阻塞 ClockDriver）
+        ├── 向 runtime thread 投递 symbol control message
+        ├── cache 更新输出过滤集合
+        └── payload / outputs 携带各自对应的 active_symbols
 ```
+
+原因：当前 ClockDriver tick 到达时，`worker.flush()` 收集的是刚刚结束的上一根 bar。如果在 `flush()` 之前先 remove symbol，可能会丢掉上一根 bucket 中已经收集好的数据。因此第一版建议采用 **post-flush commit for next bucket**：
+
+```text
+tick T:
+  flush bucket [T-freq, T)
+  write audit / enqueue runtime payload
+  commit pending symbol diff（只做轻量提交和通知）
+  diff applies to bucket [T, T+freq)
+```
+
+注意：这里的 “commit” 是提交版本和通知各组件切换目标状态，不意味着在 ClockDriver 线程里直接执行所有重活。尤其不要在 ClockDriver 线程里直接重建 WebSocket 连接、等待 worker 线程 join，或者并发修改 C++ `InferenceEngine`。这些动作应交给各自拥有状态的线程顺序处理。
 
 ### 4.4 Worker 对外暴露统一动态订阅接口
 
@@ -394,6 +414,53 @@ engine.symbol_stats
 }
 ```
 
+### 7.5 Runtime payload 需要带 universe version
+
+动态 universe 后，`bar_queue` 里的 payload 不能只是一组 bars。原因是 runtime thread 可能滞后于 ClockDriver：当 Engine 已经提交了新的 active set，runtime thread 可能还在处理旧 universe 的 payload。
+
+第一版建议把 ClockDriver payload 从 tuple 扩展为结构化对象，例如：
+
+```python
+{
+    "bars": merged_bars,
+    "trades": merged_trades,
+    "bucket_ts_ms": bucket_ts_ms,
+    "symbol_version": "2026-05-23T10:15:00.000Z",
+    "active_symbols": {"BTC-USDT", "ETH-USDT", "SOL-USDT"},
+}
+```
+
+这样 `_runtime_loop` 和 `get_factor_outputs()` 可以按 payload 对应的 universe version 做过滤，而不是只依赖“当前最新 active set”。这能避免队列延迟时的输出错配。
+
+### 7.6 Runtime symbol diff 需要顺序化
+
+动态新增 / reset symbol 不能由 ClockDriver 线程直接调用 C++ `InferenceEngine`。当前 C++ runtime 没有保护 `add_symbol()`、`add_factor()`、`push_bars()`、`get_all_outputs()` 之间的并发访问；如果 ClockDriver 在 runtime thread 正在 `push_bars()` 时修改 runner map，会引入数据竞争。
+
+第一版建议把 runtime 相关变更放进和 bar payload 同一条控制流：
+
+```python
+{
+    "type": "symbol_diff",
+    "diff": diff,
+    "effective_from_ts_ms": next_bucket_ts_ms,
+}
+```
+
+`Engine._runtime_loop()` 顺序消费：
+
+```text
+bar payload for bucket [T-freq, T)
+symbol_diff effective from T
+bar payload for bucket [T, T+freq)
+```
+
+这样可以保证：
+
+1. 旧 bucket 先按旧 universe 推理。
+2. symbol add/reset 在 runtime thread 内串行执行。
+3. 新 bucket 再按新 universe 推理。
+4. 不需要第一版就在 C++ 层加复杂锁。
+
 ---
 
 ## 8. 各模块改造点
@@ -404,32 +471,47 @@ engine.symbol_stats
 
 1. 初始化 `SymbolProvider` / `SymbolManager`。
 2. 启动 symbol refresh thread 或让 ClockDriver 周期性触发 refresh。
-3. 在 tick 边界提交 pending diff。
-4. 调用 worker/cache/runtime 的 symbol diff API。
+3. 在 ClockDriver 完成当前 tick 的 `flush -> aggregate -> audit/enqueue` 后，提交 pending diff，使其从下一根 bucket 生效。
+4. 只在 commit 阶段做轻量状态更新和通知；不要在 ClockDriver 线程里做耗时重连或 C++ runtime 结构修改。
 5. `get_factor_outputs()` 默认只返回 active symbols。
+6. 维护 `symbol_version`，并写入 runtime payload / audit records。
+7. 把 runtime 相关 symbol diff 投递给 runtime thread 串行处理。
 
 ### 8.2 ClockDriver
 
-新增一个可选 hook：
+新增一个可选 hook，但不建议叫 `before_flush`。更准确的语义是 `after_flush_commit` 或 `after_tick_commit`：
 
 ```python
 ClockDriver(
     freq_seconds=1,
     bar_queue=q,
-    before_flush=engine.commit_pending_symbol_diff,
+    after_flush_commit=engine.commit_pending_symbol_diff,
 )
 ```
 
 tick 顺序：
 
 ```text
-1. before_flush()
-2. worker.flush()
-3. _aggregate()
+1. worker.flush()
+2. _aggregate()
+3. audit.write_aggregate_batch()
 4. bar_queue.put()
+5. after_flush_commit()
 ```
 
-这样 symbol 变更会在新的 bar bucket 开始前生效。
+这样当前 tick 对应的上一根 bucket 不会丢数据，symbol 变更从下一根 bucket 开始生效。
+
+`after_flush_commit()` 必须是轻量 hook。它可以：
+
+1. 从 `SymbolManager` 取出 pending diff。
+2. 更新 Engine 的 active version / active set。
+3. 给 worker/runtime/cache 投递切换请求。
+
+它不应该：
+
+1. 等待 WebSocket collector 完整停止和重连。
+2. 直接调用 C++ `InferenceEngine.add_symbol()` / `reset_symbol()`。
+3. 做网络请求或长时间持锁。
 
 ### 8.3 Workers
 
@@ -444,16 +526,25 @@ def active_symbols(self) -> set[str]
 TradesWorker 的新增 symbol：
 
 1. 创建 `TradesAccumulator`。
-2. collector 发送 subscribe。
-3. reconnect 订阅列表更新。
+2. 更新 worker 内部 active/target symbols。
+3. 通知 collector 切换订阅。
+4. reconnect 订阅列表更新。
 
 TradesWorker 的移除 symbol：
 
-1. collector 发送 unsubscribe。
-2. 删除或 inactive accumulator。
-3. `flush()` 不再返回该 symbol。
+1. 更新 worker 内部 active/target symbols。
+2. 通知 collector 取消订阅或重建连接。
+3. 删除或 inactive accumulator。
+4. `flush()` 不再返回该 symbol。
 
 KlineWorker 同理，需要额外处理 publisher 内部 round buffer。
+
+实现细节：
+
+1. `symbols` / `_accumulators` / publisher symbol 集合必须加锁保护。
+2. `flush()` 应先复制 active symbols 快照，再逐个 snapshot，避免遍历时集合变化。
+3. `_on_trade()` / `_on_candle()` 必须容忍已经被移除的 symbol，收到迟到消息时直接忽略。
+4. worker 的动态切换接口不应长时间阻塞 ClockDriver。
 
 ### 8.4 Collectors
 
@@ -473,8 +564,30 @@ async def unsubscribe(self, symbols: list[str]) -> None: ...
 
 第一版建议：
 
-- Binance：优先动态 `SUBSCRIBE` / `UNSUBSCRIBE`。
-- OKX：如果动态订阅复杂，可以先采用重建连接策略。
+- Binance trades：第一版先采用 **重建连接策略**，避免改造 collector 的 ws handle / 命令队列 / 并发发送模型。
+- OKX：后续再评估，第一版不做。
+- WS 内动态 `SUBSCRIBE` / `UNSUBSCRIBE` 作为第二阶段优化。
+
+当前 `BaseCollector.run()` 是启动时把 `symbols` 分组，然后每组开固定 `_ws_loop`。collector 没有保存活动 websocket handle，也没有命令队列。直接做 WS 内动态订阅需要改动更大：
+
+1. collector 需要保存每个 connection 的 ws handle。
+2. worker 需要能跨线程向 asyncio loop 投递 subscribe/unsubscribe 命令。
+3. 多连接分组需要处理 symbol 从一个 connection 迁移到另一个 connection。
+4. reconnect 后要恢复最新 active subscriptions。
+
+因此第一版更稳的做法是：
+
+```text
+commit symbol diff
+  -> worker 更新 target symbols / accumulators
+  -> worker 自己的线程收到 rebuild request
+  -> stop old collector
+  -> start new collector with active symbols
+```
+
+短暂断流可以接受，因为第一版目标是 correctness，而不是毫秒级切换。
+
+不要在 ClockDriver 线程里同步执行 `stop old collector -> join -> start new collector`。现有 worker 的 `stop()` 可能等待 event loop 退出，最坏会卡住一个或多个 tick。第一版应让 worker 持有一个 “需要重建连接” 标记或命令队列，由 worker 自己的线程在安全点完成 collector 重建。
 
 ### 8.5 InferenceEngine
 
@@ -495,6 +608,20 @@ for group in self._factor_groups:
 - `_runtime_loop` 只 push active symbols。
 - `get_factor_outputs()` 只返回 active symbols。
 - C++ runner 保留但不再更新、不再输出给用户。
+
+为支持“remove 后 re-add 默认 reset state”，第一版至少建议新增 C++/pybind 的 symbol 级 reset：
+
+```cpp
+void reset_symbol(const std::string& symbol);
+```
+
+如果不加 `reset_symbol`，那么 re-add 只能复用旧 runner state，和本文档推荐的 `reset_on_readd=True` 语义不一致。
+
+并发约束：
+
+1. `add_symbol()` / `add_factor()` / `reset_symbol()` 必须和 `push_bars()` 串行。
+2. 第一版推荐由 `_runtime_loop()` 消费 symbol control message 后执行这些操作。
+3. 如果选择在其他线程执行，则必须给所有 C++ inference 访问加同一把锁，包括 `push_bars()` 和 `get_all_outputs()`。
 
 未来再考虑 C++：
 
@@ -541,12 +668,26 @@ symbol-refresh thread
 |------|--------|----------|
 | target universe | SymbolManager | refresh thread |
 | pending diff | SymbolManager | refresh thread / manual update |
-| active symbols | Engine | ClockDriver tick boundary |
-| worker subscriptions | Worker | ClockDriver tick boundary |
-| C++ runner active set | Engine/runtime wrapper | ClockDriver tick boundary |
+| active symbols | Engine | ClockDriver post-flush commit |
+| worker target symbols | Worker | ClockDriver post-flush 轻量通知 |
+| worker WS subscriptions | Worker thread / collector loop | worker 自己的安全点 |
+| C++ runner active set | runtime thread | 按 control message 顺序处理 |
 | outputs filtering | Engine | read time |
 
 核心原则：**refresh thread 只产生 pending diff，不直接改 worker/runtime。**
+
+同理，ClockDriver 也不直接拥有 worker WebSocket 生命周期和 C++ runner map。ClockDriver 只提供一个确定性的提交时机；真正修改线程内状态的动作应由对应状态的 owner 线程完成。
+
+### 9.3 两个 active set
+
+实现时建议区分两个概念：
+
+| 名称 | 含义 |
+|------|------|
+| `current_active_symbols` | Engine 当前已经提交、对下一根 bucket 生效的 active set |
+| `payload_active_symbols` | 某个 runtime payload 生成时对应的 active set |
+
+`_runtime_loop` 处理队列里的 payload 时，应优先使用 `payload_active_symbols`。`get_factor_outputs()` 对最新输出做过滤时，可以使用输出里附带的 `symbol_version` / `active_symbols`，避免当前 active set 和旧 payload 混用。
 
 ---
 
@@ -577,6 +718,10 @@ symbol-refresh thread
 | `keep_warm_state=True` | 保留旧窗口继续推 | 仅适合短暂 unsubscribe |
 | `warmup_from_history` | 从历史 kline/trades 回填 | 未来高级模式 |
 
+当前 C++ `InferenceEngine` 只有全局 `reset()`，没有 `reset_symbol()`。因此如果第一版坚持 `reset_on_readd=True`，需要先增加 symbol 级 reset binding；否则第一版只能临时采用 `keep_warm_state=True`，但这会和“移除期间数据断层”的真实语义不一致。
+
+推荐：第一版增加 `reset_symbol(symbol)`，暂不做物理 remove。
+
 ---
 
 ## 11. Warmup 问题
@@ -606,9 +751,83 @@ engine.symbol_warmup_status
 
 ---
 
-## 12. 故障和降级策略
+## 12. Audit 和事后核查
 
-### 12.1 SymbolProvider 拉取失败
+动态 symbol list 后，audit 需要能回答一个问题：
+
+```text
+某一分钟某个 symbol 没有 audit bar，是因为数据缺失，还是因为当时它不在 active universe？
+```
+
+因此 audit 不能只记录 aggregate bars，还需要记录 universe 版本和变更事件。
+
+### 12.1 Aggregate bar 增加 universe 信息
+
+建议 `AggregateBarEvent` 增加：
+
+```python
+symbol_version: str | None
+```
+
+可选增加：
+
+```python
+universe_reason: str | None
+```
+
+这样 verifier 可以按当时的 universe 判断 missing。
+
+### 12.2 单独记录 universe change events
+
+建议新增一个 JSONL 文件类型：
+
+```text
+symbol_universe_events_YYYYMMDD_HHMMSS_part000001.jsonl
+```
+
+事件示例：
+
+```json
+{
+  "event_ts_ms": 1790000001000,
+  "effective_from_ts_ms": 1790000005000,
+  "exchange": "binance",
+  "data_source": "trades",
+  "version": "2026-05-23T10:15:00.000Z",
+  "active_count": 200,
+  "added": ["SOL-USDT"],
+  "removed": ["DOGE-USDT"],
+  "target_symbols": ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
+  "reason": "top_volume_200"
+}
+```
+
+字段语义：
+
+| 字段 | 说明 |
+|------|------|
+| `event_ts_ms` | diff 实际 commit 的时间 |
+| `effective_from_ts_ms` | diff 从哪根 bucket 开始生效 |
+| `version` | 上游 universe version |
+| `added` / `removed` | 本次变更 |
+| `target_symbols` | commit 后完整 active universe，便于离线重建 |
+
+### 12.3 verifier 的影响
+
+后续 verifier 应该支持：
+
+1. 读取 aggregate bars。
+2. 读取 symbol universe events。
+3. 对每个 `(symbol, minute)` 判断 symbol 当时是否 active。
+4. 只有 active 但缺 audit bar，才算真正 `missing_audit`。
+
+这对动态 universe 很关键，否则 verifier 会把正常移除的 symbol 误判成数据缺失。
+
+---
+
+## 13. 故障和降级策略
+
+### 13.1 SymbolProvider 拉取失败
 
 建议行为：
 
@@ -617,7 +836,7 @@ engine.symbol_warmup_status
 - 超过 `ttl_seconds` 后告警。
 - 不自动清空 symbols。
 
-### 12.2 上游返回空 list
+### 13.2 上游返回空 list
 
 空 list 是危险操作，应区分：
 
@@ -634,7 +853,7 @@ engine.symbol_warmup_status
 - 记录错误。
 - 保留旧 active universe。
 
-### 12.3 大规模变更
+### 13.3 大规模变更
 
 例如 200 个 symbols 一次变成 200 个完全不同 symbols。
 
@@ -654,7 +873,7 @@ max_removed_per_commit = 50
 
 ---
 
-## 13. 实施阶段
+## 14. 实施阶段
 
 ### Phase 0：文档和测试用例设计
 
@@ -662,18 +881,26 @@ max_removed_per_commit = 50
 - 明确删除 / 重新加入语义。
 - 写 `SymbolManager` 单元测试。
 - 写 fake worker 动态 add/remove 测试。
+- 明确 ClockDriver 使用 post-flush commit，而不是 before-flush commit。
+- 明确 audit universe event schema。
 
-### Phase 1：Engine 内部动态 active set
+### Phase 1：SymbolManager + fake worker 闭环
 
 - 新增 `StaticSymbolProvider` / `SymbolManager`。
-- 保持 worker 仍静态。
-- 先支持 runtime 输出过滤和手动 `update_symbols()` 的 diff 计算。
+- 用 fake worker 验证 post-flush commit 时序。
+- 验证 bar_queue payload 携带 `symbol_version` / `active_symbols`。
+- 验证 runtime control message 与 bar payload 的顺序：旧 bar -> diff -> 新 bar。
+- 验证 ClockDriver hook 不执行阻塞式 worker 重连或 C++ runtime 修改。
+- 先不要把“只过滤输出”的半成品接入真实 live Engine，避免制造 dataflow/runtime 不一致。
 
-### Phase 2：Trades 动态订阅
+### Phase 2：Binance trades 动态 universe
 
-- 给 OKX/Binance TradesWorker 增加 `add_symbols/remove_symbols`。
-- 给 TradesCollector 增加动态 subscribe/unsubscribe 或重连。
+- 给 BinanceTradesWorker 增加 `apply_symbol_diff`。
+- 第一版采用 collector 重建连接策略，但重建动作由 worker 自己线程异步完成，不阻塞 ClockDriver。
 - 支持 `data_source="trades"` 动态 universe。
+- 新增 symbol 时初始化 accumulator 和 C++ runner/factors。
+- 移除 symbol 时停止输出、停止订阅，C++ runner 保留 inactive。
+- 为 worker 的 `symbols` / `_accumulators` 加锁，`flush()` 使用 active symbols 快照。
 
 优先做 trades 是因为 trades 链路更短：
 
@@ -681,28 +908,34 @@ max_removed_per_commit = 50
 Collector -> TradesAccumulator -> flush()
 ```
 
-### Phase 3：Kline 动态订阅
+### Phase 3：Audit + verifier 支持动态 universe
+
+- aggregate audit records 写入 `symbol_version`。
+- audit writer 记录 symbol universe change events。
+- verifier 支持按 universe events 判断 missing 是否真实异常。
+
+### Phase 4：Kline 动态订阅
 
 - 给 KlineWorker / KlinePublisher / Adapter 增加 symbol 增删。
 - 清理 removed symbol 的 round buffer。
 - 支持 `data_source="kline"` 和 `data_source="kline_trades"` 动态 universe。
 
-### Phase 4：Warmup 和历史回填
+### Phase 5：Warmup 和历史回填
 
 - 新增 per-symbol warmup 状态。
 - 新增历史数据 loader。
 - 新 symbol 先 warmup，ready 后进入输出。
 
-### Phase 5：C++ runtime 原生 remove/reset
+### Phase 6：C++ runtime 原生 remove/reset
 
-- 增加 `remove_symbol` 或 `reset_symbol`。
+- 增加 `reset_symbol`，未来再考虑 `remove_symbol`。
 - 降低长期运行时 inactive runner 的内存增长。
 
 ---
 
-## 14. 测试计划
+## 15. 测试计划
 
-### 14.1 SymbolManager
+### 15.1 SymbolManager
 
 - 静态 list 初始化。
 - 全量快照 diff。
@@ -711,22 +944,34 @@ Collector -> TradesAccumulator -> flush()
 - 大规模变更超过阈值被拒绝。
 - symbol normalize / dedupe / sort。
 
-### 14.2 Worker 动态订阅
+### 15.2 Worker 动态订阅
 
 - add symbol 后 accumulator/publisher 创建。
 - remove symbol 后 flush 不再返回。
 - remove 后同名 re-add 状态重置。
 - reconnect 后订阅 active symbols。
+- post-flush commit 不丢上一根 bucket。
+- `flush()` 与 `apply_symbol_diff()` 并发时不抛错、不返回半更新集合。
+- collector 重建不阻塞 ClockDriver tick。
 
-### 14.3 Engine 集成
+### 15.3 Engine 集成
 
-- `update_symbols()` 后下一 tick 生效。
+- `update_symbols()` 后下一根 bucket 生效。
 - `get_factor_outputs()` 只返回 active symbols。
-- runtime thread push 时不包含 inactive symbols。
+- runtime thread 按 payload `active_symbols` 过滤，不受当前 active set 超前影响。
+- runtime thread 顺序处理 `symbol_diff` control message，C++ `add_symbol/reset_symbol` 不与 `push_bars` 并发。
 - provider 失败时保留旧 universe。
 - dynamic trades-only simulation/fake worker e2e。
+- re-add symbol 时 `reset_symbol()` 生效。
 
-### 14.4 Live 风险测试
+### 15.4 Audit / verifier
+
+- universe change event 能重建任意时刻 active set。
+- aggregate audit bar 带正确 `symbol_version`。
+- verifier 不把 inactive symbol 的 missing bar 算作异常。
+- verifier 仍能发现 active symbol 的真实 missing。
+
+### 15.5 Live 风险测试
 
 - Binance trades 1s，运行中新增 5 个 symbols。
 - Binance trades 1s，运行中移除 5 个 symbols。
@@ -735,7 +980,7 @@ Collector -> TradesAccumulator -> flush()
 
 ---
 
-## 15. 推荐的第一版最小方案
+## 16. 推荐的第一版最小方案
 
 如果要尽快落地，建议先做下面这条最小闭环：
 
@@ -743,10 +988,12 @@ Collector -> TradesAccumulator -> flush()
 HttpSymbolProvider
   -> SymbolManager(diff)
   -> Engine pending diff
-  -> ClockDriver tick boundary commit
-  -> BinanceTradesWorker dynamic subscribe
-  -> InferenceEngine add new symbols
-  -> active output filtering
+  -> ClockDriver post-flush lightweight commit for next bucket
+  -> BinanceTradesWorker receives async reconnect-based universe switch
+  -> runtime thread consumes symbol_diff and add/reset symbols
+  -> bar_queue payload carries symbol_version / active_symbols
+  -> output filtering by payload universe
+  -> audit writes symbol_version + universe change events
 ```
 
 约束：
@@ -754,26 +1001,30 @@ HttpSymbolProvider
 1. 先只支持 `exchange="binance"`。
 2. 先只支持 `data_source="trades"`。
 3. 移除 symbol 只做 inactive，不做 C++ 物理删除。
-4. 新增 symbol 不做历史 warmup，输出自然从 `NaN` 过渡。
-5. 上游接口必须提供全量 snapshot。
+4. re-add symbol 默认 `reset_symbol()`，不复用断层前 rolling state。
+5. 新增 symbol 不做历史 warmup，输出自然从 `NaN` 过渡。
+6. 上游接口必须提供全量 snapshot。
+7. 第一版 worker subscription 用重建连接，暂不做 WS 内动态 SUBSCRIBE/UNSUBSCRIBE。
+8. ClockDriver commit hook 只能做轻量通知；worker 重连和 C++ runtime 结构变更必须由各自 owner 线程执行。
 
 这条路径最符合当前架构，因为 Binance trades-only 本来就是 1s 动态 universe 最可能使用的场景，并且 trades worker 比 kline worker 简单。
 
 ---
 
-## 16. 开放问题
+## 17. 开放问题
 
 1. 上游 symbol list 接口的 version 用 timestamp 还是递增整数？
 2. 上游返回的是全市场可交易 symbols，还是策略筛选后的 target universe？
-3. 删除 symbol 后重新加入，是否一定 reset state？
+3. `reset_symbol(symbol)` 是否先于 dynamic universe 实现？
 4. 新增 symbol 是否需要历史 warmup 才能输出？
 5. 是否允许 active universe 变为空？
 6. 单次最大允许变更比例是多少？
-7. 对 OKX 是否先用重连实现动态订阅，还是直接实现 WS subscribe/unsubscribe？
+7. Binance trades 第一版重连策略的最大可接受断流时间是多少？
 8. `factor_group` 是否也需要未来动态切换？
+9. universe change events 是写入独立 JSONL，还是复用 audit writer 的同一队列和 rotate 策略？
 
 ---
 
-## 17. 一句话结论
+## 18. 一句话结论
 
-动态 symbol list 不应该只是给 worker 加一个 `symbols.append()`，而应该引入一个版本化的 `SymbolProvider -> SymbolManager -> tick-boundary commit` 标准流程。第一版优先支持 Binance trades-only，删除 symbol 采用 inactive/filter 语义，新增 symbol 自然 warmup，这样能在不大改 C++ runtime 的前提下把动态 universe 跑起来。
+动态 symbol list 不应该只是给 worker 加一个 `symbols.append()`，而应该引入一个版本化的 `SymbolProvider -> SymbolManager -> post-flush tick-boundary commit` 标准流程。第一版优先支持 Binance trades-only，用重建连接实现 universe 切换；删除 symbol 采用 inactive/filter 语义；re-add 通过 `reset_symbol()` 避免 rolling state 断层；audit 必须记录 universe version 和 universe change events，这样动态 universe 才能事后解释和校准。

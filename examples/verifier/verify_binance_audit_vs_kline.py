@@ -60,6 +60,24 @@ class Diff:
     rel_diff: float | None
 
 
+@dataclass(slots=True)
+class SymbolUniverseTimeline:
+    initial_symbols: frozenset[str]
+    events: list[dict]
+
+    def is_active(self, symbol: str, bucket_ts_ms: int) -> bool:
+        active = set(self.initial_symbols)
+        for event in self.events:
+            effective_ts = event.get("effective_from_ts_ms")
+            if effective_ts is None:
+                effective_ts = event.get("commit_ts_ms")
+            if effective_ts is None or int(effective_ts) > bucket_ts_ms:
+                break
+            active.update(event.get("added", []))
+            active.difference_update(event.get("removed", []))
+        return symbol in active
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare FactorEngine Binance aggregate audit bars with official Binance 1m klines.",
@@ -187,6 +205,51 @@ def read_audit_rows(
             if in_range:
                 rows.append(row)
     return rows
+
+
+def read_symbol_diff_events(path: Path, *, exchange: str = "binance") -> list[dict]:
+    events: list[dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON at {path}:{line_no}: {exc}") from exc
+            if row.get("event_type") != "symbol_diff":
+                continue
+            if row.get("exchange") != exchange:
+                continue
+            events.append(row)
+    return sorted(
+        events,
+        key=lambda event: int(
+            event.get("effective_from_ts_ms")
+            if event.get("effective_from_ts_ms") is not None
+            else event.get("commit_ts_ms", 0)
+        ),
+    )
+
+
+def build_symbol_universe_timeline(
+    symbols: set[str],
+    events: list[dict],
+) -> SymbolUniverseTimeline:
+    """Build a best-effort active-symbol timeline from audit diff events.
+
+    Audit diff events intentionally store added/removed deltas, not the full
+    target universe. For verifier purposes, the CLI-provided symbols are the
+    baseline unless an earlier diff proves a symbol had not yet been added.
+    """
+    initial_symbols = set(symbols)
+    for event in events:
+        initial_symbols.difference_update(event.get("added", []))
+    return SymbolUniverseTimeline(
+        initial_symbols=frozenset(initial_symbols),
+        events=events,
+    )
 
 
 def aggregate_audit_to_1m(
@@ -351,6 +414,8 @@ def main() -> int:
         end_ms=end_ms,
         audit_ts_is_end=args.audit_ts_is_end,
     )
+    symbol_diff_events = read_symbol_diff_events(audit_file)
+    universe_timeline = build_symbol_universe_timeline(symbols, symbol_diff_events)
     audit_bars = aggregate_audit_to_1m(
         audit_rows,
         audit_ts_is_end=args.audit_ts_is_end,
@@ -361,6 +426,7 @@ def main() -> int:
     print(f"range UTC:  {fmt_ts(start_ms)} -> {fmt_ts(end_ms)}")
     print(f"symbols:    {', '.join(sorted(symbols))}")
     print(f"audit rows: {len(audit_rows)}")
+    print(f"symbol diffs: {len(symbol_diff_events)}")
     print(f"audit ts:   {'end boundary' if args.audit_ts_is_end else 'start boundary'}")
     print(f"price tol:  abs={args.price_tol} rel={args.price_rtol}")
     print(f"volume tol: abs={args.volume_tol} rel={args.volume_rtol}")
@@ -376,6 +442,7 @@ def main() -> int:
 
         matched = 0
         missing_audit = 0
+        inactive_missing_audit = 0
         missing_official = 0
         mismatches: list[tuple[int, list[Diff], MinuteBar | None, MinuteBar | None]] = []
 
@@ -383,6 +450,9 @@ def main() -> int:
             audit_bar = audit_bars.get(key)
             official_bar = official.get(key)
             if audit_bar is None:
+                if not universe_timeline.is_active(symbol, key[1]):
+                    inactive_missing_audit += 1
+                    continue
                 missing_audit += 1
                 mismatches.append(
                     (key[1], [Diff("missing_audit", None, None, None, None)], None, official_bar)
@@ -413,6 +483,7 @@ def main() -> int:
         print(f"  audit minutes:    {sum(1 for key in audit_bars if key[0] == symbol)}")
         print(f"  matched:          {matched}")
         print(f"  missing_audit:    {missing_audit}")
+        print(f"  inactive_missing: {inactive_missing_audit}")
         print(f"  missing_official: {missing_official}")
         print(f"  mismatched:       {len(mismatches) - missing_audit - missing_official}")
 
