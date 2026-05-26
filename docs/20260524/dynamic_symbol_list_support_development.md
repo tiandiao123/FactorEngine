@@ -98,19 +98,18 @@ flowchart LR
 7. filter pipeline 支持 top-N 24h 成交额、白名单、黑名单等筛选。
 8. 手动 `engine.update_symbols([...])`，用于测试或策略侧主动触发。
 9. 新增 symbol 创建 accumulator，并在 runtime thread 中创建 C++ runner/factors。
-10. 移除 symbol 停止输出、停止订阅，C++ runner 保留 inactive。
-11. re-add symbol 默认 reset state，避免 rolling window 跨断层复用。
+10. 移除 symbol 停止输出、停止订阅，并由 runtime thread 物理删除 C++ runner。
+11. re-add symbol 创建 fresh C++ runner 和 fresh factor graphs，避免 rolling window 跨断层复用。
 12. payload 带 `symbol_version` / `active_symbols`。
 13. 调整期间 Engine 进程不中断，ClockDriver / runtime 继续运行。
 
 ### 3.2 暂不支持
 
 1. Binance / OKX kline 或 `kline_trades` 动态 universe。
-2. C++ 物理删除 symbol runner。
-3. 新 symbol 历史 warmup。
-4. 毫秒级无断流订阅切换。
-5. WS 内动态 SUBSCRIBE / UNSUBSCRIBE 命令队列。
-6. 零数据空窗保证。第一版允许低频 rebalance 时存在短暂 collector 重连窗口。
+2. 新 symbol 历史 warmup。
+3. 毫秒级无断流订阅切换。
+4. WS 内动态 SUBSCRIBE / UNSUBSCRIBE 命令队列。
+5. 零数据空窗保证。第一版允许低频 rebalance 时存在短暂 collector 重连窗口。
 
 ---
 
@@ -702,30 +701,28 @@ for sym in diff.added:
 
 ### 10.2 移除 symbol
 
-第一版不从 C++ 删除：
+runtime thread 消费 `symbol_diff` 后，物理删除 C++ runner：
 
 ```python
 for sym in diff.removed:
-    self._runtime_active_symbols.discard(sym)
+    if self._inference.has_symbol(sym):
+        self._inference.remove_symbol(sym)
 ```
 
-`get_factor_outputs()` 过滤掉 inactive symbol。
+这样 C++ registered universe 和 active universe 收敛，长期低频轮换不会留下 retained inactive runner。
 
 ### 10.3 re-add symbol
 
-推荐新增 C++ / pybind：
+re-add symbol 不复用旧 state，而是作为 fresh symbol 重新创建：
 
-```cpp
-void reset_symbol(const std::string& symbol);
+```python
+for sym in diff.added:
+    if self._inference.has_symbol(sym):
+        self._inference.remove_symbol(sym)
+    self._add_runtime_symbol_with_factors(sym)
 ```
 
 原因：symbol 移除期间没有持续推 bars，旧 rolling window 有时间断层。re-add 时复用旧 state 会让因子值看起来连续，但实际数据缺失。
-
-如果第一版暂时没有 `reset_symbol()`，只能选择临时复用旧 state，但需要在 `symbol_stats` 中明确标记：
-
-```python
-"readd_reset_supported": False
-```
 
 ---
 
@@ -1060,7 +1057,7 @@ bars(version_2)
 
 期望：
 
-1. 如果支持 `reset_symbol()`，SOL 的 runtime state 从 0 bars 重新 warmup。
+1. SOL 的 runtime state 从 fresh runner 重新 warmup。
 2. 输出不会复用 remove 前 rolling window。
 
 ---
@@ -1122,7 +1119,7 @@ max_removed_per_commit = 50
 12. 可选 symbol refresh thread 以低频周期调用 `symbol_provider.fetch()`，默认 1800 秒级别。
 13. `BinanceTradesWorker` / OKX `TradesWorker` 加 symbol lock 和 active snapshot flush。
 14. `BinanceTradesWorker` / OKX `TradesWorker` 支持异步 collector rebuild。
-15. C++ / pybind 增加 `reset_symbol()`，或明确第一版 re-add 暂时复用旧 state。
+15. C++ / pybind 增加 `has_symbol()` / `reset_symbol()` / `remove_symbol()`，runtime thread 对 removed symbols 物理删除 runner。
 16. `signal_deque` 记录 `symbol_version` / `active_symbols`。
 17. audit 增加 `symbol_version` 和 universe change event。
 18. verifier 支持 universe events 后再判断 missing。

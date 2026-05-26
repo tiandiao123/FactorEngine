@@ -33,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <algorithm>
 #include <vector>
 
 #include "fe/runtime/symbol_runner.hpp"
@@ -129,6 +130,27 @@ public:
             throw std::runtime_error("Symbol already registered: " + symbol);
         runners_.emplace(symbol, SymbolRunner(symbol));
         symbol_order_.push_back(symbol);
+    }
+
+    [[nodiscard]] bool has_symbol(const std::string& symbol) const {
+        return runners_.count(symbol) > 0;
+    }
+
+    void reset_symbol(const std::string& symbol) {
+        auto it = runners_.find(symbol);
+        if (it == runners_.end())
+            throw std::runtime_error("Symbol not registered: " + symbol);
+        it->second.reset();
+    }
+
+    bool remove_symbol(const std::string& symbol) {
+        auto erased = runners_.erase(symbol);
+        if (erased == 0) return false;
+        symbol_order_.erase(
+            std::remove(symbol_order_.begin(), symbol_order_.end(), symbol),
+            symbol_order_.end()
+        );
+        return true;
     }
 
     void add_factor(const std::string& symbol,

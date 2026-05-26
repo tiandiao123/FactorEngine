@@ -371,8 +371,8 @@ Supported first-version path:
 | Binance / OKX trades worker subscription rebuild | Supported |
 | Structured runtime payloads with `symbol_version` and `active_symbols` | Supported |
 | Audit `symbol_diff` events and verifier timeline | Supported |
+| Physical deletion of C++ symbol runners | Supported for factor runtime paths |
 | Kline / `kline_trades` dynamic universe | Not first-version scope |
-| Physical deletion of C++ symbol runners | Not first-version scope |
 
 ### How a rebalance starts
 

@@ -252,6 +252,47 @@ class TestInferenceEngine:
         for j in range(NUM_FACTORS):
             assert out1[j] == pytest.approx(out2[j], nan_ok=True, abs=1e-6)
 
+    def test_symbol_management_apis(self):
+        engine = rt.InferenceEngine()
+        engine.add_symbol("BTC")
+        engine.add_symbol("ETH")
+
+        assert engine.has_symbol("BTC")
+        assert engine.has_symbol("ETH")
+        assert not engine.has_symbol("SOL")
+        assert engine.num_symbols() == 2
+        assert engine.symbols() == ["BTC", "ETH"]
+
+        assert engine.remove_symbol("ETH") is True
+        assert engine.remove_symbol("ETH") is False
+        assert engine.has_symbol("BTC")
+        assert not engine.has_symbol("ETH")
+        assert engine.num_symbols() == 1
+        assert engine.symbols() == ["BTC"]
+
+    def test_reset_symbol_resets_only_target_runner(self):
+        reg = FactorRegistry()
+        reg.load_group("okx_perp")
+
+        engine = rt.InferenceEngine()
+        for sym in ["BTC", "ETH"]:
+            engine.add_symbol(sym)
+            graph = reg.build("0001", group="okx_perp")
+            engine.add_factor(sym, "0001", graph)
+
+        close, volume, open_, high, low, ret = make_ohlcv(123)
+        for i in range(130):
+            for sym in ["BTC", "ETH"]:
+                engine.push_bar(sym, close[i], volume[i], open_[i], high[i], low[i], ret[i])
+
+        btc_before = engine.get_outputs("BTC")[0]
+        eth_before = engine.get_outputs("ETH")[0]
+        assert btc_before == pytest.approx(eth_before, nan_ok=True)
+
+        engine.reset_symbol("BTC")
+        assert engine.get_outputs("BTC")[0] == pytest.approx(0.0)
+        assert engine.get_outputs("ETH")[0] == pytest.approx(eth_before, nan_ok=True)
+
 
 class TestMultiThreaded:
     """Tests for push_bars() parallel batch push via thread pool."""

@@ -131,34 +131,31 @@ Output: filtered away
 | 操作 | 第一优先级 | 目的 |
 |------|------------|------|
 | `has_symbol(symbol)` | 必须 | Runtime thread 判断 C++ 是否已有 runner |
-| `reset_symbol(symbol)` | 必须 | re-add symbol 时清空旧 rolling state |
+| `reset_symbol(symbol)` | 必须 | 手动或测试场景下清空单个 runner state |
 | `add_symbol_with_factors(symbol)` | Python 侧实现 | 新 symbol 第一次出现时创建 runner 并挂 factor graphs |
-| `remove_symbol(symbol)` | 第二阶段 | 物理删除 runner，控制长期内存增长 |
+| `remove_symbol(symbol)` | 必须 | 物理删除 runner，保持 C++ registered universe 和 active universe 一致 |
 
-第一阶段推荐不要马上依赖 physical remove。原因：
+实现 physical remove 时必须明确线程所有权。风险点：
 
 1. 当前 `push_bars()` 会把 runner 指针提交到线程池，删除 runner 必须严格保证没有并发 push 正在使用它。
 2. `symbol_order_` 也要同步删除，不能只删 `runners_`。
-3. 物理删除后 re-add 需要完整重新创建 factor graphs，Python 侧要能稳定重建每个 factor graph。
-4. 现有输出过滤已经能保证 removed symbol 不对外暴露。
+3. re-add 需要完整重新创建 factor graphs，Python 侧要能稳定重建每个 factor graph。
+4. C++ runtime mutation 必须只在 Engine runtime thread 中按 queue 顺序执行。
 
-因此推荐第一阶段语义是：
+目标语义是：
 
 ```text
 remove symbol:
   Python active set 删除
   worker 停止输出
-  C++ runner retained but inactive
+  C++ remove_symbol(symbol)
 
 re-add symbol:
-  if C++ runner exists:
-      reset_symbol(symbol)
-  else:
-      add_symbol(symbol)
-      attach all configured factors
+  add_symbol(symbol)
+  attach fresh factor graphs
 ```
 
-这能先解决最重要的 correctness 问题：re-add 不复用旧 rolling window。
+这能同时解决 correctness 和内存收敛问题：re-add 不复用旧 rolling window，removed symbol 也不会长期占用 C++ runtime 内存。
 
 ---
 
@@ -197,14 +194,12 @@ def _apply_symbol_diff_to_runtime(self, diff):
 
     for sym in sorted(diff.added):
         if self._inference.has_symbol(sym):
-            self._inference.reset_symbol(sym)
-        else:
-            self._add_runtime_symbol_with_factors(sym)
+            self._inference.remove_symbol(sym)
+        self._add_runtime_symbol_with_factors(sym)
 
     for sym in sorted(diff.removed):
-        # Phase 1: retained inactive, no physical delete.
-        # Phase 2: optional self._inference.remove_symbol(sym)
-        pass
+        if self._inference.has_symbol(sym):
+            self._inference.remove_symbol(sym)
 ```
 
 这样保证 C++ runtime 结构修改和 `push_bars()` 都在同一个 runtime thread 的消息顺序里发生：
@@ -291,9 +286,9 @@ pybind:
 .def("reset_symbol", &InferenceEngine::reset_symbol, py::arg("symbol"))
 ```
 
-### 7.3 `remove_symbol`，第二阶段
+### 7.3 `remove_symbol`
 
-如果需要物理删除：
+物理删除 runner，并同步维护 `symbol_order_`：
 
 ```cpp
 bool remove_symbol(const std::string& symbol) {
@@ -318,42 +313,21 @@ bool remove_symbol(const std::string& symbol) {
 
 ---
 
-## 8. remove vs retained inactive 的取舍
-
-### Retained inactive
+## 8. physical remove 语义
 
 优点：
 
-1. 实现简单。
-2. 不影响当前 `symbol_order_` / `runners_` 生命周期。
-3. re-add 时只要 `reset_symbol()`，不用重新 attach factors。
-4. 风险低，适合第一阶段。
+1. C++ registered universe 和 active universe 对齐。
+2. 内存随 active universe 收敛。
+3. `num_symbols()` / `symbols()` 语义清晰。
+4. re-add 必然是 fresh runner，不会复用旧 rolling window。
 
-缺点：
-
-1. 长时间大量轮换 symbol 会增加 C++ runner 内存。
-2. `self._inference.symbols()` 会包含 inactive symbols，需要 Python 层解释。
-
-### Physical remove
-
-优点：
-
-1. 内存随 active universe 收敛。
-2. `num_symbols()` 更符合物理 active runner 数量。
-
-缺点：
+要求：
 
 1. re-add 必须重新 build factor graphs。
-2. 删除时要同步 `symbol_order_`。
-3. 错误调用时可能和 thread pool runner 指针生命周期冲突。
-4. 测试面更大。
-
-推荐：
-
-```text
-Phase A: retained inactive + reset on re-add
-Phase B: optional physical remove with strict runtime-thread invariant
-```
+2. 删除时同步 `symbol_order_`。
+3. remove/add 必须只在 runtime thread 中消费 `symbol_diff` 时执行。
+4. 输出过滤仍保留，因为每个 bars payload 的 `active_symbols` 仍是该 bucket 的事实来源。
 
 ---
 
@@ -398,15 +372,10 @@ def _add_runtime_symbol_with_factors(self, sym: str) -> None:
 symbol_stats = {
     "active_count": len(self._active_symbols),
     "runtime_symbol_count": self._inference.num_symbols(),
-    "runtime_retained_inactive_count": (
-        self._inference.num_symbols() - len(self._active_symbols)
-    ),
-    "runtime_remove_supported": False,
+    "runtime_remove_supported": True,
     "runtime_reset_symbol_supported": True,
 }
 ```
-
-如果实现 physical remove，再把 `runtime_remove_supported` 改成 true。
 
 ---
 
@@ -478,19 +447,15 @@ bars(v1) -> symbol_diff(v2) -> bars(v2)
 
 ## 11. 实施阶段
 
-### Phase 1：C++ minimal API
+### Phase 1：C++ symbol management API
 
 目标：
 
 1. `InferenceEngine::has_symbol`
 2. `InferenceEngine::reset_symbol`
-3. pybind 暴露 `has_symbol` / `reset_symbol`
-4. C++/Python binding tests
-
-不做：
-
-1. `remove_symbol`
-2. Engine runtime diff mutation
+3. `InferenceEngine::remove_symbol`
+4. pybind 暴露 `has_symbol` / `reset_symbol` / `remove_symbol`
+5. C++/Python binding tests
 
 ### Phase 2：Engine runtime add/reset
 
@@ -501,26 +466,11 @@ bars(v1) -> symbol_diff(v2) -> bars(v2)
    - 已存在 runner：`reset_symbol`
    - 不存在 runner：`add_symbol` + add factors
 3. `symbol_diff.removed`：
-   - Phase 2 仍 retained inactive
-4. `symbol_stats` 暴露 runtime retained inactive count
+   - `remove_symbol`
+4. `symbol_stats` 暴露 runtime physical count
 5. Engine runtime tests
 
-### Phase 3：可选 physical remove
-
-目标：
-
-1. `InferenceEngine::remove_symbol`
-2. pybind 暴露 `remove_symbol`
-3. `symbol_order_` 同步删除
-4. Engine 配置项：
-
-```python
-runtime_symbol_remove_mode: Literal["retain", "remove"] = "retain"
-```
-
-默认仍用 `retain`，只有确认长期 symbol churn 造成内存问题时再打开 `remove`。
-
-### Phase 4：文档和 audit stats
+### Phase 3：文档和 audit stats
 
 目标：
 
@@ -529,8 +479,7 @@ runtime_symbol_remove_mode: Literal["retain", "remove"] = "retain"
 3. audit 或 `symbol_stats` 记录：
    - active count
    - runtime physical count
-   - retained inactive count
-   - remove mode
+   - runtime remove supported
 
 ---
 
@@ -538,13 +487,13 @@ runtime_symbol_remove_mode: Literal["retain", "remove"] = "retain"
 
 1. **FactorGraph 不能跨 symbol 复用同一个实例**：每个 symbol 必须重新 build graph。
 2. **不要在 ClockDriver thread 里调用 C++ mutation**：所有 C++ runtime add/reset/remove 都应在 runtime thread 顺序处理。
-3. **re-add 必须 reset**：否则 rolling window 会跨 inactive gap，输出会误导。
-4. **physical remove 不是第一优先级**：先解决 correctness，再解决内存收敛。
+3. **re-add 必须 fresh add**：否则 rolling window 会跨 inactive gap，输出会误导。
+4. **physical remove 必须同步 `symbol_order_`**：不能只删 `runners_`。
 5. **输出过滤仍然需要保留**：即使 C++ 支持 remove，payload 的 `active_symbols` 仍是每个 bar 对应 universe 的事实来源。
-6. **`get_all_outputs()` 当前返回所有 runner**：只要 retained inactive 存在，Python 侧必须继续按 active set 过滤。
+6. **`get_all_outputs()` 返回当前 registered runners**：Python 侧仍按 active set 过滤，以保证 payload 级 universe 语义。
 
 ---
 
 ## 13. 一句话结论
 
-当前 dynamic symbol list 已经完成 Python dataflow 和 Engine 控制链路，但 C++ runtime 仍是 retained inactive 语义。下一步不建议一上来物理删除 runner，而是先补 `has_symbol` / `reset_symbol`，并让 runtime thread 在消费 `symbol_diff` 时为新增 symbol 创建 runner、为 re-add symbol reset state；等 correctness 稳定后，再按配置支持 `remove_symbol` 做内存收敛。
+dynamic symbol list 需要 C++ runtime 和 dataflow 一样真实同步 universe：runtime thread 消费 `symbol_diff` 时，对 removed symbols 物理 `remove_symbol()`，对 added symbols 创建 fresh runner 和 fresh factor graphs。这样 active universe、worker subscription、C++ registered universe、outputs 和 audit 才能形成一致的 end-to-end dynamic symbol 语义。

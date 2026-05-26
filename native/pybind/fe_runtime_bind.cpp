@@ -181,6 +181,9 @@ PYBIND11_MODULE(fe_runtime, m) {
     py::class_<InferenceEngine>(m, "InferenceEngine")
         .def(py::init<int>(), py::arg("num_threads") = 0)
         .def("add_symbol",     &InferenceEngine::add_symbol,     py::arg("symbol"))
+        .def("has_symbol",     &InferenceEngine::has_symbol,     py::arg("symbol"))
+        .def("reset_symbol",   &InferenceEngine::reset_symbol,   py::arg("symbol"))
+        .def("remove_symbol",  &InferenceEngine::remove_symbol,  py::arg("symbol"))
         .def("add_factor",     &InferenceEngine::add_factor,
              py::arg("symbol"), py::arg("factor_id"), py::arg("graph"))
         .def("push_bar",       &InferenceEngine::push_bar,

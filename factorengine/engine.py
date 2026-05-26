@@ -160,6 +160,7 @@ class Engine:
         self._inference = None
         self._num_threads = num_threads
         self._factor_ids: list[str] = []
+        self._factor_registry = None
         self._signal_deque: deque[dict] = deque(maxlen=signal_buffer_size)
         self._prev_closes: dict[str, float] = {}
         self._bars_pushed = 0
@@ -319,13 +320,10 @@ class Engine:
         for group in groups:
             reg.load_group(group)
 
+        self._factor_registry = reg
         self._inference = rt.InferenceEngine(num_threads=num_threads)
         for sym in self.symbols:
-            self._inference.add_symbol(sym)
-            for group in groups:
-                graphs = reg.build_group(group)
-                for fid, graph in graphs.items():
-                    self._inference.add_factor(sym, fid, graph)
+            self._add_runtime_symbol_with_factors(sym)
 
         self._factor_ids = []
         for group in groups:
@@ -337,6 +335,19 @@ class Engine:
             len(self.symbols), len(self._factor_ids),
             "+".join(groups), num_threads,
         )
+
+    def _add_runtime_symbol_with_factors(self, symbol: str) -> None:
+        """Create one C++ SymbolRunner and attach fresh factor graphs."""
+        if self._inference is None or self._factor_registry is None:
+            return
+        if hasattr(self._inference, "has_symbol") and self._inference.has_symbol(symbol):
+            raise RuntimeError(f"Runtime symbol already registered: {symbol}")
+
+        self._inference.add_symbol(symbol)
+        for group in self._factor_groups:
+            graphs = self._factor_registry.build_group(group)
+            for fid, graph in graphs.items():
+                self._inference.add_factor(symbol, fid, graph)
 
     def _runtime_loop(self):
         """Runtime thread main loop: pull bars from queue, infer, write deque."""
@@ -429,10 +440,8 @@ class Engine:
         """Normalize legacy and structured runtime queue payloads."""
         if isinstance(payload, dict) and payload.get("type") == "symbol_diff":
             diff = payload.get("diff")
-            self._last_symbol_diff = diff
             if diff is not None:
-                self._active_symbols = set(diff.target)
-                self._symbol_version = diff.version
+                self._apply_symbol_diff_to_runtime(diff)
             return None
         if isinstance(payload, dict) and payload.get("type") == "bars":
             meta = {
@@ -448,6 +457,35 @@ class Engine:
             round_bars, round_trades = payload
             return round_bars, round_trades, {}
         return payload, None, {}
+
+    def _apply_symbol_diff_to_runtime(self, diff) -> None:
+        """Synchronize committed symbol diff into C++ runtime state.
+
+        This must run on the factor runtime thread, ordered with bar payloads.
+        ClockDriver only enqueues the control message and never mutates C++.
+        """
+        self._last_symbol_diff = diff
+        self._active_symbols = set(diff.target)
+        self._symbol_version = diff.version
+
+        if self._inference is None:
+            return
+
+        for sym in sorted(diff.removed):
+            if (
+                hasattr(self._inference, "has_symbol")
+                and self._inference.has_symbol(sym)
+            ):
+                self._inference.remove_symbol(sym)
+            self._prev_closes.pop(sym, None)
+
+        for sym in sorted(diff.added):
+            if (
+                hasattr(self._inference, "has_symbol")
+                and self._inference.has_symbol(sym)
+            ):
+                self._inference.remove_symbol(sym)
+            self._add_runtime_symbol_with_factors(sym)
 
     def update_symbols(
         self,

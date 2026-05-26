@@ -80,6 +80,52 @@ def test_runtime_loop_consumes_symbol_diff_control_message_before_next_bar():
     engine.stop()
 
 
+def test_runtime_symbol_diff_physically_updates_cpp_runtime_symbols():
+    engine = Engine(
+        symbols=["BTC-USDT-SWAP"],
+        mode="simulation",
+        sim_seed=42,
+        factor_group="okx_perp",
+        num_threads=1,
+        enable_dynamic_symbols=True,
+    )
+    btc = "BTC-USDT-SWAP"
+    eth = "ETH-USDT-SWAP"
+    bar = np.array([1000.0, 100.0, 102.0, 99.0, 101.0, 5000.0, 0.0, 0.0])
+    diff = SymbolDiff(
+        version="v2",
+        added=frozenset({eth}),
+        removed=frozenset({btc}),
+        unchanged=frozenset(),
+        target=frozenset({eth}),
+    )
+
+    assert engine._inference.has_symbol(btc)
+    assert not engine._inference.has_symbol(eth)
+    engine._bar_queue.put({"type": "bars", "bars": {btc: bar}, "symbol_version": "v1"})
+    engine._bar_queue.put({"type": "symbol_diff", "diff": diff})
+    engine._bar_queue.put({
+        "type": "bars",
+        "bars": {btc: bar, eth: bar},
+        "symbol_version": "v2",
+        "active_symbols": {eth},
+    })
+
+    engine._stop_event.clear()
+    t = threading.Thread(target=engine._runtime_loop, daemon=True)
+    t.start()
+    time.sleep(0.5)
+    engine._stop_event.set()
+    t.join(timeout=2)
+
+    assert not engine._inference.has_symbol(btc)
+    assert engine._inference.has_symbol(eth)
+    assert engine._inference.symbols() == [eth]
+    assert engine.signal_deque[-1]["symbol_version"] == "v2"
+    assert set(engine.signal_deque[-1]["factors"]) == {eth}
+    engine.stop()
+
+
 def test_engine_update_symbols_stages_until_explicit_commit():
     engine = Engine(
         symbols=["BTC-USDT"],
