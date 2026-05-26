@@ -293,6 +293,39 @@ class TestInferenceEngine:
         assert engine.get_outputs("BTC")[0] == pytest.approx(0.0)
         assert engine.get_outputs("ETH")[0] == pytest.approx(eth_before, nan_ok=True)
 
+    def test_symbol_status_tracks_runtime_warmup(self):
+        reg = FactorRegistry()
+        reg.load_group("okx_perp")
+
+        engine = rt.InferenceEngine()
+        engine.add_symbol("BTC")
+        graph = reg.build("0001", group="okx_perp")
+        warmup_bars = graph.warmup_bars()
+        engine.add_factor("BTC", "0001", graph)
+
+        initial = engine.get_symbol_status("BTC")
+        assert initial["bars_pushed"] == 0
+        assert initial["warmup_bars"] == warmup_bars
+        assert initial["ready"] == 0
+        assert initial["ready_factor_count"] == 0
+        assert initial["factor_count"] == 1
+
+        close, volume, open_, high, low, ret = make_ohlcv(123, warmup_bars + 1)
+        for i in range(warmup_bars):
+            engine.push_bar("BTC", close[i], volume[i], open_[i], high[i], low[i], ret[i])
+
+        status = engine.get_symbol_status("BTC")
+        assert status["bars_pushed"] == warmup_bars
+        assert status["ready"] == 0
+        assert status["ready_factor_count"] == 0
+
+        engine.push_bar("BTC", close[warmup_bars], volume[warmup_bars], open_[warmup_bars], high[warmup_bars], low[warmup_bars], ret[warmup_bars])
+        status = engine.get_symbol_status("BTC")
+        assert status["bars_pushed"] == warmup_bars + 1
+        assert status["ready"] == 1
+        assert status["ready_factor_count"] == 1
+        assert engine.get_all_symbol_status()["BTC"] == status
+
 
 class TestMultiThreaded:
     """Tests for push_bars() parallel batch push via thread pool."""

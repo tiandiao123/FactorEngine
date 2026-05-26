@@ -41,6 +41,8 @@ def test_runtime_loop_handles_structured_bars_and_filters_active_symbols():
     assert latest["active_symbols"] == {btc}
     assert btc in latest["factors"]
     assert eth not in latest["factors"]
+    assert btc in latest["symbol_status"]
+    assert eth not in latest["symbol_status"]
     engine.stop()
 
 
@@ -123,6 +125,37 @@ def test_runtime_symbol_diff_physically_updates_cpp_runtime_symbols():
     assert engine._inference.symbols() == [eth]
     assert engine.signal_deque[-1]["symbol_version"] == "v2"
     assert set(engine.signal_deque[-1]["factors"]) == {eth}
+    assert set(engine.signal_deque[-1]["symbol_status"]) == {eth}
+    engine.stop()
+
+
+def test_engine_exposes_symbol_status_and_ready_only_outputs():
+    engine = Engine(
+        symbols=["BTC-USDT-SWAP"],
+        mode="simulation",
+        sim_seed=42,
+        factor_group="okx_perp",
+        num_threads=1,
+    )
+    sym = "BTC-USDT-SWAP"
+    bar = np.array([1000.0, 100.0, 102.0, 99.0, 101.0, 5000.0, 0.0, 0.0])
+    warmup_bars = engine._inference.get_symbol_status(sym)["warmup_bars"]
+
+    engine._bar_queue.put({"type": "bars", "bars": {sym: bar}, "symbol_version": "v1"})
+
+    engine._stop_event.clear()
+    t = threading.Thread(target=engine._runtime_loop, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    engine._stop_event.set()
+    t.join(timeout=2)
+
+    status = engine.get_symbol_status()[sym]
+    assert status["bars_pushed"] == 1
+    assert status["warmup_bars"] == warmup_bars
+    assert status["ready"] == 0
+    assert engine.get_factor_outputs()
+    assert engine.get_ready_factor_outputs() == {}
     engine.stop()
 
 

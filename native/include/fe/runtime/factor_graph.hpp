@@ -348,7 +348,7 @@ public:
         ++bars_seen_;
     }
 
-    [[nodiscard]] bool ready() const { return bars_seen_ >= warmup_bars_; }
+    [[nodiscard]] bool ready() const { return bars_seen_ > warmup_bars_; }
 
     [[nodiscard]] FeFloat output() const {
         FeFloat v = values_[output_node_];

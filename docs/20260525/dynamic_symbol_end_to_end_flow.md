@@ -74,7 +74,176 @@ audit symbol_version / symbol_diff
 
 ---
 
-## 3. 核心线程和职责
+## 3. 完整流程图
+
+### 3.1 总览：从 universe refresh 到 C++ runtime 同步
+
+```mermaid
+flowchart TB
+    subgraph U[Universe 产生]
+        A1[Manual engine.update_symbols] --> U1[SymbolUniverse]
+        A2[symbol-refresh thread] --> A3[SymbolProvider.fetch]
+        A3 --> A4[SymbolSource REST / local txt / static]
+        A4 --> A5[SymbolFilter pipeline]
+        A5 --> U1
+    end
+
+    subgraph S[Stage: 只计算 diff, 不做副作用]
+        U1 --> S1[SymbolManager.stage_universe]
+        S1 --> S2{valid and changed?}
+        S2 -->|no| S3[reject or no pending diff]
+        S2 -->|yes| S4[pending SymbolDiff<br/>added / removed / unchanged / target]
+    end
+
+    subgraph C[ClockDriver thread: tick 边界提交]
+        C1[flush workers under old universe] --> C2[aggregate bars/trades]
+        C2 --> C3[write aggregate audit<br/>old symbol_version]
+        C3 --> C4[bar_queue.put bars payload<br/>old active_symbols]
+        C4 --> C5[after_flush_commit]
+        S4 --> C5
+        C5 --> C6[SymbolManager.commit_pending]
+        C6 --> C7[Engine active_symbols / symbol_version update]
+        C7 --> C8[worker.apply_symbol_diff]
+        C7 --> C9[write symbol_diff audit]
+        C7 --> C10[bar_queue.put symbol_diff control message]
+    end
+
+    subgraph W[Trades worker thread: dataflow 同步]
+        C8 --> W1[add/remove accumulators]
+        W1 --> W2[update active_symbols / target_symbols]
+        W2 --> W3[request collector rebuild]
+        W3 --> W4[stop old collector]
+        W4 --> W5[rebuild exchange collector<br/>with target_symbols]
+    end
+
+    subgraph R[Runtime thread: C++ runtime 同步]
+        C4 --> R1[consume bars payload]
+        R1 --> R2[C++ InferenceEngine.push_bars]
+        C10 --> R3[consume symbol_diff]
+        R3 --> R4[remove C++ runners for removed symbols]
+        R3 --> R5[add C++ runners + fresh FactorGraphs for added symbols]
+        R4 --> R6[registered universe synced]
+        R5 --> R6
+        R6 --> R7[next bars payload uses new universe]
+    end
+
+    subgraph O[Outputs / Audit]
+        R2 --> O1[get_all_outputs]
+        O1 --> O2[filter by payload active_symbols]
+        O2 --> O3[signal_deque append<br/>symbol_version + active_symbols]
+        C9 --> O4[verifier active timeline]
+    end
+```
+
+这张图里最重要的是两个顺序：
+
+```text
+ClockDriver thread:
+  bars payload 先入队
+  symbol_diff 后入队
+
+Runtime thread:
+  push_bars 先完成
+  C++ add/remove runner 后发生
+```
+
+### 3.2 Add symbol 时序图
+
+```mermaid
+sequenceDiagram
+    participant User as User / RefreshThread
+    participant SM as SymbolManager
+    participant CD as ClockDriver
+    participant ENG as Engine
+    participant WK as TradesWorker
+    participant RT as RuntimeThread
+    participant CPP as C++ InferenceEngine
+
+    User->>SM: stage_universe(target={BTC,ETH})
+    SM-->>SM: pending diff.added={ETH}
+
+    CD->>WK: flush() old active={BTC}
+    WK-->>CD: bars(BTC)
+    CD->>RT: bar_queue.put(bars v1)
+    CD->>ENG: after_flush_commit(bucket_ts)
+
+    ENG->>SM: commit_pending()
+    SM-->>ENG: SymbolDiff added={ETH}
+    ENG->>WK: apply_symbol_diff(diff)
+    WK-->>WK: create ETH accumulator<br/>target_symbols={BTC,ETH}
+    WK-->>WK: request collector rebuild
+    ENG->>RT: bar_queue.put(symbol_diff v2)
+
+    RT->>CPP: push_bars(BTC) for bars v1
+    CPP-->>RT: push_bars complete
+    RT->>RT: consume symbol_diff v2
+    RT->>CPP: has_symbol(ETH)
+    CPP-->>RT: false
+    RT->>CPP: add_symbol(ETH)
+    loop for each factor graph
+        RT->>CPP: add_factor(ETH, fid, fresh graph)
+    end
+    RT-->>RT: next bars can include ETH
+```
+
+### 3.3 Remove symbol 时序图
+
+```mermaid
+sequenceDiagram
+    participant User as User / RefreshThread
+    participant SM as SymbolManager
+    participant CD as ClockDriver
+    participant ENG as Engine
+    participant WK as TradesWorker
+    participant RT as RuntimeThread
+    participant CPP as C++ InferenceEngine
+
+    User->>SM: stage_universe(target={BTC})
+    SM-->>SM: pending diff.removed={ETH}
+
+    CD->>WK: flush() old active={BTC,ETH}
+    WK-->>CD: bars(BTC,ETH)
+    CD->>RT: bar_queue.put(bars v1)
+    CD->>ENG: after_flush_commit(bucket_ts)
+
+    ENG->>SM: commit_pending()
+    SM-->>ENG: SymbolDiff removed={ETH}
+    ENG->>WK: apply_symbol_diff(diff)
+    WK-->>WK: remove ETH accumulator<br/>target_symbols={BTC}
+    WK-->>WK: request collector rebuild
+    ENG->>RT: bar_queue.put(symbol_diff v2)
+
+    RT->>CPP: push_bars(BTC,ETH) for bars v1
+    CPP-->>RT: push_bars complete
+    RT->>RT: consume symbol_diff v2
+    RT->>CPP: has_symbol(ETH)
+    CPP-->>RT: true
+    RT->>CPP: remove_symbol(ETH)
+    CPP-->>RT: runners_ and symbol_order_ updated
+    RT-->>RT: next bars active={BTC}
+```
+
+### 3.4 Runtime thread 顺序保证
+
+```mermaid
+flowchart LR
+    Q1[bar_queue: bars v1] --> R1[RuntimeThread handles bars v1]
+    R1 --> P1[C++ push_bars starts]
+    P1 --> TP[C++ thread pool computes symbols in parallel]
+    TP --> P2[push_bars waits for all tasks]
+    P2 --> R2[push_bars returns]
+    R2 --> Q2[bar_queue: symbol_diff v2]
+    Q2 --> R3[RuntimeThread handles symbol_diff]
+    R3 --> M1[C++ remove_symbol / add_symbol]
+    M1 --> Q3[bar_queue: bars v2]
+    Q3 --> R4[RuntimeThread handles bars v2]
+```
+
+这里没有并发删除 runner 的风险，因为 `symbol_diff` 一定在 `push_bars()` 返回后才会被 runtime thread 处理。
+
+---
+
+## 4. 核心线程和职责
 
 | 线程 / 组件 | 负责什么 | 不负责什么 |
 |-------------|----------|------------|
@@ -96,7 +265,7 @@ worker thread 负责“何时重建 WS collector”
 
 ---
 
-## 4. 静态启动时 C++ runtime 怎么建
+## 5. 静态启动时 C++ runtime 怎么建
 
 启动时如果配置了 `factor_group`，Engine 会初始化 C++ `InferenceEngine`。
 
@@ -142,11 +311,11 @@ def _add_runtime_symbol_with_factors(self, symbol: str) -> None:
 
 ---
 
-## 5. Universe 从哪里来
+## 6. Universe 从哪里来
 
 dynamic universe 有两种入口。
 
-### 5.1 手动入口
+### 6.1 手动入口
 
 用户或策略侧直接调用：
 
@@ -165,7 +334,7 @@ return self._symbol_manager.update_symbols(
 )
 ```
 
-### 5.2 provider refresh 入口
+### 6.2 provider refresh 入口
 
 如果配置了 `symbol_provider`，Engine start 后会启动 `symbol-refresh` 线程。
 
@@ -182,7 +351,7 @@ return self._symbol_manager.stage_universe(universe)
 
 ---
 
-## 6. SymbolManager 如何算 diff
+## 7. SymbolManager 如何算 diff
 
 `SymbolManager.stage_universe()` 输入的是一个完整目标 universe：
 
@@ -216,7 +385,7 @@ self._pending = SymbolDiff(
 
 ---
 
-## 7. 为什么要 post-flush commit
+## 8. 为什么要 post-flush commit
 
 假设当前 active universe 是：
 
@@ -273,7 +442,7 @@ bars(v2)
 
 ---
 
-## 8. Commit 时 Python dataflow 层做什么
+## 9. Commit 时 Python dataflow 层做什么
 
 ClockDriver post-flush 调用：
 
@@ -318,7 +487,7 @@ self._bar_queue.put({
 
 ---
 
-## 9. Worker 如何处理 add/remove symbol
+## 10. Worker 如何处理 add/remove symbol
 
 Binance / OKX trades worker 都实现了同样的动态接口：
 
@@ -367,7 +536,7 @@ with self._symbol_lock:
 
 ---
 
-## 10. Worker 为什么异步 rebuild
+## 11. Worker 为什么异步 rebuild
 
 `apply_symbol_diff()` 不能阻塞 ClockDriver，否则 flush thread 会卡住。
 
@@ -399,7 +568,7 @@ while True:
 
 ---
 
-## 11. Runtime thread 如何同步 C++ runtime
+## 12. Runtime thread 如何同步 C++ runtime
 
 C++ runtime 的真实 add/remove 不在 commit 阶段发生，而是在 factor runtime thread 消费 `symbol_diff` control message 时发生。
 
@@ -450,7 +619,7 @@ added symbol:
 
 ---
 
-## 12. C++ InferenceEngine 如何 add/remove
+## 13. C++ InferenceEngine 如何 add/remove
 
 当前 C++ `InferenceEngine` 保存两份 symbol 结构：
 
@@ -499,7 +668,7 @@ engine._inference.num_symbols() == active_count
 
 ---
 
-## 13. 为什么不会影响正在推理的那一轮
+## 14. 为什么不会影响正在推理的那一轮
 
 核心原因：`bars` 和 `symbol_diff` 都通过同一个 `bar_queue` 进入 runtime thread。
 
@@ -541,7 +710,7 @@ and only between two push_bars() calls.
 
 ---
 
-## 14. Add new symbol 的完整流程
+## 15. Add new symbol 的完整流程
 
 假设：
 
@@ -593,7 +762,7 @@ diff.added = {ETH}
 
 ---
 
-## 15. Remove symbol 的完整流程
+## 16. Remove symbol 的完整流程
 
 假设：
 
@@ -643,7 +812,7 @@ diff.removed = {ETH}
 
 ---
 
-## 16. Re-add symbol 的完整流程
+## 17. Re-add symbol 的完整流程
 
 假设：
 
@@ -681,7 +850,7 @@ SymbolRunner("ETH")
 
 ---
 
-## 17. 输出为什么还要过滤 active_symbols
+## 18. 输出为什么还要过滤 active_symbols
 
 即使 C++ 已经支持 physical remove，Python output 仍然保留：
 
@@ -705,7 +874,7 @@ if active_symbols is not None:
 
 ---
 
-## 18. Audit / verifier 如何解释变化
+## 19. Audit / verifier 如何解释变化
 
 每个 aggregate bar audit row 会带：
 
@@ -739,7 +908,7 @@ inactive_missing
 
 ---
 
-## 19. 当前支持范围
+## 20. 当前支持范围
 
 已支持：
 
@@ -763,6 +932,6 @@ inactive_missing
 
 ---
 
-## 20. 一句话总结
+## 21. 一句话总结
 
 当前 dynamic symbol list 是一条端到端顺序化控制流：上游 universe 先变成 pending `SymbolDiff`，ClockDriver 在当前 bucket flush 后提交版本，worker 异步重建订阅，runtime thread 按 `bar_queue` 顺序物理 add/remove C++ `SymbolRunner`，最终 outputs 和 audit 都以 payload 的 `active_symbols` / `symbol_version` 为准。这样 dataflow universe、worker subscription、C++ registered universe 和用户看到的 factor outputs 可以保持一致。

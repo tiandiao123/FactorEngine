@@ -420,10 +420,20 @@ class Engine:
             }
 
             result = self._inference.get_all_outputs()
+            symbol_status = (
+                self._inference.get_all_symbol_status()
+                if hasattr(self._inference, "get_all_symbol_status")
+                else {}
+            )
             if active_symbols is not None:
                 result = {
                     sym: factors
                     for sym, factors in result.items()
+                    if sym in active_symbols
+                }
+                symbol_status = {
+                    sym: status
+                    for sym, status in symbol_status.items()
                     if sym in active_symbols
                 }
             self._signal_deque.append({
@@ -432,6 +442,7 @@ class Engine:
                 "symbol_version": payload_meta.get("symbol_version"),
                 "active_symbols": active_symbols,
                 "factors": result,
+                "symbol_status": symbol_status,
             })
 
         logger.info("factor-infer thread stopped (bars_pushed=%d)", self._bars_pushed)
@@ -597,7 +608,10 @@ class Engine:
             logger.exception("Dynamic symbol diff audit write failed")
 
     def get_factor_outputs(
-        self, symbols: list[str] | None = None
+        self,
+        symbols: list[str] | None = None,
+        *,
+        ready_only: bool = False,
     ) -> dict[str, dict[str, float]]:
         """Get the latest factor values for each symbol.
 
@@ -608,10 +622,34 @@ class Engine:
         """
         if not self._signal_deque:
             return {}
-        latest = self._signal_deque[-1]["factors"]
+        latest_snapshot = self._signal_deque[-1]
+        latest = latest_snapshot["factors"]
+        if ready_only:
+            status = latest_snapshot.get("symbol_status", {})
+            latest = {
+                sym: factors
+                for sym, factors in latest.items()
+                if status.get(sym, {}).get("ready")
+            }
         if symbols is None:
             return latest
         return {sym: latest[sym] for sym in symbols if sym in latest}
+
+    def get_symbol_status(self, symbols: list[str] | None = None) -> dict[str, dict]:
+        """Get latest per-symbol runtime readiness metadata."""
+        if not self._signal_deque:
+            return {}
+        status = self._signal_deque[-1].get("symbol_status", {})
+        if symbols is None:
+            return status
+        return {sym: status[sym] for sym in symbols if sym in status}
+
+    def get_ready_factor_outputs(
+        self,
+        symbols: list[str] | None = None,
+    ) -> dict[str, dict[str, float]]:
+        """Get factor outputs only for symbols whose full factor set is ready."""
+        return self.get_factor_outputs(symbols, ready_only=True)
 
     @property
     def factor_ids(self) -> list[str]:
