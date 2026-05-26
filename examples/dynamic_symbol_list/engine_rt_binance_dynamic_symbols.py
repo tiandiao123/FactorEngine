@@ -36,6 +36,7 @@ DATA_FREQ = "1s"
 NUM_THREADS = 4
 BAR_WINDOW = 200
 UPDATE_EVERY_SECONDS = 300
+RUN_SECONDS = 3600
 PRINT_EVERY_CYCLES = 1
 PRINT_TOP_K = 8
 AUDIT_ENABLED = True
@@ -78,7 +79,7 @@ SYMBOL_LISTS = [
 
 def _version(list_idx: int) -> str:
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
-    return f"manual-rotate:{list_idx}:{ts}"
+    return f"manual-rotate:{ts}:{list_idx}"
 
 
 def _runtime_symbols(engine: Engine) -> list[str]:
@@ -128,15 +129,20 @@ def _log_state(engine: Engine, *, cycle: int, list_idx: int, next_update_in: flo
         (int(status.get("warmup_bars", 0)) for status in symbol_status.values()),
         default=0,
     )
+    min_symbol_bars = min(
+        (int(status.get("bars_pushed", 0)) for status in symbol_status.values()),
+        default=0,
+    )
     warmup_pct = (
-        min(100, int(100 * engine.bars_pushed / max_warmup_bars))
+        min(100, int(100 * min_symbol_bars / max_warmup_bars))
         if max_warmup_bars > 0
         else 0
     )
 
     logger.info(
         f"\n═══ Cycle {cycle:4d} list={list_idx} "
-        f"bars_pushed={engine.bars_pushed:5d} warmup={warmup_pct}%/{max_warmup_bars}bars "
+        f"bars_pushed={engine.bars_pushed:5d} "
+        f"symbol_warmup={warmup_pct}% ({min_symbol_bars}/{max_warmup_bars}bars) "
         f"next_update_in={next_update_in:6.1f}s"
     )
     logger.info(f"  active({len(active)}):  {active}")
@@ -235,6 +241,7 @@ logger.info(f"Data freq:      {engine.data_freq}")
 logger.info(f"Factor IDs:     {engine.factor_ids}")
 logger.info(f"Audit:          {AUDIT_ENABLED} -> {AUDIT_ROOT}")
 logger.info(f"Update every:   {UPDATE_EVERY_SECONDS}s")
+logger.info(f"Run duration:   {RUN_SECONDS}s")
 for i, symbols in enumerate(SYMBOL_LISTS):
     logger.info(f"  list[{i}] ({len(symbols)}): {symbols}")
 
@@ -243,12 +250,17 @@ engine.start()
 
 freq_seconds = engine.data_freq_seconds
 current_list_idx = 0
+end_ts = time.monotonic() + RUN_SECONDS
 next_update_ts = time.monotonic() + UPDATE_EVERY_SECONDS
 
 try:
-    for cycle in range(1, 100_000):
+    cycle = 0
+    while time.monotonic() < end_ts:
+        cycle += 1
         time.sleep(freq_seconds)
         now = time.monotonic()
+        if now >= end_ts:
+            break
 
         if now >= next_update_ts:
             current_list_idx = (current_list_idx + 1) % len(SYMBOL_LISTS)
@@ -279,5 +291,6 @@ try:
 except KeyboardInterrupt:
     logger.info("Interrupted by user.")
 finally:
+    logger.info("Run duration reached or interrupted; stopping engine.")
     engine.stop()
     logger.info("Done.")
