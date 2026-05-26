@@ -255,24 +255,24 @@ trade 属于哪个 bucket 取决于它什么时候到达本地并 update accumul
 
 ```mermaid
 flowchart TB
-    WS[Exchange trades WebSocket] --> C[Collector parses trade]
-    C --> T[price / size / side / exchange_ts_ms]
-    T --> K[Compute bucket_start<br/>trade_ts_ms - trade_ts_ms % freq_ms]
-    K --> M{bucket key}
+    WS["Exchange trades WebSocket"] --> C["Collector parses trade"]
+    C --> T["price, size, side, exchange_ts_ms"]
+    T --> K["Compute bucket_start_ms<br>trade_ts_ms - trade_ts_ms % freq_ms"]
+    K --> M{"bucket_start_ms"}
 
-    M --> P[previous bucket<br/>waiting for late trades]
-    M --> C1[current bucket<br/>normal updates]
-    M --> N[next bucket<br/>early-created if needed]
+    M --> P["previous bucket<br>waiting for late trades"]
+    M --> C1["current bucket<br>normal updates"]
+    M --> N["next bucket<br>created if needed"]
 
-    P --> U1[TradeBucket.update O(1)]
-    C1 --> U2[TradeBucket.update O(1)]
-    N --> U3[TradeBucket.update O(1)]
+    P --> U1["TradeBucket.update O(1)"]
+    C1 --> U2["TradeBucket.update O(1)"]
+    N --> U3["TradeBucket.update O(1)"]
 
-    subgraph BucketState[Each TradeBucket stores aggregate state]
-        O[open / high / low / close]
-        V[volume / vwap]
-        B[buy_vol / sell_vol / trade_count]
-        TS[first / last trade_ts]
+    subgraph BucketState["Each TradeBucket stores aggregate state"]
+        O["open, high, low, close"]
+        V["volume, vwap"]
+        BV["buy_vol, sell_vol, trade_count"]
+        TS["first_trade_ts, last_trade_ts"]
     end
 
     U1 --> BucketState
@@ -340,27 +340,27 @@ drop + metrics
 
 ```mermaid
 flowchart TB
-    Worker[TradesWorker] --> SM[accumulators: dict[symbol, EventTimeTradesAccumulator]]
+    Worker["TradesWorker"] --> SM["accumulators map<br>symbol to EventTimeTradesAccumulator"]
 
-    SM --> BTC[BTC-USDT accumulator]
-    SM --> ETH[ETH-USDT accumulator]
+    SM --> BTC["BTC-USDT accumulator"]
+    SM --> ETH["ETH-USDT accumulator"]
 
-    BTC --> B0[buckets[11:00:00.000]]
-    BTC --> B1[buckets[11:00:01.000]]
-    BTC --> B2[buckets[11:00:02.000]]
+    BTC --> B0["bucket 11:00:00.000"]
+    BTC --> B1["bucket 11:00:01.000"]
+    BTC --> B2["bucket 11:00:02.000"]
 
-    ETH --> E0[buckets[11:00:00.000]]
-    ETH --> E1[buckets[11:00:01.000]]
+    ETH --> E0["bucket 11:00:00.000"]
+    ETH --> E1["bucket 11:00:01.000"]
 
-    B0 --> BS0[TradeBucket OHLCV state]
-    B1 --> BS1[TradeBucket OHLCV state]
-    B2 --> BS2[TradeBucket OHLCV state]
-    E0 --> ES0[TradeBucket OHLCV state]
-    E1 --> ES1[TradeBucket OHLCV state]
+    B0 --> BS0["TradeBucket OHLCV state"]
+    B1 --> BS1["TradeBucket OHLCV state"]
+    B2 --> BS2["TradeBucket OHLCV state"]
+    E0 --> ES0["TradeBucket OHLCV state"]
+    E1 --> ES1["TradeBucket OHLCV state"]
 
-    Clock[ClockDriver tick] --> WM[watermark = now_ms - allowed_lateness_ms]
-    WM --> FR[flush_ready by bucket_start_ms]
-    FR --> OUT[emit all mature buckets sorted by bucket_start_ms]
+    Clock["ClockDriver tick"] --> WM["watermark = now_ms - allowed_lateness_ms"]
+    WM --> FR["flush_ready(bucket_start_ms)"]
+    FR --> OUT["emit mature buckets sorted by bucket_start_ms"]
 ```
 
 这个结构让 `ClockDriver` 的职责变得很清楚：它只推进时间和 watermark；具体每个 symbol 在某个时间点有没有 bucket，由 `TradesWorker` / `EventTimeTradesAccumulator` 的 map 自然表达。
