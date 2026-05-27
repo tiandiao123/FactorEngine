@@ -218,6 +218,282 @@ allowed_lateness=500ms
 
 如果想更精细，可以让 ClockDriver tick 仍是 1s，但 flush 时输出“所有已成熟 bucket”；实现简单，延迟可接受。
 
+### 5.1 三条独立规则（实现时必须分开实现）
+
+event-time + allowed_lateness 方案里有 **三条语义上独立、不能混用的规则**。实现时建议写成三个明确的分支，而不是“收到 trade 就 update 当前桶”或“tick 到了就 snapshot 当前 accumulator”。
+
+#### 规则 1：分桶 —— 只看交易所时间，不看本地收到时间
+
+```text
+bucket_start_ms = trade_ts_ms - (trade_ts_ms % freq_ms)
+bucket_end_ms   = bucket_start_ms + freq_ms
+```
+
+- 每笔 trade 到达时，**先用 `trade_ts_ms` 计算它属于哪个 exchange-time bucket**
+- **本地 `receive_ts_ms` 不参与分桶**
+- 即使 trade 本地晚到、甚至本地时间已经跨秒，只要 `trade_ts_ms` 还在上一秒，就必须进入上一秒的 bucket
+
+#### 规则 2：迟到判定 —— trade 到达时刻立即检查，与 flush tick 无关
+
+trade 到达时（`update()` 入口），立刻计算当前 watermark：
+
+```text
+watermark_ms = receive_ts_ms - allowed_lateness_ms
+```
+
+如果：
+
+```text
+bucket_end_ms <= watermark_ms
+```
+
+说明这个 bucket 已经过了可接受窗口（要么即将被 flush，要么已经被 flush 并 delete），**这笔 trade 必须 drop**，不能创建或更新旧 bucket。
+
+注意：
+
+```text
+迟到判定发生在 update() 入口
+flush 发生在 ClockDriver tick
+两者时间点不同，不能合并成一个逻辑
+```
+
+#### 规则 3：flush —— ClockDriver tick 时输出所有成熟 bucket
+
+ClockDriver 每次 tick（`now_ms`）：
+
+```text
+watermark_ms = now_ms - allowed_lateness_ms
+emit all buckets where bucket_end_ms <= watermark_ms
+按 bucket_start_ms 升序输出
+snapshot 后立刻从 buckets map 中 delete
+```
+
+一次 tick 可能 emit 0 根、1 根或多根 bar（系统卡顿时可能补吐多个成熟 bucket）。
+
+#### 三条规则的关系
+
+```text
+trade 到达
+  -> [规则 1] 按 trade_ts_ms 计算 bucket_start_ms
+  -> [规则 2] 若 bucket_end_ms <= receive_watermark，drop
+  -> 否则 update bucket[bucket_start_ms]
+
+ClockDriver tick
+  -> [规则 3] 若 bucket_end_ms <= tick_watermark，emit + delete
+```
+
+**常见错误**：只在 flush 时做分桶或只在 flush 时做 drop。正确做法是 **update 入口做分桶 + 迟到 drop，tick 入口做成熟 flush**。
+
+---
+
+### 5.2 详细示例 A：本地同一窗口内收到跨秒 trade
+
+以下示例用于澄清“本地收到时间相同/接近，但 exchange time 不同”时的分桶与 flush 行为。
+
+参数：
+
+```text
+freq_ms = 1000
+allowed_lateness_ms = 500
+```
+
+两笔 trade 都在 **本地 10:00:01.000 ~ 10:00:01.500** 之间收到：
+
+| Trade | 交易所时间 `trade_ts_ms` | 本地收到时间 `receive_ts_ms`（举例） |
+|-------|--------------------------|--------------------------------------|
+| Y | 10:00:00.990 | 10:00:01.100 |
+| X | 10:00:01.100 | 10:00:01.300 |
+
+#### Step 1：分桶（规则 1）
+
+```text
+Trade Y: bucket_start = 10:00:00.000, bucket_end = 10:00:01.000  -> bucket[10:00:00]
+Trade X: bucket_start = 10:00:01.000, bucket_end = 10:00:02.000  -> bucket[10:00:01]
+```
+
+虽然两笔都是本地 10:00:01.xxx 才收到，但：
+
+- Y 的 exchange time 仍在 **10:00:00 这一秒** → 进 `bucket[10:00:00]`
+- X 的 exchange time 已在 **10:00:01 这一秒** → 进 `bucket[10:00:01]`
+
+**不能**因为“本地都在 10:00:01 收到”就把它们放进同一个 bucket。这正是 event-time 方案与当前 receive-time 方案的核心差异。
+
+#### Step 2：到达时迟到判定（规则 2）
+
+Trade Y 到达时（`receive_ts_ms = 10:00:01.100`）：
+
+```text
+watermark = 10:00:01.100 - 500 = 10:00:00.600
+bucket_end = 10:00:01.000
+10:00:01.000 <= 10:00:00.600 ? 否 -> 允许 update bucket[10:00:00]
+```
+
+Trade X 到达时（`receive_ts_ms = 10:00:01.300`）：
+
+```text
+watermark = 10:00:01.300 - 500 = 10:00:00.800
+bucket_end = 10:00:02.000
+10:00:02.000 <= 10:00:00.800 ? 否 -> 允许 update bucket[10:00:01]
+```
+
+在 **10:00:01.000 ~ 10:00:01.500** 窗口内收到的 Y，都不会被 drop。
+
+Trade Y 的 drop 边界：
+
+```text
+若 receive_ts_ms >= 10:00:01.501:
+  watermark = receive_ts_ms - 500 >= 10:00:01.001
+  bucket_end = 10:00:01.000
+  10:00:01.000 <= watermark -> drop
+```
+
+即：对 `bucket[10:00:00]` 而言，本地收到时间最晚不能超过 **10:00:01.500**（恰好等于 `bucket_end + allowed_lateness`）。
+
+#### Step 3：map 状态（两笔都收到后、第一次 flush 前）
+
+```text
+buckets = {
+  10:00:00.000 -> TradeBucket { ..., trade_count 含 Y }
+  10:00:01.000 -> TradeBucket { ..., trade_count 含 X }
+}
+```
+
+两个 bucket **同时存在于 map 中**。这不是 bug，而是 event-time map 分桶的正常状态。
+
+#### Step 4：逐 tick flush（规则 3）
+
+```text
+Tick 10:00:01.000 (now_ms = 10:00:01.000):
+  watermark = 10:00:00.500
+  bucket[10:00:00] end=10:00:01.000 > watermark -> 不 emit
+  bucket[10:00:01] end=10:00:02.000 > watermark -> 不 emit
+  （此时 Y、X 可能尚未到达）
+
+Tick 10:00:02.000 (now_ms = 10:00:02.000):
+  watermark = 10:00:01.500
+  bucket[10:00:00] end=10:00:01.000 <= watermark -> emit，delete
+  bucket[10:00:01] end=10:00:02.000 >  watermark -> 保留
+
+Tick 10:00:03.000 (now_ms = 10:00:03.000):
+  watermark = 10:00:02.500
+  bucket[10:00:01] end=10:00:02.000 <= watermark -> emit，delete
+```
+
+emit 顺序：先 `10:00:00`（含 Y），再 `10:00:01`（含 X）。bar 的时间戳应对齐 `bucket_start_ms`（或文档约定的 bucket end，但全链路必须统一）。
+
+#### 与 receive-time 方案的对比
+
+若仍用当前 receive-time 聚合：
+
+```text
+10:00:01.xxx 收到的 Y 和 X 都会进入“当前 accumulator”
+10:00:01.000 tick 已 flush 时，Y 可能尚未到达 -> Y 被错误归入下一秒
+即使 Y 在 10:00:01.100 到达，也会和 X 混在同一根 bar 里
+```
+
+event-time 方案下，Y 会被正确归入 `10:00:00` bucket，并在 `10:00:02.000` tick 随该 bucket 一起 emit。
+
+---
+
+### 5.3 详细示例 B：文档原始单 bucket 迟到 case
+
+参数同上（`allowed_lateness_ms = 500`）。
+
+```text
+10:00:00.900  Trade A arrives, trade_ts=10:00:00.890  -> bucket[10:00:00]
+10:00:01.020  Trade B arrives, trade_ts=10:00:00.999  -> bucket[10:00:00]
+```
+
+Trade B 到达时迟到判定：
+
+```text
+watermark = 10:00:01.020 - 500 = 10:00:00.520
+bucket_end = 10:00:01.000
+10:00:01.000 <= 10:00:00.520 ? 否 -> 允许 update
+```
+
+```text
+Tick 10:00:01.000: watermark=10:00:00.500 -> bucket[10:00:00] 不 emit（B 可能尚未到达）
+Tick 10:00:02.000: watermark=10:00:01.500 -> bucket[10:00:00] emit（含 A + B）
+```
+
+---
+
+### 5.4 超迟到 trade：bucket 已 emit 后到达
+
+若 trade 的 exchange time 远早于当前时间（例如 `trade_ts = 11:00:00.990`，本地 `10:00:01.xxx` 收到），则：
+
+```text
+bucket_start = 11:00:00.000
+bucket_end   = 11:00:01.000
+```
+
+- 若 `bucket[11:00:00]` 已在更早的 tick emit 并 delete → **drop**，记 `dropped_late_trade_count`
+- 第一版 **不做 runtime 回滚**，也不重建已输出的 bucket
+
+这与 5.2 中“本地晚到但 exchange time 仍在 allowed_lateness 窗口内”的 case 不同：前者 bucket 尚未 emit，后者 bucket 已经不存在。
+
+---
+
+### 5.5 实现伪代码（推荐直接对照实现）
+
+```python
+def update(px, sz, side, trade_ts_ms, receive_ts_ms):
+    bucket_start_ms = trade_ts_ms - (trade_ts_ms % freq_ms)
+    bucket_end_ms = bucket_start_ms + freq_ms
+
+    # 规则 2：到达时迟到判定（用 receive_ts_ms，不是 trade_ts_ms）
+    receive_watermark_ms = receive_ts_ms - allowed_lateness_ms
+    if bucket_end_ms <= receive_watermark_ms:
+        dropped_late_trade_count += 1
+        late_trade_count += 1
+        return
+
+    # 规则 1：分桶 update
+    bucket = buckets.setdefault(bucket_start_ms, TradeBucket(bucket_start_ms))
+    bucket.update(px, sz, side, trade_ts_ms, receive_ts_ms)
+
+
+def flush_ready(now_ms: int) -> list[TradeBucketSnapshot]:
+    # 规则 3：tick 时成熟 flush（用 now_ms，不是 receive_ts_ms）
+    tick_watermark_ms = now_ms - allowed_lateness_ms
+    ready_keys = sorted(
+        bucket_start_ms
+        for bucket_start_ms in buckets
+        if bucket_start_ms + freq_ms <= tick_watermark_ms
+    )
+    snapshots = []
+    for bucket_start_ms in ready_keys:
+        bucket = buckets.pop(bucket_start_ms)
+        snapshots.append(bucket.snapshot(is_complete=True))
+    return snapshots
+```
+
+#### 实现检查清单
+
+实现完成后，至少验证以下 invariant：
+
+```text
+[分桶] update() 内 bucket_start_ms 只依赖 trade_ts_ms，不依赖 receive_ts_ms
+[迟到] update() 入口的 watermark 使用 receive_ts_ms（或 now_ms），不是 trade_ts_ms
+[flush] flush_ready() 的 watermark 使用 ClockDriver tick 的 now_ms
+[delete] emit 后 bucket 立刻从 map 删除；delete 后同 bucket_start_ms 的新 trade 走 late-drop，不重建
+[多桶] 同一 symbol 的 map 中允许同时存在多个 bucket（如 10:00:00 和 10:00:01）
+[顺序] 一次 flush_ready 返回多根 bar 时，按 bucket_start_ms 升序
+[空桶] forward-fill 空 bucket 的逻辑只作用于“成熟且 active symbol”的 bucket，见第 15 节
+```
+
+#### 常见实现错误
+
+| 错误 | 后果 |
+|------|------|
+| 用 `receive_ts_ms` 计算 `bucket_start_ms` | 退化为 receive-time 聚合，与官方 kline 仍不对齐 |
+| 只在 flush tick 做迟到 drop，update 时不检查 | 已 emit 的 bucket 被迟到 trade 重建，audit/runtime 不一致 |
+| flush 后未 delete bucket | map 内存泄漏；迟到 trade 重复修改已输出 bar |
+| update 与 flush 共用同一个 watermark 变量但时间点混用 | 边界 trade 有时被误 drop，有时被误保留 |
+| 假设 map 中永远只有 1 个 bucket | 跨秒迟到 trade 会覆盖或丢失数据 |
+| 一次 tick 只 emit 最后一根成熟 bucket（方案 A） | 系统卡顿时丢失中间 bucket |
+
 ---
 
 ## 6. 流程图对比
@@ -847,6 +1123,8 @@ bar_queue 的 tick 和 bucket_ts 不再一一对应
 
 ## 14. 迟到 trade 如何处理
 
+> **详细分桶 / flush / drop 时序与实现伪代码见第 5.1 ~ 5.5 节。** 本节只总结策略选型。
+
 定义：
 
 ```text
@@ -865,11 +1143,16 @@ trade bucket end <= current watermark
 
 ### 14.1 第一版：drop + metrics
 
+drop 条件与 5.1 规则 2 一致：trade 到达时（不是 flush tick 时）检查：
+
 ```python
-if bucket_end_ms <= watermark_ms:
+receive_watermark_ms = receive_ts_ms - allowed_lateness_ms
+if bucket_end_ms <= receive_watermark_ms:
     dropped_late_trade_count += 1
     return
 ```
+
+注意：`bucket_end_ms` 由 **exchange `trade_ts_ms`** 计算；`receive_watermark_ms` 由 **本地 `receive_ts_ms`** 计算。两者不可混用。
 
 同时记录：
 
