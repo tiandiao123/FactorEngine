@@ -251,22 +251,22 @@ trade_ts_ms 已经解析出来，但没有参与分桶
 trade 属于哪个 bucket 取决于它什么时候到达本地并 update accumulator
 ```
 
-### 6.2 目标 exchange-time 三桶流程
+### 6.2 目标 exchange-time map 分桶流程
 
 ```mermaid
 flowchart TB
     WS["Exchange trades WebSocket"] --> C["Collector parses trade"]
     C --> T["price, size, side, exchange_ts_ms"]
     T --> K["Compute bucket_start_ms<br>trade_ts_ms - trade_ts_ms % freq_ms"]
-    K --> M{"bucket_start_ms"}
+    K --> M["buckets map<br>bucket_start_ms to TradeBucket"]
 
-    M --> P["previous bucket<br>waiting for late trades"]
-    M --> C1["current bucket<br>normal updates"]
-    M --> N["next bucket<br>created if needed"]
+    M --> B0["bucket 11:00:00.000"]
+    M --> B1["bucket 11:00:01.000"]
+    M --> B2["bucket 11:00:02.000"]
 
-    P --> U1["TradeBucket.update O(1)"]
-    C1 --> U2["TradeBucket.update O(1)"]
-    N --> U3["TradeBucket.update O(1)"]
+    B0 --> U0["TradeBucket.update O(1)"]
+    B1 --> U1["TradeBucket.update O(1)"]
+    B2 --> U2["TradeBucket.update O(1)"]
 
     subgraph BucketState["Each TradeBucket stores aggregate state"]
         O["open, high, low, close"]
@@ -275,16 +275,18 @@ flowchart TB
         TS["first_trade_ts, last_trade_ts"]
     end
 
+    U0 --> BucketState
     U1 --> BucketState
     U2 --> BucketState
-    U3 --> BucketState
 ```
 
 目标流程的关键点：
 
 ```text
 每笔 trade 按 exchange timestamp 进入正确 bucket
+bucket 由 dict/map 自然创建，不固定成 previous/current/next 三个字段
 即使本地迟到，只要还没超过 allowed_lateness，就能补进原本那一秒
+每个 bucket 内只维护聚合状态，不保存 raw trade list
 ```
 
 ### 6.3 ClockDriver watermark flush
@@ -413,7 +415,7 @@ ETH-USDT -> buckets[11:00:00.000] -> ETH 这一秒的 OHLCV 聚合状态
 所有 bucket_end_ms <= watermark_ms 的成熟桶
 ```
 
-这比固定维护 `previous/current/next` 三个字段更自然。三桶只是正常网络情况下的直觉模型；实际实现应该使用 `dict[int, TradeBucket]`，让桶数量由数据自然决定。
+第一版实现应只使用 `dict[int, TradeBucket]`，让 bucket 数量由数据自然决定；不要在代码里维护固定的 `previous/current/next` 字段。
 
 `TradeBucket` 维护：
 
@@ -445,70 +447,134 @@ def update(px, sz, side, trade_ts_ms, receive_ts_ms=None):
 
 ---
 
-## 8. 三桶直觉：previous / current / next
+## 8. map 分桶，而不是固定三桶
 
-如果 `freq=1s`，任意时刻正常只需要关心很少几个 exchange-time bucket。
-
-可以直观理解成三个桶：
-
-```text
-previous bucket: 前一秒，等待 allowed_lateness 后关闭
-current bucket:  当前交易所秒，正在接收正常 trades
-next bucket:     下一秒，可能因为本地 clock / WS 到达顺序而提前出现
-```
-
-例如本地时间在：
-
-```text
-11:00:01.100
-```
-
-可能同时存在：
-
-```text
-bucket[11:00:00]  # 前一秒，还在等迟到 trade
-bucket[11:00:01]  # 当前秒，正常累加
-bucket[11:00:02]  # 如果收到了 exchange_ts 属于下一秒的 trade，也可提前建桶
-```
-
-每笔 aggTrade 到达时，不看本地到达时间决定 bucket，而是看交易所时间：
-
-```python
-bucket_start = trade_ts_ms - (trade_ts_ms % freq_ms)
-```
-
-所以：
-
-```text
-trade_ts = 11:00:00.980
-receive  = 11:00:01.120
-```
-
-仍然进入：
-
-```text
-bucket[11:00:00]
-```
-
-不会因为本地收到时已经过了 11:00:01，就被放进 11:00:01 bucket。
-
-代码实现上不应该真的写死“三个桶”。推荐直接使用 map：
+第一版实现必须使用 map 管理 exchange-time bucket：
 
 ```python
 buckets: dict[int, TradeBucket]
 ```
 
-正常网络下这个 dict 大多只有 2-3 个 key，看起来就像 previous/current/next。网络抖动、进程卡顿或交易所补发时，可能短暂多几个 key；超过 `allowed_lateness` 的 bucket 则按 late trade 策略处理。
+其中 key 是：
 
-因此文档后面提到的“三桶”都只是解释概念，不是实现约束。
+```text
+bucket_start_ms = trade_ts_ms - (trade_ts_ms % freq_ms)
+```
+
+不要在代码里固定维护：
+
+```text
+previous_bucket
+current_bucket
+next_bucket
+```
+
+原因是固定三桶会把实现和“正常网络情况下通常只看到 2-3 个 bucket”这个现象绑死。实际系统需要处理：
+
+```text
+迟到 trade
+乱序 trade
+进程短暂停顿后一次 flush 多个成熟 bucket
+交易所补发或 WebSocket 抖动
+动态 symbol list add/remove 边界
+```
+
+这些场景下，map 更自然：
+
+```text
+trade arrives
+  -> compute bucket_start_ms from exchange timestamp
+  -> bucket = buckets.setdefault(bucket_start_ms, TradeBucket(bucket_start_ms))
+  -> bucket.update(...)
+```
+
+如果 `freq=1s`，正常网络下这个 map 大多只会短暂包含类似下面几个 key：
+
+```text
+bucket[11:00:00]
+bucket[11:00:01]
+bucket[11:00:02]
+```
+
+这可以被口头理解成 previous/current/next，但它不是实现结构。实现只认 `bucket_start_ms -> TradeBucket`。
 
 ---
 
-## 9. 聚合时机：推荐实时流式聚合，不推荐 flush 时存 list 再计算
+## 9. 聚合时机：实时流式 O(1) 聚合
 
-这里有两种实现方式。
+实时主路径必须采用流式 O(1) 聚合：
 
-### 9.1 方案一：bucket 内保存原始 aggTrades list，flush 时一次性聚合
+```text
+trade arrives
+  -> 按 trade_ts_ms 找 bucket
+  -> bucket.update(price, size, side, trade_ts_ms, receive_ts_ms)
+
+flush mature bucket
+  -> bucket.snapshot()
+  -> delete bucket
+```
+
+`TradeBucket` 只维护聚合状态：
+
+```text
+open
+high
+low
+close
+sum_v
+sum_pv
+buy_vol
+sell_vol
+trade_count
+first_trade_ts_ms
+last_trade_ts_ms
+first_receive_ts_ms
+last_receive_ts_ms
+```
+
+每笔 trade 都是 O(1) 更新：
+
+```python
+if bucket.trade_count == 0:
+    bucket.open = px
+bucket.high = max(bucket.high, px)
+bucket.low = min(bucket.low, px)
+bucket.close = px
+bucket.sum_v += sz
+bucket.sum_pv += px * sz
+bucket.trade_count += 1
+```
+
+注意：`open/close` 应该按 exchange trade time 语义定义。如果 WebSocket 保证单 symbol 内 trade 基本按 exchange time 有序，直接用到达顺序更新 open/close 通常可行；如果要更严格，则 bucket 需要保存：
+
+```text
+first_trade_ts_ms + first_trade_price
+last_trade_ts_ms + last_trade_price
+```
+
+更新时：
+
+```python
+if trade_ts_ms < first_trade_ts_ms:
+    open = px
+if trade_ts_ms >= last_trade_ts_ms:
+    close = px
+```
+
+这样即使同一个 bucket 内极少数 trade 乱序到达，open/close 仍按 exchange timestamp 对齐。
+
+这个方案是第一版实时实现的唯一推荐方案，因为：
+
+```text
+内存小
+实时路径稳定
+flush 很轻
+和当前 TradesAccumulator 的 O(1) 聚合模型一致
+```
+
+### 9.1 非实时调试方案：保存 raw trades list
+
+bucket 内保存原始 aggTrades list，然后 flush 时一次性聚合，只适合 debug / offline replay，不进入实时主路径。
 
 流程：
 
@@ -539,81 +605,7 @@ flush 时计算集中在 ClockDriver 路径上，可能造成抖动
 需要处理 list 排序、重复 trade、超大 bucket
 ```
 
-这个方式适合离线 replay 或 debug，不建议作为实时主路径第一版。
-
-### 9.2 方案二：bucket 内实时 O(1) 聚合，flush 时只 snapshot
-
-流程：
-
-```text
-trade arrives
-  -> 按 trade_ts 找 bucket
-  -> bucket.update(price, size, side, trade_ts)
-
-flush mature bucket
-  -> bucket.snapshot()
-  -> delete bucket
-```
-
-`TradeBucket` 只维护聚合状态：
-
-```text
-open
-high
-low
-close
-sum_v
-sum_pv
-buy_vol
-sell_vol
-trade_count
-first_trade_ts_ms
-last_trade_ts_ms
-first_receive_ts_ms
-last_receive_ts_ms
-```
-
-每笔 trade 仍然是 O(1) 更新：
-
-```python
-if bucket.trade_count == 0:
-    bucket.open = px
-bucket.high = max(bucket.high, px)
-bucket.low = min(bucket.low, px)
-bucket.close = px
-bucket.sum_v += sz
-bucket.sum_pv += px * sz
-bucket.trade_count += 1
-```
-
-注意：这里的 `open/close` 应该按 exchange trade time 语义定义。
-
-如果 WebSocket 保证单 symbol 内 trade 基本按 exchange time 有序，直接用到达顺序更新 open/close 通常可行；如果要更严格，则 bucket 需要保存：
-
-```text
-first_trade_ts_ms + first_trade_price
-last_trade_ts_ms + last_trade_price
-```
-
-更新时：
-
-```python
-if trade_ts_ms < first_trade_ts_ms:
-    open = px
-if trade_ts_ms >= last_trade_ts_ms:
-    close = px
-```
-
-这样即使同一个 bucket 内极少数 trade 乱序到达，open/close 仍按 exchange timestamp 对齐。
-
-推荐第一版采用这个方案，因为：
-
-```text
-内存小
-实时路径稳定
-flush 很轻
-和当前 TradesAccumulator 的 O(1) 聚合模型一致
-```
+这个方式可以作为可选 debug 工具，但不要让生产 worker 依赖它。
 
 ---
 
@@ -642,7 +634,118 @@ def flush_ready(now_ms: int) -> list[dict]:
 
 这点和现在 `flush()` 每个 symbol 只返回一根 bar 不同。
 
-为了不大改下游，有三个实现选择。
+`flush_ready()` 必须只处理 map 里的成熟 bucket：
+
+```text
+遍历 buckets
+找出 bucket_end_ms <= watermark_ms 的 bucket
+按 bucket_start_ms 排序输出
+从 buckets 里删除已输出 bucket
+```
+
+它不应该依赖 previous/current/next 这种固定桶字段。
+
+### 10.1 bucket 生命周期与 delete / audit 边界
+
+map 中每个 `TradeBucket` 的生命周期应该很明确：
+
+```text
+1. create
+   第一笔属于 bucket_start_ms 的 trade 到达时创建
+
+2. streaming update
+   后续属于同一个 bucket_start_ms 的 trade 持续 O(1) 更新聚合状态
+
+3. mature
+   ClockDriver tick 时，watermark_ms = now_ms - allowed_lateness_ms
+   如果 bucket_start_ms + freq_ms <= watermark_ms，则 bucket 成熟
+
+4. snapshot
+   accumulator 把成熟 bucket 转成不可变 snapshot
+
+5. delete from map
+   snapshot 成功生成后，立刻从 buckets map 中删除该 bucket
+
+6. hand off
+   snapshot 返回给 TradesWorker / ClockDriver
+
+7. audit + runtime
+   ClockDriver 负责写 aggregate audit，并把 bar payload 推给 runtime
+```
+
+也就是说，**map 必须删除久远时间戳的 bucket**，否则会造成内存泄漏；但 **accumulator 不直接写 audit**。职责边界应该是：
+
+```text
+EventTimeTradesAccumulator:
+  负责 bucket 创建、流式聚合、成熟判断、snapshot、delete
+
+TradesWorker:
+  负责按 symbol 收集 accumulator.flush_ready(now_ms) 的 snapshots
+
+ClockDriver:
+  负责按 bucket_ts_ms 汇总 worker 返回的 mature buckets
+  负责写 aggregate audit
+  负责 bar_queue.put(...)
+
+AuditWriter:
+  负责异步落盘和文件轮转
+```
+
+推荐的 `flush_ready()` 语义：
+
+```python
+def flush_ready(now_ms: int) -> list[TradeBucketSnapshot]:
+    watermark_ms = now_ms - allowed_lateness_ms
+    ready_keys = sorted(
+        bucket_start_ms
+        for bucket_start_ms in buckets
+        if bucket_start_ms + freq_ms <= watermark_ms
+    )
+
+    snapshots = []
+    for bucket_start_ms in ready_keys:
+        bucket = buckets.pop(bucket_start_ms)
+        snapshots.append(bucket.snapshot(is_complete=True))
+
+    return snapshots
+```
+
+注意这里的顺序：
+
+```text
+先 snapshot，再 delete，再返回 snapshot
+```
+
+delete 后如果又收到属于同一个 `bucket_start_ms` 的 trade，说明它已经超过 `allowed_lateness`，应该进入 late-trade 处理逻辑，而不是重新创建旧 bucket 继续修改已经输出的 bar。
+
+### 10.2 delete 与 audit 流程图
+
+```mermaid
+flowchart TB
+    Tick["ClockDriver tick"] --> Worker["TradesWorker.flush_ready(now_ms)"]
+    Worker --> Acc["EventTimeTradesAccumulator.flush_ready(now_ms)"]
+    Acc --> WM["Compute watermark_ms"]
+    WM --> Scan["Scan buckets map"]
+    Scan --> Mature{"bucket_end_ms <= watermark_ms?"}
+
+    Mature -->|no| Keep["Keep bucket in map"]
+    Mature -->|yes| Snap["Build immutable snapshot"]
+    Snap --> Del["Delete bucket from map"]
+    Del --> Return["Return snapshot to worker"]
+
+    Return --> Group["ClockDriver groups snapshots by bucket_ts_ms"]
+    Group --> Audit["AuditWriter enqueue aggregate_bar"]
+    Group --> Runtime["bar_queue.put mature bucket payload"]
+```
+
+这个流程避免了两个问题：
+
+```text
+accumulator 直接落盘会把聚合状态管理和 I/O 耦合在一起
+delete 不及时会让 buckets map 随运行时间持续增长
+```
+
+为了不大改下游，有三个接入选择。
 
 ---
 
@@ -973,6 +1076,14 @@ max lateness
 EventTimeTradesAccumulator(freq_ms, allowed_lateness_ms)
 ```
 
+第一版内部结构固定为：
+
+```text
+buckets: dict[int, TradeBucket]
+```
+
+`TradeBucket` 采用流式 O(1) 聚合，不保存 raw trades list。
+
 单元测试：
 
 ```text
@@ -999,6 +1110,8 @@ receive_time
 ```
 
 避免破坏现有实时行为。
+
+当 `trade_time_mode="exchange_time"` 时，worker 的 `_on_trade(..., ts_ms)` 必须把 exchange `ts_ms` 传入 `EventTimeTradesAccumulator.update(...)`，而不是像当前实现一样丢掉 `ts_ms`。
 
 ### Phase 4：ClockDriver 多 bucket 支持
 
