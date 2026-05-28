@@ -2,7 +2,7 @@
 
 这个目录放审计日志校验脚本，用于把 FactorEngine 落盘的 aggregate audit 数据和外部参考数据做对比。
 
-当前只有一个脚本：
+当前主要脚本：
 
 ```text
 verify_binance_audit_vs_kline.py
@@ -14,8 +14,8 @@ verify_binance_audit_vs_kline.py
 FactorEngine audit 5s aggregate bars
   -> 合成 1m bars
 
-Binance 官方 1m kline
-  -> REST API 拉取
+Binance reference
+  -> official 1m kline 或 aggTrades REST 聚合成 1m
 
 按 (symbol, minute open_time) 对比 OHLCV
 ```
@@ -35,14 +35,14 @@ aggregate_bars_*.jsonl
 1. 根据 `--symbols` 过滤币种。
 2. 根据 `--start` / `--end` 过滤时间范围。
 3. 把 audit 里的 5s bars 聚合成 1m bars。
-4. 调 Binance Futures 官方接口：
+4. 按 `--reference` 选择参考源：
 
 ```text
-https://fapi.binance.com/fapi/v1/klines
+--reference kline      -> https://fapi.binance.com/fapi/v1/klines
+--reference aggtrades  -> https://fapi.binance.com/fapi/v1/aggTrades
 ```
 
-5. 拉取 `interval=1m` 的官方 kline。
-6. 对比：
+5. 对比：
 
 ```text
 open
@@ -51,6 +51,26 @@ low
 close
 volume
 ```
+
+`kline` 是官方 1m kline sanity check；`aggtrades` 会把 Binance aggTrades REST 聚合成 1m，更适合校验 trades-only / exchange-time 聚合结果。
+
+---
+
+## 1.1 参考源差异
+
+`kline` 模式调用：
+
+```text
+https://fapi.binance.com/fapi/v1/klines
+```
+
+`aggtrades` 模式调用：
+
+```text
+https://fapi.binance.com/fapi/v1/aggTrades
+```
+
+对于 trades-only engine，尤其是 Binance `aggTrade` WS，`aggtrades` 通常是更直接的参考源。官方 1m kline 可能和 aggTrades 在少数分钟存在 volume / trade count 口径差异，所以 `kline` 更适合检查时间错位和 OHLC 大体一致性。
 
 ---
 
@@ -152,6 +172,7 @@ python examples/verifier/verify_binance_audit_vs_kline.py \
 --start             校验开始时间，包含
 --end               校验结束时间，不包含
 --audit-ts-is-end   把 audit bucket_ts_ms 当成 bucket 结束边界
+--reference         参考源：kline 或 aggtrades，默认 kline
 --price-tol         price 字段的绝对误差阈值，默认 1e-8
 --price-rtol        price 字段的相对误差阈值，默认 0
 --volume-tol        volume 字段的绝对误差阈值，默认 1e-8

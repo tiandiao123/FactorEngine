@@ -1,12 +1,13 @@
-"""Verify Binance aggregate audit bars against official 1m klines.
+"""Verify Binance aggregate audit bars against Binance reference data.
 
 This verifier is a sanity check for aggregate audit logs:
 
     audit 5s bars -> aggregate to 1m
-    Binance official 1m klines -> compare OHLCV
+    Binance reference data -> compare OHLCV
 
-It does not replay raw trades.  It compares the online aggregate bars that
-ClockDriver wrote to disk with Binance's official minute kline API.
+By default it compares against Binance's official minute kline API. For
+trades-only engines, use ``--reference aggtrades`` to aggregate Binance
+aggTrades REST data over the same minutes.
 
 Example:
     python examples/verifier/verify_binance_audit_vs_kline.py \
@@ -31,6 +32,7 @@ from typing import Iterable
 
 
 BINANCE_KLINE_URL = "https://fapi.binance.com/fapi/v1/klines"
+BINANCE_AGG_TRADES_URL = "https://fapi.binance.com/fapi/v1/aggTrades"
 DEFAULT_SYMBOLS = ("BTC-USDT", "ETH-USDT", "SOL-USDT")
 ONE_MINUTE_MS = 60_000
 
@@ -80,7 +82,7 @@ class SymbolUniverseTimeline:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare FactorEngine Binance aggregate audit bars with official Binance 1m klines.",
+        description="Compare FactorEngine Binance aggregate audit bars with Binance reference data.",
     )
     parser.add_argument(
         "--audit-file",
@@ -101,6 +103,15 @@ def parse_args() -> argparse.Namespace:
         "--end",
         required=True,
         help="Exclusive end time. Use only fully closed minutes.",
+    )
+    parser.add_argument(
+        "--reference",
+        choices=("kline", "aggtrades"),
+        default="kline",
+        help=(
+            "Reference data source. 'kline' compares against official 1m klines; "
+            "'aggtrades' aggregates Binance aggTrades REST to 1m."
+        ),
     )
     parser.add_argument(
         "--price-tol",
@@ -359,6 +370,97 @@ def fetch_official_klines(
     return bars
 
 
+def fetch_aggtrades_1m(
+    symbol: str,
+    *,
+    start_ms: int,
+    end_ms: int,
+) -> dict[tuple[str, int], MinuteBar]:
+    binance_symbol = to_binance_symbol(symbol)
+    trades: dict[int, dict] = {}
+    from_id: int | None = None
+
+    while True:
+        if from_id is None:
+            params = {
+                "symbol": binance_symbol,
+                "startTime": start_ms,
+                "endTime": end_ms - 1,
+                "limit": 1000,
+            }
+        else:
+            params = {
+                "symbol": binance_symbol,
+                "fromId": from_id,
+                "limit": 1000,
+            }
+        url = BINANCE_AGG_TRADES_URL + "?" + urllib.parse.urlencode(params)
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            payload = json.load(resp)
+
+        if not payload:
+            break
+
+        saw_in_range = False
+        for item in payload:
+            trade_ts = int(item["T"])
+            if start_ms <= trade_ts < end_ms:
+                trades[int(item["a"])] = item
+                saw_in_range = True
+
+        last_id = int(payload[-1]["a"])
+        from_id = last_id + 1
+        last_ts = int(payload[-1]["T"])
+        if last_ts >= end_ms:
+            break
+
+        if len(payload) < 1000 and not saw_in_range:
+            break
+
+    grouped: dict[int, list[dict]] = {}
+    for item in trades.values():
+        trade_ts = int(item["T"])
+        minute_ts = trade_ts - (trade_ts % ONE_MINUTE_MS)
+        grouped.setdefault(minute_ts, []).append(item)
+
+    bars: dict[tuple[str, int], MinuteBar] = {}
+    for minute_ts, items in grouped.items():
+        items.sort(key=lambda item: (int(item["T"]), int(item["a"])))
+        volumes = [float(item["q"]) for item in items]
+        prices = [float(item["p"]) for item in items]
+        buy_vol = sum(
+            volume
+            for item, volume in zip(items, volumes, strict=True)
+            if not bool(item.get("m"))
+        )
+        sell_vol = sum(
+            volume
+            for item, volume in zip(items, volumes, strict=True)
+            if bool(item.get("m"))
+        )
+        total_volume = sum(volumes)
+        bars[(symbol, minute_ts)] = MinuteBar(
+            symbol=symbol,
+            bucket_ts_ms=minute_ts,
+            open=prices[0],
+            high=max(prices),
+            low=min(prices),
+            close=prices[-1],
+            volume=total_volume,
+            vwap=(
+                sum(price * volume for price, volume in zip(prices, volumes, strict=True))
+                / total_volume
+                if total_volume > 0
+                else None
+            ),
+            buy_vol=buy_vol,
+            sell_vol=sell_vol,
+            trade_count=len(items),
+            source_count=len(items),
+        )
+    return bars
+
+
 def compare_bars(
     audit: MinuteBar,
     official: MinuteBar,
@@ -421,10 +523,11 @@ def main() -> int:
         audit_ts_is_end=args.audit_ts_is_end,
     )
 
-    print("Verifier: Binance audit aggregate vs official 1m kline")
+    print("Verifier: Binance audit aggregate vs reference")
     print(f"audit_file: {audit_file}")
     print(f"range UTC:  {fmt_ts(start_ms)} -> {fmt_ts(end_ms)}")
     print(f"symbols:    {', '.join(sorted(symbols))}")
+    print(f"reference:  {args.reference}")
     print(f"audit rows: {len(audit_rows)}")
     print(f"symbol diffs: {len(symbol_diff_events)}")
     print(f"audit ts:   {'end boundary' if args.audit_ts_is_end else 'start boundary'}")
@@ -434,10 +537,14 @@ def main() -> int:
 
     total_mismatches = 0
     for symbol in sorted(symbols):
-        official = fetch_official_klines(symbol, start_ms=start_ms, end_ms=end_ms)
+        reference = (
+            fetch_aggtrades_1m(symbol, start_ms=start_ms, end_ms=end_ms)
+            if args.reference == "aggtrades"
+            else fetch_official_klines(symbol, start_ms=start_ms, end_ms=end_ms)
+        )
         keys = sorted(
             {key for key in audit_bars if key[0] == symbol}
-            | {key for key in official if key[0] == symbol}
+            | {key for key in reference if key[0] == symbol}
         )
 
         matched = 0
@@ -448,17 +555,17 @@ def main() -> int:
 
         for key in keys:
             audit_bar = audit_bars.get(key)
-            official_bar = official.get(key)
+            reference_bar = reference.get(key)
             if audit_bar is None:
                 if not universe_timeline.is_active(symbol, key[1]):
                     inactive_missing_audit += 1
                     continue
                 missing_audit += 1
                 mismatches.append(
-                    (key[1], [Diff("missing_audit", None, None, None, None)], None, official_bar)
+                    (key[1], [Diff("missing_audit", None, None, None, None)], None, reference_bar)
                 )
                 continue
-            if official_bar is None:
+            if reference_bar is None:
                 missing_official += 1
                 mismatches.append(
                     (key[1], [Diff("missing_official", None, None, None, None)], audit_bar, None)
@@ -466,25 +573,25 @@ def main() -> int:
                 continue
             diffs = compare_bars(
                 audit_bar,
-                official_bar,
+                reference_bar,
                 price_tol=args.price_tol,
                 price_rtol=args.price_rtol,
                 volume_tol=args.volume_tol,
                 volume_rtol=args.volume_rtol,
             )
             if diffs:
-                mismatches.append((key[1], diffs, audit_bar, official_bar))
+                mismatches.append((key[1], diffs, audit_bar, reference_bar))
             else:
                 matched += 1
 
         total_mismatches += len(mismatches)
         print(f"{symbol}:")
-        print(f"  official minutes: {len(official)}")
+        print(f"  reference minutes:{len(reference)}")
         print(f"  audit minutes:    {sum(1 for key in audit_bars if key[0] == symbol)}")
         print(f"  matched:          {matched}")
         print(f"  missing_audit:    {missing_audit}")
         print(f"  inactive_missing: {inactive_missing_audit}")
-        print(f"  missing_official: {missing_official}")
+        print(f"  missing_reference:{missing_official}")
         print(f"  mismatched:       {len(mismatches) - missing_audit - missing_official}")
 
         for ts_ms, diffs, audit_bar, official_bar in mismatches[: args.max_mismatches]:
@@ -498,7 +605,7 @@ def main() -> int:
                 )
             if official_bar is not None:
                 print(
-                    "    official: "
+                    "    reference:"
                     f"O={official_bar.open} H={official_bar.high} L={official_bar.low} "
                     f"C={official_bar.close} V={official_bar.volume} "
                     f"count={official_bar.trade_count}"
