@@ -32,6 +32,7 @@ the worker type:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import queue
 import threading
@@ -177,19 +178,17 @@ class ClockDriver:
 
     def _flush_and_aggregate(self) -> None:
         """Flush all workers and aggregate into a unified payload."""
+        now_ms = int(time.time() * 1000)
         raw: dict[str, Any] = {}
         for name, worker in self._workers.items():
             try:
-                raw[name] = worker.flush()
+                raw[name] = _call_worker_flush(worker, now_ms)
             except Exception:
                 logger.exception(
                     "ClockDriver: worker '%s' flush error (tick=%d)",
                     name, self._tick_count,
                 )
 
-        merged_bars, merged_trades = self._aggregate(raw)
-
-        bucket_ts_ms = _bucket_ts_ms(merged_bars)
         symbol_version = (
             self._symbol_version_getter()
             if self._symbol_version_getter is not None
@@ -201,6 +200,41 @@ class ClockDriver:
             else None
         )
 
+        event_round = _event_time_trades_round(raw.get("trades"))
+        if event_round is not None:
+            bucket_ts_ms, trades_bars, trades_snaps = event_round
+            round_raw = dict(raw)
+            round_raw["trades"] = (trades_bars, trades_snaps)
+            merged_bars, merged_trades = self._aggregate(round_raw)
+            self._emit_round(
+                merged_bars,
+                merged_trades,
+                bucket_ts_ms,
+                symbol_version=symbol_version,
+                active_symbols=active_symbols,
+            )
+            return
+
+        merged_bars, merged_trades = self._aggregate(raw)
+        bucket_ts_ms = _bucket_ts_ms(merged_bars)
+        self._emit_round(
+            merged_bars,
+            merged_trades,
+            bucket_ts_ms,
+            symbol_version=symbol_version,
+            active_symbols=active_symbols,
+        )
+
+    def _emit_round(
+        self,
+        merged_bars: dict[str, np.ndarray],
+        merged_trades: dict[str, dict],
+        bucket_ts_ms: int,
+        *,
+        symbol_version: str | None = None,
+        active_symbols: set[str] | frozenset[str] | None = None,
+    ) -> None:
+        """Write one finalized round to audit, queue, and post-flush hook."""
         if merged_bars and self._audit is not None:
             try:
                 self._audit.write_aggregate_batch(
@@ -307,3 +341,31 @@ def _bucket_ts_ms(merged_bars: dict[str, np.ndarray]) -> int:
         except (IndexError, TypeError, ValueError):
             continue
     return int(time.time() * 1000)
+
+
+def _call_worker_flush(worker: FlushableWorker, now_ms: int) -> Any:
+    """Call flush(now_ms) for new workers, flush() for legacy workers."""
+    try:
+        params = inspect.signature(worker.flush).parameters
+    except (TypeError, ValueError):
+        return worker.flush()
+    if any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params.values()):
+        return worker.flush(now_ms)
+    if len(params) == 0:
+        return worker.flush()
+    return worker.flush(now_ms)
+
+
+def _event_time_trades_round(
+    trades_data: Any,
+) -> tuple[int, dict[str, np.ndarray], dict[str, dict]] | None:
+    if not isinstance(trades_data, tuple) or len(trades_data) != 3:
+        return None
+    bucket_ts_ms, bars, trades = trades_data
+    if not isinstance(bars, dict) or not isinstance(trades, dict):
+        return None
+    try:
+        bucket_ts_ms = int(bucket_ts_ms)
+    except (TypeError, ValueError):
+        return None
+    return bucket_ts_ms, bars, trades

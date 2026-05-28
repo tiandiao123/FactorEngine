@@ -89,6 +89,7 @@ class Engine:
 
     _VALID_DATA_SOURCES = ("kline", "trades", "kline_trades")
     _VALID_EXCHANGES = ("okx", "binance")
+    _VALID_TRADE_TIME_MODES = ("receive_time", "exchange_time")
 
     def __init__(
         self,
@@ -112,6 +113,8 @@ class Engine:
         enable_dynamic_symbols: bool = False,
         symbol_provider=None,
         symbol_refresh_interval_seconds: float | None = None,
+        trade_time_mode: str = "receive_time",
+        allowed_lateness_ms: int = 1000,
     ):
         if data_source not in self._VALID_DATA_SOURCES:
             raise ValueError(
@@ -123,6 +126,18 @@ class Engine:
                 f"Invalid exchange: {exchange!r}. "
                 f"Use one of {self._VALID_EXCHANGES}"
             )
+        if trade_time_mode not in self._VALID_TRADE_TIME_MODES:
+            raise ValueError(
+                f"Invalid trade_time_mode: {trade_time_mode!r}. "
+                f"Use one of {self._VALID_TRADE_TIME_MODES}"
+            )
+        if allowed_lateness_ms < 0:
+            raise ValueError("allowed_lateness_ms must be non-negative")
+        if data_source == "kline_trades" and trade_time_mode == "exchange_time":
+            raise ValueError(
+                "trade_time_mode='exchange_time' is not supported with "
+                "data_source='kline_trades' in phase 1; use data_source='trades'."
+            )
 
         self.symbols = symbols
         self.data_freq = data_freq
@@ -132,6 +147,8 @@ class Engine:
         self._data_source = data_source
         self._exchange = exchange
         self._testnet = testnet
+        self._trade_time_mode = trade_time_mode
+        self._allowed_lateness_ms = int(allowed_lateness_ms)
         self._dynamic_symbols_enabled = enable_dynamic_symbols
         self._symbol_manager = None
         self._symbol_provider = symbol_provider
@@ -271,12 +288,21 @@ class Engine:
             if exchange == "okx":
                 from dataflow.okx.trades.worker import TradesWorker
 
-                self._trades_worker = TradesWorker(symbols=symbols)
+                self._trades_worker = TradesWorker(
+                    symbols=symbols,
+                    trade_time_mode=self._trade_time_mode,
+                    allowed_lateness_ms=self._allowed_lateness_ms,
+                    freq_seconds=self.data_freq_seconds,
+                )
             elif exchange == "binance":
                 from dataflow.binance.trades.worker import BinanceTradesWorker
 
                 self._trades_worker = BinanceTradesWorker(
-                    symbols=symbols, testnet=self._testnet,
+                    symbols=symbols,
+                    testnet=self._testnet,
+                    trade_time_mode=self._trade_time_mode,
+                    allowed_lateness_ms=self._allowed_lateness_ms,
+                    freq_seconds=self.data_freq_seconds,
                 )
             self._trades_worker.set_freq(self.data_freq_seconds)
 

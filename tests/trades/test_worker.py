@@ -14,6 +14,7 @@ import pytest
 
 from dataflow.okx.trades.worker import TradesWorker
 from dataflow.okx.trades.accumulator import TradesAccumulator
+from dataflow.trades.accumulator import EventTimeTradesAccumulator
 
 
 # ── unit tests (no network) ─────────────────────────────────────
@@ -75,6 +76,65 @@ class TestTradesWorkerUnit:
         assert snap2["trade_count"] == 1
         assert snap2["vwap"] == pytest.approx(200.0)
         assert snap2["sell_vol"] == pytest.approx(2.0)
+
+    def test_exchange_time_accumulators_created(self):
+        w = TradesWorker(
+            symbols=["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+            trade_time_mode="exchange_time",
+            freq_seconds=1.0,
+            allowed_lateness_ms=500,
+        )
+
+        assert all(
+            isinstance(acc, EventTimeTradesAccumulator)
+            for acc in w.accumulators.values()
+        )
+
+    def test_exchange_time_flush_finalizes_single_target_bucket(self):
+        w = TradesWorker(
+            symbols=["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+            trade_time_mode="exchange_time",
+            freq_seconds=1.0,
+            allowed_lateness_ms=500,
+        )
+
+        with patch("dataflow.okx.trades.worker.time.time", return_value=10_000.150):
+            w._on_trade("BTC-USDT-SWAP", 100.0, 1.0, "buy", 10_000_100)
+            w._on_trade("ETH-USDT-SWAP", 200.0, 2.0, "sell", 10_000_200)
+
+        assert w.flush(10_001_000) is None
+
+        result = w.flush(10_002_000)
+        assert result is not None
+        bucket_ts_ms, bars, trades = result
+        assert bucket_ts_ms == 10_000_000
+        assert set(bars) == {"BTC-USDT-SWAP", "ETH-USDT-SWAP"}
+        assert bars["BTC-USDT-SWAP"][0] == pytest.approx(10_000_000)
+        assert bars["BTC-USDT-SWAP"][4] == pytest.approx(100.0)
+        assert bars["ETH-USDT-SWAP"][4] == pytest.approx(200.0)
+        assert trades["BTC-USDT-SWAP"]["bucket_time_basis"] == "exchange_time"
+        assert trades["BTC-USDT-SWAP"]["allowed_lateness_ms"] == 500
+
+        assert w.flush(10_002_100) is None
+
+    def test_exchange_time_worker_drops_trade_for_emitted_bucket(self):
+        w = TradesWorker(
+            symbols=["BTC-USDT-SWAP"],
+            trade_time_mode="exchange_time",
+            freq_seconds=1.0,
+            allowed_lateness_ms=500,
+        )
+
+        with patch("dataflow.okx.trades.worker.time.time", return_value=10_000.150):
+            w._on_trade("BTC-USDT-SWAP", 100.0, 1.0, "buy", 10_000_100)
+
+        assert w.flush(10_002_000) is not None
+
+        with patch("dataflow.okx.trades.worker.time.time", return_value=10_002.100):
+            w._on_trade("BTC-USDT-SWAP", 999.0, 1.0, "buy", 10_000_200)
+
+        assert w.trade_count == 1
+        assert w.stats()["dropped_late_trade_count"] == 1
 
 
 # ── integration test (live WS) ──────────────────────────────────
