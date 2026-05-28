@@ -173,14 +173,15 @@ render_graph(g, "factor_0001.png")   # needs graphviz
 
 | Script | Description |
 |--------|-------------|
-| [`engine_rt_live.py`](examples/engine/static_symbols/engine_rt_live.py) | OKX kline + factors (`data_source="kline"`). |
-| [`engine_rt_trades.py`](examples/engine/static_symbols/engine_rt_trades.py) | OKX trades-only with 20 symbols and 53 trades factors. |
-| [`engine_rt_binance_trades.py`](examples/engine/static_symbols/engine_rt_binance_trades.py) | **Binance Futures** trades-only, picks top 200 USDT-M perpetuals at startup and enables aggregate audit logging. |
-| [`engine_rt_binance_dynamic_symbols.py`](examples/engine/dynanmic_symbols/engine_rt_binance_dynamic_symbols.py) | Binance trades-only dynamic symbol universe demo with readiness logging and aggregate audit output. |
-| [`engine_rt_okx_dynamic_symbols.py`](examples/engine/dynanmic_symbols/engine_rt_okx_dynamic_symbols.py) | OKX trades-only dynamic symbol universe demo mirroring the Binance configuration. |
+| [`engine_rt_live.py`](examples/engine/staticSymbols/engine_rt_live.py) | OKX kline + factors (`data_source="kline"`). |
+| [`engine_rt_trades.py`](examples/engine/staticSymbols/engine_rt_trades.py) | OKX trades-only with 20 symbols and 53 trades factors. |
+| [`engine_rt_binance_trades.py`](examples/engine/staticSymbols/engine_rt_binance_trades.py) | **Binance Futures** trades-only, picks top 200 USDT-M perpetuals at startup and enables aggregate audit logging. |
+| [`engine_rt_binance_dynamic_symbols.py`](examples/engine/dynanmicSymbols/engine_rt_binance_dynamic_symbols.py) | Binance trades-only dynamic symbol universe demo with readiness logging and aggregate audit output. |
+| [`engine_rt_okx_dynamic_symbols.py`](examples/engine/dynanmicSymbols/engine_rt_okx_dynamic_symbols.py) | OKX trades-only dynamic symbol universe demo mirroring the Binance configuration. |
 | [`engine_rt_binance_exchange_time.py`](examples/engine/timeBuckets/engine_rt_binance_exchange_time.py) | Binance trades-only exchange-time demo with `allowed_lateness_ms` and tee logging for debugging. |
 | [`engine_rt_binance_dynamic_exchange_time.py`](examples/engine/timeBuckets/engine_rt_binance_dynamic_exchange_time.py) | Binance dynamic-symbol exchange-time demo; rotates symbol lists while preserving bucket finalization semantics. |
-| [`engine_rt_simulation.py`](examples/engine/engine_rt_simulation.py) | Simulation bars + factors. |
+| [`engine_rt_okx_dynamic_exchange_time.py`](examples/engine/timeBuckets/engine_rt_okx_dynamic_exchange_time.py) | OKX dynamic-symbol exchange-time demo with OKX swap symbols and aggregate audit output. |
+| [`engine_rt_simulation.py`](examples/engine/staticSymbols/engine_rt_simulation.py) | Simulation bars + factors. |
 
 ### OKX kline example
 
@@ -269,20 +270,28 @@ data/audit/binance_trades_demo/aggregate_bars_YYYYMMDD_HHMMSS_part000001.jsonl
 
 Use `engine.audit_stats` to inspect queue, flush, drop, and current-file state. See [`docs/20260524/aggregate_audit_implementation.md`](docs/20260524/aggregate_audit_implementation.md) for the full call flow.
 
-### Audit verifier
+### Audit verifiers
 
-The verifier compares FactorEngine aggregate audit bars with Binance official 1m klines:
+The Binance verifier compares FactorEngine aggregate audit bars with either Binance official 1m klines or Binance `aggTrades` rebuilt to 1m. For exchange-time trades audits, `aggTrades` is the strictest reference because it uses the same trades-only data source:
 
 ```bash
 python examples/verifier/verify_binance_audit_vs_kline.py \
-  --audit-file examples/engine/data/audit/binance_trades_demo/aggregate_bars_20260524_101827_part000001.jsonl \
+  --audit-file examples/engine/timeBuckets/data/audit/binance_exchange_time_demo/aggregate_bars_20260528_081536_part000001.jsonl \
   --symbols BTC-USDT,ETH-USDT,SOL-USDT \
-  --start "2026-05-24T10:19:00Z" \
-  --end "2026-05-24T10:24:00Z" \
-  --audit-ts-is-end \
-  --price-rtol 0.001 \
-  --volume-rtol 0.02 \
+  --start "2026-05-28T08:16:00Z" \
+  --end "2026-05-28T08:33:00Z" \
+  --reference aggtrades \
+  --price-rtol 0.0001 \
+  --volume-rtol 0.001 \
   --max-mismatches 3
+```
+
+Use [`examples/verifier/run.sh`](examples/verifier/run.sh) as a ready-to-edit Binance command.
+
+The OKX verifier compares aggregate audit bars with OKX official 1m candles. Pick a fully covered UTC minute window that avoids the demo startup minute and the most recent still-settling minute:
+
+```bash
+bash examples/verifier/run_okx.sh
 ```
 
 `trade_count` is displayed for context but is not part of the match decision. See [`examples/verifier/README.md`](examples/verifier/README.md) for timestamp semantics and tolerance rules.
@@ -307,7 +316,7 @@ engine.update_symbols(
 
 The update is applied after a `ClockDriver` flush boundary. Added symbols get fresh C++ `SymbolRunner` state; removed symbols are physically removed from the runtime. Use `get_symbol_status()` to inspect per-symbol warmup state and `get_ready_factor_outputs()` when downstream consumers should ignore symbols whose factors are not fully warmed up yet.
 
-See [`examples/engine/dynanmic_symbols/`](examples/engine/dynanmic_symbols/), [`docs/20260523/dynamic_symbol_list_design.md`](docs/20260523/dynamic_symbol_list_design.md), and [`docs/20260525/dynamic_symbol_end_to_end_flow.md`](docs/20260525/dynamic_symbol_end_to_end_flow.md) for the full flow.
+See [`examples/engine/dynanmicSymbols/`](examples/engine/dynanmicSymbols/), [`docs/20260523/dynamic_symbol_list_design.md`](docs/20260523/dynamic_symbol_list_design.md), and [`docs/20260525/dynamic_symbol_end_to_end_flow.md`](docs/20260525/dynamic_symbol_end_to_end_flow.md) for the full flow.
 
 ### Exchange-time trades buckets
 
@@ -347,6 +356,7 @@ Examples:
 ```bash
 python examples/engine/timeBuckets/engine_rt_binance_exchange_time.py
 python examples/engine/timeBuckets/engine_rt_binance_dynamic_exchange_time.py
+python examples/engine/timeBuckets/engine_rt_okx_dynamic_exchange_time.py
 ```
 
 See [`docs/20260528/exchange_time_engine_tutorial.md`](docs/20260528/exchange_time_engine_tutorial.md) for the operational walkthrough and [`docs/20260526/exchange_time_trades_aggregation_allowed_lateness.md`](docs/20260526/exchange_time_trades_aggregation_allowed_lateness.md) for the original design note.
@@ -386,10 +396,10 @@ FactorEngine/
 ├── pyproject.toml
 ├── examples/
 │   ├── engine/                   # live/simulation Engine demos
-│   │   └── timeBuckets/          # exchange-time bucket demos
-│   │   ├── static_symbols/       # static universe demos
-│   │   └── dynanmic_symbols/     # dynamic universe demos for Binance and OKX
-│   └── verifier/                 # audit vs Binance official kline verifier
+│   │   ├── timeBuckets/          # exchange-time bucket demos
+│   │   ├── staticSymbols/        # static universe demos
+│   │   └── dynanmicSymbols/      # dynamic universe demos for Binance and OKX
+│   └── verifier/                 # audit verifiers for Binance and OKX
 ├── dataflow/
 │   ├── base_collector.py         # BaseCollector ABC (shared WS reconnect)
 │   ├── audit/                    # aggregate audit schema/config/writer
