@@ -11,5 +11,5 @@ python "${SCRIPT_DIR}/verify_binance_audit_vs_kline.py" \
   --end "2026-05-28T08:33:00Z" \
   --reference aggtrades \
   --price-rtol 0.0001 \
-  --volume-rtol 0.02 \
+  --volume-rtol 0.001 \
   --max-mismatches 3
