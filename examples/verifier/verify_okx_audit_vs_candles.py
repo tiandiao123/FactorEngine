@@ -272,7 +272,8 @@ def fetch_official_candles(
     params = {
         "instId": symbol,
         "bar": "1m",
-        "before": start_ms,
+        # OKX treats `before` as an exclusive lower boundary for this endpoint.
+        "before": max(0, start_ms - ONE_MINUTE_MS),
         "after": end_ms,
         "limit": 300,
     }
