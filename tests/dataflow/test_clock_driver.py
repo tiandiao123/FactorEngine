@@ -24,6 +24,18 @@ class FakeWorker:
         return self._data
 
 
+class NowAwareWorker:
+    def __init__(self, data=None):
+        self._data = data
+        self.flush_count = 0
+        self.now_ms_values = []
+
+    def flush(self, now_ms):
+        self.flush_count += 1
+        self.now_ms_values.append(now_ms)
+        return self._data
+
+
 class TestClockDriverBasic:
     def test_register_and_tick(self):
         """Workers are flushed at least once within 2× freq."""
@@ -105,6 +117,18 @@ class TestClockDriverBasic:
         cd.register("kline", FakeWorker())
         with pytest.raises(ValueError, match="already registered"):
             cd.register("kline", FakeWorker())
+
+    def test_flush_passes_now_ms_to_now_aware_worker(self):
+        q = queue.Queue(maxsize=4)
+        worker = NowAwareWorker(data=None)
+        cd = ClockDriver(freq_seconds=1.0, bar_queue=q)
+        cd.register("trades", worker)
+
+        cd._flush_and_aggregate()
+
+        assert worker.flush_count == 1
+        assert len(worker.now_ms_values) == 1
+        assert isinstance(worker.now_ms_values[0], int)
 
 
 class TestClockDriverAlignment:
@@ -212,3 +236,46 @@ class TestClockDriverQueue:
         assert payload["symbol_version"] == "v1"
         assert payload["active_symbols"] == {"BTC", "ETH"}
         assert "BTC" in payload["bars"]
+
+    def test_event_time_trades_round_pushes_finalized_bucket(self):
+        q = queue.Queue(maxsize=8)
+        bars = {
+            "BTC": np.array([10_000, 100, 101, 99, 100.5, 3.0, np.nan, np.nan])
+        }
+        trades = {"BTC": {"vwap": 100.25, "trade_count": 2}}
+        cd = ClockDriver(freq_seconds=1.0, bar_queue=q, structured_payload=True)
+        cd.register("trades", NowAwareWorker(data=(10_000, bars, trades)))
+
+        cd._flush_and_aggregate()
+
+        payload = q.get_nowait()
+        assert payload["bucket_ts_ms"] == 10_000
+        assert payload["bars"] == bars
+        assert payload["trades"] == trades
+
+    def test_event_time_trades_none_does_not_push(self):
+        q = queue.Queue(maxsize=8)
+        cd = ClockDriver(freq_seconds=1.0, bar_queue=q)
+        cd.register("trades", NowAwareWorker(data=None))
+
+        cd._flush_and_aggregate()
+
+        assert q.qsize() == 0
+
+    def test_event_time_trades_round_uses_returned_bucket_for_hook(self):
+        q = queue.Queue(maxsize=8)
+        events = []
+        bars = {
+            "BTC": np.array([10_000, 100, 101, 99, 100.5, 3.0, np.nan, np.nan])
+        }
+        trades = {"BTC": {"vwap": 100.25, "trade_count": 2}}
+        cd = ClockDriver(
+            freq_seconds=1.0,
+            bar_queue=q,
+            after_flush_commit=lambda bucket_ts_ms: events.append(bucket_ts_ms),
+        )
+        cd.register("trades", NowAwareWorker(data=(10_000, bars, trades)))
+
+        cd._flush_and_aggregate()
+
+        assert events == [10_000]

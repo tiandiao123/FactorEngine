@@ -61,6 +61,34 @@ class TestDataSourceParam:
                 data_source="orderbook",
             )
 
+    def test_invalid_trade_time_mode_raises(self):
+        with pytest.raises(ValueError, match="Invalid trade_time_mode"):
+            Engine(
+                symbols=["BTC-USDT-SWAP"],
+                mode="simulation",
+                sim_seed=42,
+                trade_time_mode="event_time",
+            )
+
+    def test_negative_allowed_lateness_raises(self):
+        with pytest.raises(ValueError, match="allowed_lateness_ms"):
+            Engine(
+                symbols=["BTC-USDT-SWAP"],
+                mode="simulation",
+                sim_seed=42,
+                allowed_lateness_ms=-1,
+            )
+
+    def test_kline_trades_exchange_time_rejected(self):
+        with pytest.raises(ValueError, match="kline_trades"):
+            Engine(
+                symbols=["BTC-USDT-SWAP"],
+                mode="live",
+                data_source="kline_trades",
+                trade_time_mode="exchange_time",
+                factor_group=["okx_perp", "okx_perp_trades"],
+            )
+
     def test_kline_backward_compat(self):
         """data_source='kline' should behave exactly like before."""
         engine = Engine(
@@ -90,6 +118,27 @@ class TestDataSourceParam:
         )
         assert engine.trades_stats == {}
         engine.stop()
+
+    def test_okx_trades_exchange_time_wires_worker_config(self):
+        engine = Engine(
+            symbols=["BTC-USDT-SWAP"],
+            mode="live",
+            data_source="trades",
+            data_freq="1s",
+            factor_group="okx_perp_trades",
+            num_threads=1,
+            trade_time_mode="exchange_time",
+            allowed_lateness_ms=500,
+        )
+
+        try:
+            assert engine._trade_time_mode == "exchange_time"
+            assert engine._allowed_lateness_ms == 500
+            assert engine._trades_worker._trade_time_mode == "exchange_time"
+            assert engine._trades_worker._allowed_lateness_ms == 500
+            assert engine._trades_worker._freq_ms == pytest.approx(1000.0)
+        finally:
+            engine.stop()
 
 
 class TestRuntimeLoopTradesUnpacking:

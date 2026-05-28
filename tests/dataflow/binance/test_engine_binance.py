@@ -88,6 +88,28 @@ class TestBinanceKlineValidation:
         assert engine.data_source == "trades"
         engine.stop()
 
+    def test_binance_trades_exchange_time_wires_worker_config(self):
+        engine = Engine(
+            symbols=["BTC-USDT"],
+            mode="live",
+            exchange="binance",
+            data_source="trades",
+            data_freq="1s",
+            factor_group="okx_perp_trades",
+            num_threads=1,
+            trade_time_mode="exchange_time",
+            allowed_lateness_ms=750,
+        )
+
+        try:
+            assert engine.exchange == "binance"
+            assert engine.data_source == "trades"
+            assert engine._trades_worker._trade_time_mode == "exchange_time"
+            assert engine._trades_worker._allowed_lateness_ms == 750
+            assert engine._trades_worker._freq_ms == pytest.approx(1000.0)
+        finally:
+            engine.stop()
+
     def test_binance_kline_1m_ok(self):
         """kline mode at 1m should work for Binance."""
         engine = Engine(

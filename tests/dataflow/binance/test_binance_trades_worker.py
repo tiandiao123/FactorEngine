@@ -5,12 +5,14 @@ connections by directly calling _on_trade() and flush().
 """
 
 import math
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 
 from dataflow.symbols import SymbolDiff
 from dataflow.binance.trades.worker import BinanceTradesWorker
+from dataflow.trades.accumulator import EventTimeTradesAccumulator
 
 
 class TestBinanceTradesWorkerFlush:
@@ -99,6 +101,65 @@ class TestBinanceTradesWorkerFlush:
         _, trades = worker.flush()
         expected_vwap = (100.0 * 3.0 + 200.0 * 1.0) / (3.0 + 1.0)
         assert trades["BTC-USDT"]["vwap"] == pytest.approx(expected_vwap)
+
+    def test_exchange_time_accumulators_created(self):
+        worker = BinanceTradesWorker(
+            symbols=["BTC-USDT", "ETH-USDT"],
+            trade_time_mode="exchange_time",
+            freq_seconds=1.0,
+            allowed_lateness_ms=500,
+        )
+
+        assert all(
+            isinstance(acc, EventTimeTradesAccumulator)
+            for acc in worker.accumulators.values()
+        )
+
+    def test_exchange_time_flush_finalizes_single_target_bucket(self):
+        worker = BinanceTradesWorker(
+            symbols=["BTC-USDT", "ETH-USDT"],
+            trade_time_mode="exchange_time",
+            freq_seconds=1.0,
+            allowed_lateness_ms=500,
+        )
+
+        with patch("dataflow.binance.trades.worker.time.time", return_value=10_000.150):
+            worker._on_trade("BTC-USDT", 100.0, 1.0, "buy", 10_000_100)
+            worker._on_trade("ETH-USDT", 200.0, 2.0, "sell", 10_000_200)
+
+        assert worker.flush(10_001_000) is None
+
+        result = worker.flush(10_002_000)
+        assert result is not None
+        bucket_ts_ms, bars, trades = result
+        assert bucket_ts_ms == 10_000_000
+        assert set(bars) == {"BTC-USDT", "ETH-USDT"}
+        assert bars["BTC-USDT"][0] == pytest.approx(10_000_000)
+        assert bars["BTC-USDT"][4] == pytest.approx(100.0)
+        assert bars["ETH-USDT"][4] == pytest.approx(200.0)
+        assert trades["BTC-USDT"]["bucket_time_basis"] == "exchange_time"
+        assert trades["BTC-USDT"]["allowed_lateness_ms"] == 500
+
+        assert worker.flush(10_002_100) is None
+
+    def test_exchange_time_worker_drops_trade_for_emitted_bucket(self):
+        worker = BinanceTradesWorker(
+            symbols=["BTC-USDT"],
+            trade_time_mode="exchange_time",
+            freq_seconds=1.0,
+            allowed_lateness_ms=500,
+        )
+
+        with patch("dataflow.binance.trades.worker.time.time", return_value=10_000.150):
+            worker._on_trade("BTC-USDT", 100.0, 1.0, "buy", 10_000_100)
+
+        assert worker.flush(10_002_000) is not None
+
+        with patch("dataflow.binance.trades.worker.time.time", return_value=10_002.100):
+            worker._on_trade("BTC-USDT", 999.0, 1.0, "buy", 10_000_200)
+
+        assert worker.trade_count == 1
+        assert worker.stats()["dropped_late_trade_count"] == 1
 
 
 class TestBinanceTradesWorkerDynamicSymbols:
